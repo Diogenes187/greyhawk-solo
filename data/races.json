@@ -1,0 +1,155 @@
+{
+  "Human": {
+    "ability_modifiers": {},
+    "ability_minimums": {},
+    "ability_maximums": {},
+    "infravision": false,
+    "infravision_range_ft": 0,
+    "languages": ["Common"],
+    "bonus_languages": true,
+    "class_level_limits": {},
+    "allowed_classes": ["Fighter", "Paladin", "Ranger", "Cleric", "Druid", "Magic-User", "Illusionist", "Thief", "Assassin", "Monk", "Bard"],
+    "special_abilities": ["Unlimited level advancement in any class"],
+    "notes": "Humans have no racial modifiers but no level limits either. Can be any class."
+  },
+
+  "Elf": {
+    "ability_modifiers": {"DEX": 1, "CON": -1},
+    "ability_minimums": {"STR": 3, "INT": 8, "WIS": 3, "DEX": 7, "CON": 7, "CHA": 8},
+    "ability_maximums": {"STR": 18, "INT": 18, "WIS": 18, "DEX": 19, "CON": 17, "CHA": 18},
+    "infravision": true,
+    "infravision_range_ft": 60,
+    "languages": ["Common", "Elvish", "Gnoll", "Gnome", "Goblin", "Halfling", "Hobgoblin", "Orcish"],
+    "bonus_languages": false,
+    "class_level_limits": {
+      "Fighter": 7,
+      "Magic-User": 11,
+      "Thief": "unlimited",
+      "Fighter/Magic-User": {"Fighter": 7, "Magic-User": 11},
+      "Fighter/Thief": {"Fighter": 7, "Thief": "unlimited"},
+      "Magic-User/Thief": {"Magic-User": 11, "Thief": "unlimited"},
+      "Fighter/Magic-User/Thief": {"Fighter": 7, "Magic-User": 11, "Thief": "unlimited"}
+    },
+    "allowed_classes": ["Fighter", "Magic-User", "Thief", "Fighter/Magic-User", "Fighter/Thief", "Magic-User/Thief", "Fighter/Magic-User/Thief"],
+    "special_abilities": [
+      "Detect secret/concealed doors (1-2 on d6 passing, 1-3 actively searching)",
+      "Immune to ghoul paralysis",
+      "90% resistance to charm and sleep spells",
+      "Surprise: surprised only on 1 in 6, surprises on 1-4 in 6 when alone or with all-elf party in non-metal armor",
+      "Infravision 60 ft"
+    ],
+    "notes": "Campaign rule for Theron: racial level limits ignored (see rules table in DB)."
+  },
+
+  "Dwarf": {
+    "ability_modifiers": {"CON": 1, "CHA": -1},
+    "ability_minimums": {"STR": 8, "INT": 3, "WIS": 3, "DEX": 3, "CON": 11, "CHA": 3},
+    "ability_maximums": {"STR": 18, "INT": 18, "WIS": 18, "DEX": 17, "CON": 19, "CHA": 16},
+    "infravision": true,
+    "infravision_range_ft": 60,
+    "languages": ["Common", "Dwarven", "Gnome", "Goblin", "Kobold", "Orcish"],
+    "bonus_languages": false,
+    "class_level_limits": {
+      "Fighter": 9,
+      "Thief": "unlimited",
+      "Fighter/Thief": {"Fighter": 9, "Thief": "unlimited"}
+    },
+    "allowed_classes": ["Fighter", "Thief", "Fighter/Thief"],
+    "special_abilities": [
+      "Saving throw bonus vs. poison, magic wands, staves, rods, and spells (+4 per 3.5 CON points above 14, or use standard table)",
+      "Attack bonus: +1 to hit vs. goblins, hobgoblins, gnolls, and orcs",
+      "AC bonus: -4 AC vs. giants, ogres, trolls, and similar large humanoids",
+      "Detect construction tricks (sliding walls, sloping passages, etc.) — 1-2 on d6",
+      "Infravision 60 ft",
+      "Detect depth underground, approximate direction underground"
+    ],
+    "saving_throw_bonus_vs_magic": true,
+    "notes": "Saving throw bonuses scale with CON. Standard rule: +1 per 3.5 CON above 14 (round down), minimum CON 15 for bonus."
+  },
+
+  "Halfling": {
+    "ability_modifiers": {"DEX": 1, "STR": -1},
+    "ability_minimums": {"STR": 6, "INT": 6, "WIS": 3, "DEX": 8, "CON": 10, "CHA": 3},
+    "ability_maximums": {"STR": 17, "INT": 18, "WIS": 17, "DEX": 19, "CON": 19, "CHA": 18},
+    "infravision": false,
+    "infravision_range_ft": 0,
+    "languages": ["Common", "Halfling", "Dwarvish", "Elvish", "Gnome", "Goblin", "Orcish"],
+    "bonus_languages": false,
+    "class_level_limits": {
+      "Fighter": 6,
+      "Thief": "unlimited",
+      "Fighter/Thief": {"Fighter": 6, "Thief": "unlimited"}
+    },
+    "allowed_classes": ["Fighter", "Thief", "Fighter/Thief"],
+    "special_abilities": [
+      "Saving throw bonus vs. magic (same formula as Dwarves, based on CON)",
+      "Saving throw bonus vs. poison",
+      "+3 bonus to hit with slings and thrown weapons",
+      "Near-invisible in natural surroundings (15% base chance to be noticed)",
+      "Surprised only on 1 in 10 when in natural terrain",
+      "Excellent hearing: 1-4 on d6 to detect noise"
+    ],
+    "saving_throw_bonus_vs_magic": true,
+    "notes": "Halflings are small creatures. Max STR 17."
+  },
+
+  "Half-Elf": {
+    "ability_modifiers": {},
+    "ability_minimums": {"STR": 3, "INT": 4, "WIS": 3, "DEX": 6, "CON": 6, "CHA": 3},
+    "ability_maximums": {"STR": 18, "INT": 18, "WIS": 18, "DEX": 18, "CON": 18, "CHA": 18},
+    "infravision": true,
+    "infravision_range_ft": 60,
+    "languages": ["Common", "Elvish"],
+    "bonus_languages": true,
+    "class_level_limits": {
+      "Fighter": 8,
+      "Ranger": 8,
+      "Cleric": 5,
+      "Druid": "unlimited",
+      "Magic-User": 8,
+      "Thief": "unlimited",
+      "Fighter/Magic-User": {"Fighter": 8, "Magic-User": 8},
+      "Fighter/Thief": {"Fighter": 8, "Thief": "unlimited"},
+      "Cleric/Fighter": {"Cleric": 5, "Fighter": 8},
+      "Fighter/Magic-User/Thief": {"Fighter": 8, "Magic-User": 8, "Thief": "unlimited"},
+      "Cleric/Fighter/Magic-User": {"Cleric": 5, "Fighter": 8, "Magic-User": 8}
+    },
+    "allowed_classes": ["Fighter", "Ranger", "Cleric", "Druid", "Magic-User", "Thief",
+                        "Fighter/Magic-User", "Fighter/Thief", "Cleric/Fighter",
+                        "Fighter/Magic-User/Thief", "Cleric/Fighter/Magic-User"],
+    "special_abilities": [
+      "Detect secret/concealed doors (1 on d6 passing, 1-3 actively searching)",
+      "30% resistance to charm and sleep spells",
+      "Infravision 60 ft"
+    ],
+    "notes": "Half-Elves receive a reduced version of Elven racial abilities."
+  },
+
+  "Half-Orc": {
+    "ability_modifiers": {"STR": 1, "CON": 1, "CHA": -2},
+    "ability_minimums": {"STR": 6, "INT": 3, "WIS": 3, "DEX": 3, "CON": 13, "CHA": 3},
+    "ability_maximums": {"STR": 18, "INT": 17, "WIS": 14, "DEX": 17, "CON": 19, "CHA": 12},
+    "infravision": true,
+    "infravision_range_ft": 60,
+    "languages": ["Common", "Orcish"],
+    "bonus_languages": false,
+    "class_level_limits": {
+      "Fighter": 10,
+      "Cleric": 4,
+      "Thief": 8,
+      "Assassin": "unlimited",
+      "Fighter/Thief": {"Fighter": 10, "Thief": 8},
+      "Fighter/Assassin": {"Fighter": 10, "Assassin": "unlimited"},
+      "Cleric/Fighter": {"Cleric": 4, "Fighter": 10},
+      "Cleric/Assassin": {"Cleric": 4, "Assassin": "unlimited"},
+      "Fighter/Cleric/Thief": {"Fighter": 10, "Cleric": 4, "Thief": 8}
+    },
+    "allowed_classes": ["Fighter", "Cleric", "Thief", "Assassin",
+                        "Fighter/Thief", "Fighter/Assassin", "Cleric/Fighter",
+                        "Cleric/Assassin", "Fighter/Cleric/Thief"],
+    "special_abilities": [
+      "Infravision 60 ft"
+    ],
+    "notes": "Half-Orcs have strong physical stats but low CHA maximum and INT/WIS caps. CHA max 12."
+  }
+}
