@@ -40,7 +40,7 @@ No other dependencies. No API keys. No web server.
 
 ```bash
 # 1. Clone and install
-git clone https://github.com/yourname/greyhawk-solo.git
+git clone https://github.com/Diogenes187/greyhawk-solo.git
 cd greyhawk-solo
 pip install "mcp[cli]"
 
@@ -62,7 +62,7 @@ Then say:
 ### 1. Clone the repo
 
 ```bash
-git clone https://github.com/yourname/greyhawk-solo.git
+git clone https://github.com/Diogenes187/greyhawk-solo.git
 cd greyhawk-solo
 ```
 

@@ -19,7 +19,7 @@ terminal and have Python installed. Takes about 10 minutes.
 ## Step 1 — Clone the repo
 
 ```bash
-git clone https://github.com/yourname/greyhawk-solo.git
+git clone https://github.com/Diogenes187/greyhawk-solo.git
 cd greyhawk-solo
 ```
 
