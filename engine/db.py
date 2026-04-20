@@ -3402,3 +3402,980 @@ def db_get_lost(terrain: str, weather_condition: str = "") -> dict:
         "extra_days_lost will be accounted for automatically."
     )
     return result
+
+
+# ==============================================================================
+# PHASE 5B — CAROUSING & DOWNTIME ACTIVITIES
+# carouse · research_spell · gather_rumors · religious_observance
+# domain_administration · recovery · craft_item
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# CAROUSING TABLE — Jeff Rients style, AD&D 1e flavour
+# Roll d20 (modified upward by gold-spend tier). XP = gold spent (always).
+# Low results = trouble; high results = colourful but manageable or beneficial.
+# ------------------------------------------------------------------------------
+
+_CAROUSING_SPEND_BONUS: list[tuple[int, int]] = [
+    # (minimum_gp_spent, d20_roll_modifier)
+    (500, +5),
+    (200, +4),
+    (100, +3),
+    ( 50, +2),
+    ( 25, +1),
+    (  1,  0),
+]
+
+_CAROUSING_TABLE: dict[int, dict] = {
+    1:  {"consequence": "public_disgrace",
+         "description": "You made a spectacular fool of yourself in public. -1 to reaction rolls in this community for 30 days.",
+         "mechanical": "reaction_penalty_30d",
+         "severity": "moderate"},
+    2:  {"consequence": "romantic_entanglement",
+         "description": "You wake next to someone with expectations. Roll Charisma or face a complicated social scene — possibly in front of witnesses.",
+         "mechanical": "cha_check_required",
+         "severity": "minor"},
+    3:  {"consequence": "brutal_hangover",
+         "description": "Your head is splitting and the room won't stop moving. Incapacitated for 1d6 hours at the start of the next session.",
+         "mechanical": "1d6_hours_incapacitated",
+         "severity": "minor"},
+    4:  {"consequence": "watch_trouble",
+         "description": "The watch would like a word about last night. Pay 20 gp fine or spend 1d3 days in a cell.",
+         "mechanical": "pay_20gp_or_1d3_days_jail",
+         "severity": "moderate"},
+    5:  {"consequence": "gambling_losses",
+         "description": "The dice were not your friends. Lose an additional 1d6x10 gp from your purse before morning.",
+         "mechanical": "lose_1d6x10_gp_extra",
+         "severity": "moderate"},
+    6:  {"consequence": "local_enemy",
+         "description": "You earned the lasting enmity of a local tough. He has friends, a scar, and an excellent memory.",
+         "mechanical": "new_enemy_npc",
+         "severity": "moderate"},
+    7:  {"consequence": "bar_brawl",
+         "description": "Bar fight erupted. You took 1d6 damage (armour does not count — this was a tavern). Your name is now in the watch's ledger.",
+         "mechanical": "1d6_damage_no_armor_plus_watch_notice",
+         "severity": "moderate"},
+    8:  {"consequence": "pickpocketed",
+         "description": "Someone had nimble fingers and a good eye. Lose an additional 1d6x5 gp from your person.",
+         "mechanical": "lose_1d6x5_gp_extra",
+         "severity": "minor"},
+    9:  {"consequence": "indiscretion",
+         "description": "You said something you absolutely should not have — about your plans, your allies, or your enemies. The rumour is already spreading.",
+         "mechanical": "rumor_started_about_pc",
+         "severity": "moderate"},
+    10: {"consequence": "tattoo",
+         "description": "You wake with a new tattoo. It is in a visible location. You have absolutely no memory of choosing it, but it is disturbingly well-executed.",
+         "mechanical": "cosmetic_only",
+         "severity": "minor"},
+    11: {"consequence": "dubious_contact",
+         "description": "You made a new acquaintance — a fence, a smuggler, a very well-connected rat-catcher. Definitely useful. Probably trouble eventually.",
+         "mechanical": "new_contact_npc",
+         "severity": "beneficial"},
+    12: {"consequence": "gambling_winnings",
+         "description": "Fortune smiled on you for once. You won at dice and recovered 1d6x10 gp before sunrise.",
+         "mechanical": "recover_1d6x10_gp",
+         "severity": "beneficial"},
+    13: {"consequence": "local_fame",
+         "description": "Your exploits — suitably embellished — are the talk of the common room. Reaction rolls +1 in this community for 30 days.",
+         "mechanical": "reaction_bonus_30d",
+         "severity": "beneficial"},
+    14: {"consequence": "mysterious_patron",
+         "description": "A well-dressed stranger bought rounds all night and was extremely interested in your plans. They will contact you. They will want something.",
+         "mechanical": "obligation_to_stranger",
+         "severity": "mixed"},
+    15: {"consequence": "debt",
+         "description": "You borrowed against tomorrow. A moneylender is owed 1d4x50 gp within 30 days — at interest. He has friends.",
+         "mechanical": "debt_1d4x50_gp_30_days",
+         "severity": "moderate"},
+    16: {"consequence": "notable_offended",
+         "description": "In your cups you publicly insulted a guild officer, temple elder, or minor noble. They remember. They have influence. They are not done with you.",
+         "mechanical": "powerful_enemy_created",
+         "severity": "serious"},
+    17: {"consequence": "political_entanglement",
+         "description": "You stumbled into a factional dispute and apparently took a side — without knowing it. Both factions believe you are their enemy.",
+         "mechanical": "two_faction_enemies",
+         "severity": "serious"},
+    18: {"consequence": "cultist_oath",
+         "description": "You won an oath-swearing contest at what turned out to be a cult ceremony. They consider you a member. They have expectations.",
+         "mechanical": "cult_membership_obligation",
+         "severity": "serious"},
+    19: {"consequence": "rolled_in_alley",
+         "description": "You wake in an alley with a headache and empty pockets. All carried coin is gone. Roll Constitution or lose one item as well.",
+         "mechanical": "lose_all_carried_coin_plus_con_check_for_item",
+         "severity": "severe"},
+    20: {"consequence": "grand_evening",
+         "description": "A legendary night by all accounts. The bard is already writing the song. No ill effects whatsoever.",
+         "mechanical": "no_consequence",
+         "severity": "beneficial"},
+}
+
+# ------------------------------------------------------------------------------
+# RUMOUR TABLES — by quality tier (1=tavern gossip, 4=reliable intelligence)
+# Template placeholders are filled from _RUMOUR_FILL at call time.
+# ------------------------------------------------------------------------------
+
+_RUMOUR_TEMPLATES: dict[int, list[str]] = {
+    1: [
+        "Someone claims to have seen lights moving in the old watchtower three nights running.",
+        "Old Marta swears there's a hoard buried under the ruins east of town — her grandfather said so.",
+        "The miller's boy went into the forest and came back talking strangely. He won't say what he saw.",
+        "Three merchants were robbed on the road to {road_dest}. Nobody saw a thing.",
+        "There's a witch living in the hills who can cure any disease — for a price.",
+        "Word is the local lord raised taxes again. People are angry but too scared to say it openly.",
+        "A foreign soldier was drinking here last tenday. He paid in coins nobody here recognised.",
+        "Something big is moving in the river at night. The fishermen won't go out after dark.",
+    ],
+    2: [
+        "A tinker who travels widely says the ruins of {ruin_name} have been disturbed recently — fresh tracks leading in, none coming out.",
+        "A traveller from the east claims a necromancer has been buying bodies from the undertakers in {town_name} — paying well.",
+        "River traders say there's a new toll on the {river_name} — not levied by any recognised lord.",
+        "A retired soldier says there's a cache of arms buried near the old battlefield — enough to equip thirty men.",
+        "A hedge wizard passing through detected an unusual concentration of magical aura from the forest to the north.",
+        "One of the local guild associates (not that he'd admit his connections) says a rival operation has moved into the territory.",
+        "A travelling priest of {deity_name} mentioned that a holy relic stolen from their shrine three years ago has surfaced locally.",
+        "Several farmers report missing livestock — not taken by wolves. The tracks are wrong.",
+    ],
+    3: [
+        "A dwarven prospector: there's a mine entrance in the {terrain} hills, sealed from the inside. The stonework is old — pre-migration era.",
+        "A retired adventurer, and she knows what she's talking about: the dungeon under {ruin_name} has three levels. She reached the second. She doesn't discuss why she stopped.",
+        "A road warden reports a band of {monster_type} using the ruined fort as a base. Roughly {number}. They haven't raided yet but they're scouting the roads.",
+        "A merchant with city contacts says a powerful magic item was stolen from a noble house. There is a quiet reward for its recovery — no questions asked.",
+        "A message-runner who reads the letters he carries says {faction_name} is planning to move against {target} within the month.",
+        "An ex-guild thief, going straight now, says there's a hidden vault beneath the old {building_type} in the next town. He has a partial map.",
+    ],
+    4: [
+        "First-hand account from a survivor: the dungeon at {ruin_name} has a guardian on the third level that cannot be harmed by non-magical weapons. They lost three good people learning that.",
+        "A well-paid spy confirms {faction_name} has a mole in the local garrison. Reports go out every tenday via a coded dead drop.",
+        "A wizard's apprentice, in exchange for passage out of town, provided her master's notes on the wards and traps protecting his tower. Detailed and current.",
+        "A former cultist, seeking redemption, provides the meeting schedule, location, and membership list of a local {cult_name} cell. He wants protection in return.",
+        "A cartographer's fresh survey locates three previously unmapped dungeon entrances in the {region_name} region — with rough interior sketches.",
+    ],
+}
+
+_RUMOUR_FILL: dict[str, list[str]] = {
+    "road_dest":    ["the capital", "the coast", "the border fort", "the dwarven holds"],
+    "ruin_name":    ["Stonehallow", "the Old Keep", "the Barrow Mounds", "Castle Greystone", "the Sunken Tower"],
+    "town_name":    ["Millford", "Rillford", "Eastgate", "the market town"],
+    "river_name":   ["the Velverdyva", "the Artonsamay", "the Nyr Dyv tributary"],
+    "deity_name":   ["Trithereon", "Pelor", "St. Cuthbert", "Heironeous"],
+    "terrain":      ["western", "northern", "eastern", "southern"],
+    "monster_type": ["gnolls", "orcs", "bandits", "hobgoblins", "bugbears"],
+    "number":       ["a dozen", "twenty or more", "thirty", "a score"],
+    "faction_name": ["the Horned Society", "the Scarlet Brotherhood", "the local thieves guild", "a merchant consortium"],
+    "target":       ["the town council", "the road garrison", "a rival merchant house", "the temple"],
+    "building_type":["granary", "inn", "guildhall", "old temple"],
+    "cult_name":    ["Vecna", "Iuz", "Nerull", "Incabulos"],
+    "region_name":  ["Vesve", "Velverdyva", "the northern march", "the border lands"],
+}
+
+
+def _fill_rumour(template: str) -> str:
+    """Replace {placeholder} tokens in a rumour template with random values."""
+    def _replacer(m: "re.Match") -> str:
+        key = m.group(1)
+        choices = _RUMOUR_FILL.get(key, [key])
+        return random.choice(choices)
+    return re.sub(r"\{(\w+)\}", _replacer, template)
+
+
+# ------------------------------------------------------------------------------
+# Shared downtime helpers
+# ------------------------------------------------------------------------------
+
+def _award_pc_xp(amount: int) -> dict:
+    """
+    Add XP to the PC's class_level rows (split evenly for multi-class).
+    Returns {"xp_awards": [...], "total_xp_awarded": int}.
+    """
+    with _get_conn(read_only=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT class_level_id, class_name, level, xp "
+            "FROM class_levels WHERE character_id = ?",
+            (_PC_CHARACTER_ID,),
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+
+    if not rows:
+        return {"error": "No class_levels found for PC", "xp_awards": [], "total_xp_awarded": 0}
+
+    share = amount // max(1, len(rows))
+    updates: list[dict] = []
+    with _get_conn() as conn:
+        for cls in rows:
+            new_xp = cls["xp"] + share
+            conn.execute(
+                "UPDATE class_levels SET xp = ? WHERE class_level_id = ?",
+                (new_xp, cls["class_level_id"]),
+            )
+            updates.append({
+                "class_name": cls["class_name"],
+                "level":      cls["level"],
+                "xp_before":  cls["xp"],
+                "xp_gained":  share,
+                "xp_after":   new_xp,
+            })
+    return {"xp_awards": updates, "total_xp_awarded": amount}
+
+
+def _log_downtime(activity: str, data: dict) -> None:
+    """Append a downtime record to world_facts (category='downtime_log')."""
+    with _get_conn() as conn:
+        conn.execute(
+            "INSERT INTO world_facts (campaign_id, category, fact_text, source_note) "
+            "VALUES (?, 'downtime_log', ?, ?)",
+            (_CAMPAIGN_ID, json.dumps(data), activity),
+        )
+
+
+def _get_pc_ability(stat: str) -> int:
+    """Return the PC's score for the named ability (e.g. 'charisma', 'intelligence')."""
+    with _get_conn(read_only=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            f"SELECT {stat} FROM character_abilities WHERE character_id = ?",
+            (_PC_CHARACTER_ID,),
+        )
+        row = cur.fetchone()
+    return int(row[0]) if row and row[0] is not None else 10
+
+
+def _ability_mod(score: int) -> int:
+    """AD&D 1e modifier for ability scores (used for reaction/morale checks)."""
+    if score <= 3:   return -3
+    if score <= 5:   return -2
+    if score <= 7:   return -1
+    if score <= 12:  return  0
+    if score <= 15:  return  1
+    if score <= 17:  return  2
+    return 3
+
+
+def _get_treasury_gp() -> int:
+    """Return GP balance of treasury_id=1 (primary account)."""
+    with _get_conn(read_only=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT gp FROM treasury_accounts "
+            "WHERE treasury_id = 1 AND campaign_id = ?",
+            (_CAMPAIGN_ID,),
+        )
+        row = cur.fetchone()
+    return int(row[0]) if row and row[0] is not None else 0
+
+
+def _downtime_advance_calendar(days: int, calendar_note: str) -> str:
+    """
+    Write/replace the 'calendar' world_fact.
+    Uses calendar_note verbatim if provided; otherwise appends '+N days' to the
+    existing entry.  Returns the final calendar string stored.
+    """
+    if calendar_note:
+        new_time = calendar_note
+    else:
+        with _get_conn(read_only=True) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT fact_text FROM world_facts "
+                "WHERE campaign_id = ? AND category = 'calendar' LIMIT 1",
+                (_CAMPAIGN_ID,),
+            )
+            row = cur.fetchone()
+        existing = row["fact_text"] if row else "576 CY (date unknown)"
+        new_time = f"{existing} [+{days}d]"
+
+    with _get_conn() as conn:
+        conn.execute(
+            "DELETE FROM world_facts WHERE campaign_id = ? AND category = 'calendar'",
+            (_CAMPAIGN_ID,),
+        )
+        conn.execute(
+            "INSERT INTO world_facts (campaign_id, category, fact_text, source_note) "
+            "VALUES (?, 'calendar', ?, 'downtime')",
+            (_CAMPAIGN_ID, new_time),
+        )
+    return new_time
+
+
+# ------------------------------------------------------------------------------
+# PUBLIC DOWNTIME FUNCTIONS
+# ------------------------------------------------------------------------------
+
+def db_carouse(gold_spent: int, calendar_note: str = "") -> dict:
+    """
+    Carousing: spend gold in taverns, earn XP equal to gold spent, roll d20 for
+    consequence.  Higher spend tiers add a bonus to the roll (wilder results).
+    """
+    if gold_spent < 1:
+        return {"error": "gold_spent must be at least 1."}
+
+    # Spend-tier roll bonus
+    roll_bonus = 0
+    for (min_gp, mod) in _CAROUSING_SPEND_BONUS:
+        if gold_spent >= min_gp:
+            roll_bonus = mod
+            break
+
+    # Deduct gold — cap at available balance
+    treasury_before = _get_treasury_gp()
+    actual_spent    = min(gold_spent, treasury_before)
+    if actual_spent <= 0:
+        return {"error": "Insufficient funds in primary treasury for carousing."}
+    _deduct_treasury(actual_spent)
+
+    # d20 + spend bonus, clamped 1-20
+    raw_roll   = random.randint(1, 20)
+    final_roll = max(1, min(20, raw_roll + roll_bonus))
+    entry      = _CAROUSING_TABLE[final_roll]
+
+    # XP = gold spent (always, win or lose)
+    xp_result = _award_pc_xp(actual_spent)
+
+    # Roll extra dice for mechanical effects
+    extra_gold_recovered = 0
+    extra_gold_lost      = 0
+    extra_rolls: dict    = {}
+
+    if entry["consequence"] == "gambling_winnings":
+        extra_gold_recovered = random.randint(1, 6) * 10
+        _credit_treasury(extra_gold_recovered)
+        extra_rolls["winnings_roll"] = extra_gold_recovered
+
+    elif entry["consequence"] in ("gambling_losses",):
+        extra_gold_lost = random.randint(1, 6) * 10
+        _deduct_treasury(extra_gold_lost)
+        extra_rolls["extra_loss_roll"] = extra_gold_lost
+
+    elif entry["consequence"] == "pickpocketed":
+        extra_gold_lost = random.randint(1, 6) * 5
+        _deduct_treasury(extra_gold_lost)
+        extra_rolls["pickpocket_roll"] = extra_gold_lost
+
+    elif entry["consequence"] == "debt":
+        debt_amount = random.randint(1, 4) * 50
+        extra_rolls["debt_amount_gp"] = debt_amount
+
+    elif entry["consequence"] == "bar_brawl":
+        damage = random.randint(1, 6)
+        extra_rolls["brawl_damage"] = damage
+
+    elif entry["consequence"] == "brutal_hangover":
+        hours_lost = random.randint(1, 6)
+        extra_rolls["hours_incapacitated"] = hours_lost
+
+    treasury_after = treasury_before - actual_spent + extra_gold_recovered - extra_gold_lost
+
+    cal = _downtime_advance_calendar(1, calendar_note)
+
+    result = {
+        "activity":          "carouse",
+        "gold_spent":        actual_spent,
+        "treasury_before":   treasury_before,
+        "treasury_after":    treasury_after,
+        "xp_awarded":        actual_spent,
+        "xp_details":        xp_result.get("xp_awards", []),
+        "d20_roll":          raw_roll,
+        "spend_bonus":       roll_bonus,
+        "final_roll":        final_roll,
+        "consequence_type":  entry["consequence"],
+        "consequence":       entry["description"],
+        "mechanical_effect": entry["mechanical"],
+        "severity":          entry["severity"],
+        "extra_rolls":       extra_rolls,
+        "calendar":          cal,
+        "dm_note": (
+            "Apply mechanical_effect narratively. For damage consequences call "
+            "update_character_status. For new_enemy_npc / new_contact_npc call "
+            "add_npc. For debt or political consequences record via update_world_fact. "
+            "XP is always awarded regardless of consequence."
+        ),
+    }
+    _log_downtime("carouse", result)
+    return result
+
+
+def db_research_spell(
+    spell_name:    str,
+    spell_level:   int,
+    days:          int,
+    gold_spent:    int,
+    calendar_note: str = "",
+) -> dict:
+    """
+    Magic-User researches a new spell or copies one into their spellbook.
+    Success chance: base 45% + INT modifier x5% + extra weeks over minimum x5%.
+    Cost guideline: 100 gp x spell_level per week.
+    XP on success: 100 x spell_level.
+    """
+    spell_level = max(1, min(9, spell_level))
+    days        = max(1, days)
+
+    int_score = _get_pc_ability("intelligence")
+    int_mod   = _ability_mod(int_score)
+
+    # Minimum time: spell_level days; typical: spell_level weeks
+    min_days    = spell_level
+    weeks_spent = max(1, days // 7)
+    extra_weeks = max(0, weeks_spent - spell_level)
+
+    expected_gp = spell_level * 100 * weeks_spent
+
+    # Success chance
+    success_pct = 45 + (int_mod * 5) + (extra_weeks * 5)
+    success_pct = max(5, min(95, success_pct))
+
+    # Deduct gold
+    treasury_before = _get_treasury_gp()
+    actual_spent    = min(gold_spent, treasury_before)
+    _deduct_treasury(actual_spent)
+
+    roll    = random.randint(1, 100)
+    success = roll <= success_pct
+
+    if success:
+        xp_award  = spell_level * 100
+        xp_result = _award_pc_xp(xp_award)
+        note = (
+            f"'{spell_name}' (level {spell_level}) successfully researched "
+            f"and added to spellbook after {days} days."
+        )
+    else:
+        # On failure: half the time and cost is recoverable; can retry
+        xp_award  = 0
+        xp_result = {"xp_awards": [], "total_xp_awarded": 0}
+        note = (
+            f"Research on '{spell_name}' (level {spell_level}) failed after "
+            f"{days} days. Half the time invested; may retry with fresh materials."
+        )
+
+    cal = _downtime_advance_calendar(days, calendar_note)
+
+    result = {
+        "activity":          "research_spell",
+        "spell_name":        spell_name,
+        "spell_level":       spell_level,
+        "days_spent":        days,
+        "gold_spent":        actual_spent,
+        "expected_cost_gp":  expected_gp,
+        "intelligence":      int_score,
+        "success_chance_pct": success_pct,
+        "roll":              roll,
+        "success":           success,
+        "xp_awarded":        xp_award,
+        "xp_details":        xp_result.get("xp_awards", []),
+        "calendar":          cal,
+        "note":              note,
+        "dm_note": (
+            "On success, call update_world_fact(category='spellbook_contents') to "
+            "record the new spell. The spell is not yet memorized — use memorize_spells "
+            "after the next long rest."
+        ),
+    }
+    _log_downtime("research_spell", result)
+    return result
+
+
+def db_gather_rumors(
+    settlement:    str,
+    days:          int,
+    gold_spent:    int,
+    calendar_note: str = "",
+) -> dict:
+    """
+    Spend days in a settlement buying drinks and asking questions.
+    Days and gold spent determine quality tier and rumour count.
+    Charisma modifier extends maximum quality.
+    Results stored in world_facts (category='rumors') for future retrieval.
+    """
+    days       = max(1, days)
+    gold_spent = max(0, gold_spent)
+
+    # Determine quality ceiling and rumour die
+    if days >= 8 or gold_spent >= 100:
+        max_quality  = 4
+        rumour_die   = 8
+    elif days >= 4 or gold_spent >= 50:
+        max_quality  = 3
+        rumour_die   = 6
+    elif days >= 2 or gold_spent >= 20:
+        max_quality  = 2
+        rumour_die   = 4
+    else:
+        max_quality  = 1
+        rumour_die   = 3
+
+    cha_score = _get_pc_ability("charisma")
+    cha_mod   = _ability_mod(cha_score)
+    effective_max = min(4, max_quality + max(0, cha_mod))
+
+    num_rumors = random.randint(1, rumour_die)
+
+    gathered: list[dict] = []
+    for _ in range(num_rumors):
+        quality   = random.randint(1, effective_max)
+        pool      = _RUMOUR_TEMPLATES.get(quality, _RUMOUR_TEMPLATES[1])
+        text      = _fill_rumour(random.choice(pool))
+        gathered.append({"quality": quality, "text": text})
+    gathered.sort(key=lambda r: r["quality"], reverse=True)
+
+    # Deduct expenses
+    treasury_before = _get_treasury_gp()
+    actual_spent    = min(gold_spent, treasury_before)
+    _deduct_treasury(actual_spent)
+
+    # XP: 10 per day of investigation
+    xp_award  = days * 10
+    xp_result = _award_pc_xp(xp_award)
+
+    # Persist each rumour to world_facts
+    with _get_conn() as conn:
+        for r in gathered:
+            conn.execute(
+                "INSERT INTO world_facts "
+                "(campaign_id, category, fact_text, source_note) "
+                "VALUES (?, 'rumors', ?, ?)",
+                (
+                    _CAMPAIGN_ID,
+                    r["text"],
+                    f"Q{r['quality']} — {settlement}",
+                ),
+            )
+
+    cal = _downtime_advance_calendar(days, calendar_note)
+
+    result = {
+        "activity":       "gather_rumors",
+        "settlement":     settlement,
+        "days_spent":     days,
+        "gold_spent":     actual_spent,
+        "charisma":       cha_score,
+        "max_quality":    effective_max,
+        "rumors_learned": len(gathered),
+        "rumors":         gathered,
+        "xp_awarded":     xp_award,
+        "xp_details":     xp_result.get("xp_awards", []),
+        "calendar":       cal,
+        "dm_note": (
+            "Rumors are stored in world_facts category='rumors'. "
+            "Quality 4 = reliable intelligence; quality 1 = colourful tavern gossip "
+            "that may or may not be true. Embellish freely. "
+            "Call update_world_fact or save_turn to act on any rumour that leads "
+            "somewhere significant."
+        ),
+    }
+    _log_downtime("gather_rumors", result)
+    return result
+
+
+def db_religious_observance(
+    deity:           str,
+    observance_type: str,
+    calendar_note:   str = "",
+) -> dict:
+    """
+    Cleric fulfils religious obligations.
+    observance_type: 'weekly' | 'holy_day' | 'atonement' | 'major_ritual'
+
+    Tracks cumulative missed observances and active bonuses/penalties in
+    world_facts (category='religious_obligations', source_note=deity).
+    Missed count >= 3 triggers loss of highest-level spell slot (DM applies).
+    """
+    # Load existing record for this deity
+    with _get_conn(read_only=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT world_fact_id, fact_text FROM world_facts "
+            "WHERE campaign_id = ? AND category = 'religious_obligations' "
+            "AND source_note = ? LIMIT 1",
+            (_CAMPAIGN_ID, deity),
+        )
+        row = cur.fetchone()
+
+    if row:
+        record  = json.loads(row["fact_text"])
+        fact_id = row["world_fact_id"]
+    else:
+        record  = {
+            "deity":          deity,
+            "missed_count":   0,
+            "penalty_stacks": 0,
+            "bonus_active":   None,
+            "last_observed":  None,
+        }
+        fact_id = None
+
+    missed_before  = record.get("missed_count",   0)
+    penalty_before = record.get("penalty_stacks", 0)
+
+    OBSERVANCE_PARAMS = {
+        "weekly":       {"xp": 50,  "days": 1, "bonus": "prayer_bonus_24h",
+                         "desc": "Weekly prayers completed. Divine standing maintained; minor blessing granted."},
+        "holy_day":     {"xp": 200, "days": 1, "bonus": "holy_day_bonus_7d",
+                         "desc": "Holy day rites observed. +1 to all saving throws for 7 days."},
+        "atonement":    {"xp": 100, "days": 2, "bonus": "atonement_cleared",
+                         "desc": "Atonement rites complete. All penalties cleared; standing with deity restored."},
+        "major_ritual": {"xp": 300, "days": 3, "bonus": "divine_favour_14d",
+                         "desc": "Major ritual completed. Deity's favour: +1 morale to all followers for 14 days; +1 to next turn undead attempt."},
+    }
+    obs  = OBSERVANCE_PARAMS.get(observance_type, OBSERVANCE_PARAMS["weekly"])
+    days = obs["days"]
+
+    # Clear atonement fully; otherwise reduce by 1
+    if observance_type == "atonement":
+        new_missed   = 0
+        new_penalties = 0
+    else:
+        new_missed    = max(0, missed_before - 1)
+        new_penalties = max(0, penalty_before - 1)
+
+    record.update({
+        "missed_count":   new_missed,
+        "penalty_stacks": new_penalties,
+        "bonus_active":   obs["bonus"],
+        "last_observed":  calendar_note or "recently",
+    })
+
+    with _get_conn() as conn:
+        if fact_id:
+            conn.execute(
+                "UPDATE world_facts SET fact_text = ? WHERE world_fact_id = ?",
+                (json.dumps(record), fact_id),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO world_facts "
+                "(campaign_id, category, fact_text, source_note) "
+                "VALUES (?, 'religious_obligations', ?, ?)",
+                (_CAMPAIGN_ID, json.dumps(record), deity),
+            )
+
+    xp_result = _award_pc_xp(obs["xp"])
+    cal       = _downtime_advance_calendar(days, calendar_note)
+
+    result = {
+        "activity":        "religious_observance",
+        "deity":           deity,
+        "observance_type": observance_type,
+        "days_spent":      days,
+        "penalty_before":  penalty_before,
+        "penalty_after":   new_penalties,
+        "missed_before":   missed_before,
+        "missed_after":    new_missed,
+        "bonus_granted":   obs["bonus"],
+        "xp_awarded":      obs["xp"],
+        "xp_details":      xp_result.get("xp_awards", []),
+        "description":     obs["desc"],
+        "calendar":        cal,
+        "dm_note": (
+            "Apply bonus narratively: holy_day_bonus_7d = +1 all saves 7 days; "
+            "divine_favour_14d = +1 troop/follower morale 14 days and +1 next turn "
+            "undead attempt; prayer_bonus_24h = +1 next Wis check. "
+            "If missed_count reaches 3+, cleric loses their highest memorized spell "
+            "level until atonement is performed."
+        ),
+    }
+    _log_downtime("religious_observance", result)
+    return result
+
+
+def db_domain_administration(
+    days:          int,
+    focus:         str         = "general",
+    calendar_note: str         = "",
+) -> dict:
+    """
+    Hold court and administer the domain for 1-14 days.
+    focus: 'general' | 'military' | 'economic' | 'diplomatic' | 'justice'
+    Charisma and Intelligence modify the d20 roll.
+    Result affects NPC loyalty, troop morale, and treasury efficiency notes.
+    """
+    days = max(1, min(14, days))
+
+    cha_score = _get_pc_ability("charisma")
+    int_score = _get_pc_ability("intelligence")
+    cha_mod   = _ability_mod(cha_score)
+    int_mod   = _ability_mod(int_score)
+
+    # d20 + ability mods + duration bonus
+    raw_roll   = random.randint(1, 20)
+    dur_bonus  = (1 if days >= 3 else 0) + (1 if days >= 7 else 0)
+    total_roll = max(1, min(20, raw_roll + cha_mod + dur_bonus))
+
+    if total_roll >= 18:
+        tier   = "excellent"
+        outcome = "Exceptional session — the realm feels your hand on the reins."
+        npc_mood    = "improved"
+        troop_mood  = "elevated"
+        xp_mult     = 3
+        bonus_effect = (
+            "Treasury efficiency +10% this season. One outstanding petition resolved "
+            "decisively in the PC's favour. Key NPC loyalty +1."
+        )
+    elif total_roll >= 14:
+        tier   = "good"
+        outcome = "Effective court — business handled, people satisfied."
+        npc_mood    = "satisfied"
+        troop_mood  = "steady"
+        xp_mult     = 2
+        bonus_effect = (
+            "Key NPCs note the diligence. One piece of actionable intelligence "
+            "brought to the PC's attention through normal channels."
+        )
+    elif total_roll >= 9:
+        tier   = "adequate"
+        outcome = "Routine session — nothing remarkable."
+        npc_mood    = "neutral"
+        troop_mood  = "unchanged"
+        xp_mult     = 1
+        bonus_effect = "Business as usual. No complications."
+    elif total_roll >= 5:
+        tier   = "poor"
+        outcome = "Distracted session — a petition was mishandled."
+        npc_mood    = "mildly_dissatisfied"
+        troop_mood  = "unchanged"
+        xp_mult     = 0
+        bonus_effect = "One minor NPC is quietly disgruntled. May surface as a complication later."
+    else:
+        tier   = "crisis"
+        outcome = "Crisis during court — a serious dispute erupted."
+        npc_mood    = "alarmed"
+        troop_mood  = "unsettled"
+        xp_mult     = 0
+        bonus_effect = (
+            "Serious dispute requires follow-up action next session. "
+            "One troop group's morale may drop if not addressed."
+        )
+
+    FOCUS_FLAVOUR = {
+        "general":    "General court: petitions, disputes, and reports from all quarters.",
+        "military":   "Military review: troop readiness, supply, and deployment assessed.",
+        "economic":   "Economic session: guild reports, trade routes, and treasury reviewed.",
+        "diplomatic": "Diplomatic audience: emissaries, envoys, and petitioners received.",
+        "justice":    "Justice session: crimes, punishments, and outstanding disputes adjudicated.",
+    }
+
+    xp_award  = days * 20 * max(0, xp_mult)
+    xp_result = _award_pc_xp(xp_award) if xp_award > 0 else {"xp_awards": [], "total_xp_awarded": 0}
+    cal       = _downtime_advance_calendar(days, calendar_note)
+
+    result = {
+        "activity":      "domain_administration",
+        "days_spent":    days,
+        "focus":         focus,
+        "focus_desc":    FOCUS_FLAVOUR.get(focus, FOCUS_FLAVOUR["general"]),
+        "charisma":      cha_score,
+        "intelligence":  int_score,
+        "d20_roll":      raw_roll,
+        "modifier":      cha_mod + dur_bonus,
+        "final_roll":    total_roll,
+        "outcome_tier":  tier,
+        "outcome":       outcome,
+        "npc_mood":      npc_mood,
+        "troop_mood":    troop_mood,
+        "bonus_effect":  bonus_effect,
+        "xp_awarded":    xp_award,
+        "xp_details":    xp_result.get("xp_awards", []),
+        "calendar":      cal,
+        "dm_note": (
+            "For 'excellent'/'good' outcomes, call update_npc on key NPCs to note "
+            "improved loyalty. For 'poor'/'crisis', note the disgruntled NPC and "
+            "track for future roleplay. A 'crisis' may warrant a save_turn to narrate "
+            "the dispute and its resolution."
+        ),
+    }
+    _log_downtime("domain_administration", result)
+    return result
+
+
+def db_recovery(
+    injury_description: str,
+    days_resting:       int,
+    calendar_note:      str = "",
+) -> dict:
+    """
+    Extended rest for serious injuries or magical ailments beyond normal healing.
+    Enhanced HP recovery: 2 HP per character level per week (vs 1/level/night).
+    7+ days clears minor ailments; 30+ days clears all ailments (status_notes reset).
+    """
+    days_resting = max(1, min(90, days_resting))
+
+    # Get current HP and status
+    with _get_conn(read_only=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT hp_current, hp_max, status_notes "
+            "FROM character_status WHERE character_id = ?",
+            (_PC_CHARACTER_ID,),
+        )
+        status = dict(cur.fetchone())
+
+    # Get total character levels for recovery rate
+    with _get_conn(read_only=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT SUM(level) FROM class_levels WHERE character_id = ?",
+            (_PC_CHARACTER_ID,),
+        )
+        lv_row = cur.fetchone()
+    total_levels = int(lv_row[0]) if lv_row and lv_row[0] else 1
+
+    hp_cur = status["hp_current"]
+    hp_max = status["hp_max"]
+
+    # 2 HP per level per week of complete bed rest
+    hp_per_week  = total_levels * 2
+    full_weeks   = days_resting // 7
+    partial_days = days_resting % 7
+    # Partial week: 1 HP per level per day (normal rate)
+    hp_recovered = min(
+        hp_max - hp_cur,
+        full_weeks * hp_per_week + partial_days * total_levels,
+    )
+    new_hp = min(hp_max, hp_cur + hp_recovered)
+
+    if days_resting >= 30:
+        ailments_cleared = "all"
+        new_notes        = None
+        recovery_note    = "Full recovery from extended bed rest. All ailments and conditions resolved."
+    elif days_resting >= 14:
+        ailments_cleared = "moderate"
+        new_notes        = status.get("status_notes")
+        recovery_note    = "Two weeks of rest cleared moderate ailments. Serious conditions persist."
+    elif days_resting >= 7:
+        ailments_cleared = "minor"
+        new_notes        = status.get("status_notes")
+        recovery_note    = "One week of rest cleared minor ailments. Serious conditions persist."
+    else:
+        ailments_cleared = "none"
+        new_notes        = status.get("status_notes")
+        recovery_note    = "Short recovery. HP improved; no ailments cleared."
+
+    with _get_conn() as conn:
+        conn.execute(
+            "UPDATE character_status SET hp_current = ?, status_notes = ? "
+            "WHERE character_id = ?",
+            (new_hp, new_notes, _PC_CHARACTER_ID),
+        )
+
+    # XP: 5 per day (representing time cost, not merit)
+    xp_award  = days_resting * 5
+    xp_result = _award_pc_xp(xp_award)
+    cal       = _downtime_advance_calendar(days_resting, calendar_note)
+
+    result = {
+        "activity":           "recovery",
+        "injury_description": injury_description,
+        "days_resting":       days_resting,
+        "hp_before":          hp_cur,
+        "hp_after":           new_hp,
+        "hp_recovered":       hp_recovered,
+        "hp_max":             hp_max,
+        "ailments_cleared":   ailments_cleared,
+        "recovery_note":      recovery_note,
+        "xp_awarded":         xp_award,
+        "xp_details":         xp_result.get("xp_awards", []),
+        "calendar":           cal,
+        "dm_note": (
+            "30 days automatically clears status_notes (all conditions). "
+            "Magical ailments (curses, lycanthropy, charm, energy drain) require "
+            "Remove Curse / Cure Disease / Restoration in addition to bed rest — "
+            "recovery alone does not cure magical conditions."
+        ),
+    }
+    _log_downtime("recovery", result)
+    return result
+
+
+def db_craft_item(
+    item_name:     str,
+    item_type:     str,
+    materials_gp:  int,
+    days:          int,
+    calendar_note: str = "",
+) -> dict:
+    """
+    Craft a mundane or minor magical item.
+    item_type: 'mundane' | 'masterwork' | 'scroll' | 'potion' | 'minor_magic'
+    On success, item is added to the PC's inventory via the items/inventory tables.
+    On failure, half the materials are lost; retry is possible.
+    """
+    CRAFT_PARAMS: dict[str, dict] = {
+        "mundane":     {"base_pct": 90, "min_days": 1,  "xp_base": 50,  "magic": False},
+        "masterwork":  {"base_pct": 70, "min_days": 7,  "xp_base": 150, "magic": False},
+        "scroll":      {"base_pct": 65, "min_days": 3,  "xp_base": 200, "magic": True},
+        "potion":      {"base_pct": 60, "min_days": 7,  "xp_base": 250, "magic": True},
+        "minor_magic": {"base_pct": 45, "min_days": 14, "xp_base": 500, "magic": True},
+    }
+    params = CRAFT_PARAMS.get(item_type, CRAFT_PARAMS["mundane"])
+
+    days         = max(1, days)
+    materials_gp = max(0, materials_gp)
+
+    int_score = _get_pc_ability("intelligence")
+    int_mod   = _ability_mod(int_score)
+
+    days_over    = max(0, days - params["min_days"])
+    extra_bonus  = min(20, (days_over // max(1, params["min_days"])) * 5)
+    success_pct  = params["base_pct"] + (int_mod * 3) + extra_bonus
+    success_pct  = max(5, min(98, success_pct))
+
+    # Deduct materials
+    treasury_before = _get_treasury_gp()
+    actual_spent    = min(materials_gp, treasury_before)
+    _deduct_treasury(actual_spent)
+
+    roll    = random.randint(1, 100)
+    success = roll <= success_pct
+
+    if success:
+        # Add item to inventory using existing add_item()
+        add_item(
+            name       = item_name,
+            item_type  = item_type,
+            magic_flag = params["magic"],
+            value_gp   = actual_spent,
+            notes      = f"Crafted — {days} days, {actual_spent} gp materials.",
+        )
+        xp_award   = params["xp_base"] + (actual_spent // 10)
+        xp_result  = _award_pc_xp(xp_award)
+        craft_note = (
+            f"{item_name} ({item_type}) successfully crafted and added to "
+            f"inventory after {days} days."
+        )
+    else:
+        # Half materials lost on failure
+        refund = actual_spent // 2
+        if refund > 0:
+            _credit_treasury(refund)
+        xp_award   = 0
+        xp_result  = {"xp_awards": [], "total_xp_awarded": 0}
+        craft_note = (
+            f"Crafting of {item_name} ({item_type}) failed after {days} days. "
+            f"{actual_spent - refund} gp in materials lost. May retry."
+        )
+
+    cal = _downtime_advance_calendar(days, calendar_note)
+
+    result = {
+        "activity":       "craft_item",
+        "item_name":      item_name,
+        "item_type":      item_type,
+        "days_spent":     days,
+        "materials_gp":   actual_spent,
+        "success_chance": success_pct,
+        "roll":           roll,
+        "success":        success,
+        "item_added":     success,
+        "xp_awarded":     xp_award,
+        "xp_details":     xp_result.get("xp_awards", []),
+        "calendar":       cal,
+        "note":           craft_note,
+        "dm_note": (
+            "Item added to PC inventory on success. For scrolls, also call "
+            "update_world_fact(category='spellbook_contents') to note the spell. "
+            "For potions and minor_magic items, describe the effect in a follow-up "
+            "save_turn. Failed crafting loses half the materials; retry is always allowed."
+        ),
+    }
+    _log_downtime("craft_item", result)
+    return result

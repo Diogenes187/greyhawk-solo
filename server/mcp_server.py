@@ -64,6 +64,15 @@ Tools exposed:
   generate_weather        -- Roll daily weather for season and region
   get_current_weather     -- Return today's weather and 3-day forecast
 
+  CAROUSING & DOWNTIME
+  carouse                 -- Spend gold, roll Jeff Rients d20 table, earn XP, apply consequence
+  research_spell          -- Magic-User researches/copies a spell; INT + time + gold = success chance
+  gather_rumors           -- Spend days in settlement; roll for rumour quantity and quality tier
+  religious_observance    -- Cleric fulfils deity obligations; tracks penalties/bonuses
+  domain_administration   -- Hold court; Cha roll affects NPC loyalty and troop morale
+  recovery                -- Extended bed rest for serious injuries; enhanced HP + ailment clearing
+  craft_item              -- Spend time and materials to produce mundane or minor magic items
+
 Architecture:
   - FastMCP (mcp 1.27.0) runs over stdio; Claude Desktop connects as a client.
   - All DB access goes through engine/db.py — this file contains zero SQL.
@@ -123,6 +132,14 @@ from engine.db import (
     db_start_travel, db_travel_turn, db_get_lost,
     db_generate_weather, db_get_current_weather,
     _get_world_fact_json, _BASE_MOVE_MPD,
+    # Phase 5B — carousing & downtime
+    db_carouse,
+    db_research_spell,
+    db_gather_rumors,
+    db_religious_observance,
+    db_domain_administration,
+    db_recovery,
+    db_craft_item,
     # Phase 4 — domain
     get_full_domain_state,
     db_add_construction_project,
@@ -3067,6 +3084,382 @@ def get_lost(
     extra days lost (0 or 1), and a description for narration.
     """
     return db_get_lost(terrain=terrain, weather_condition=weather_condition)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PHASE 5B — CAROUSING & DOWNTIME ACTIVITIES
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@mcp.tool()
+def carouse(
+    gold_spent: Annotated[
+        int,
+        "Gold pieces spent on the evening's entertainment (minimum 1). "
+        "This exact amount is deducted from the primary treasury. "
+        "XP equal to gold spent is always awarded. "
+        "Spend tiers add a bonus to the d20 consequence roll: "
+        "25 gp = +1, 50 gp = +2, 100 gp = +3, 200 gp = +4, 500 gp = +5. "
+        "Higher rolls trend toward colourful but manageable; lower rolls toward trouble.",
+    ],
+    calendar_note: Annotated[
+        str,
+        "Current in-game date/time to record, e.g. 'Coldeven 14, 576 CY'. "
+        "If omitted, '+1d' is appended to the existing calendar entry.",
+    ] = "",
+) -> dict:
+    """
+    Carousing downtime activity — Jeff Rients style.
+
+    The character spends an evening (or three) in the taverns and back alleys of
+    the nearest settlement. Gold spent is deducted from the primary treasury and
+    converted 1:1 into XP — always, regardless of what the dice decide.
+
+    Then a d20 is rolled (modified by gold spend tier) to determine the night's
+    consequence. Results 1-10 range from public embarrassment to serious trouble.
+    Results 11-20 are colourful, beneficial, or at worst mixed.
+
+    Returns:
+    - gold_spent, treasury_before/after
+    - xp_awarded and per-class XP breakdown
+    - d20 raw roll, spend_bonus, final_roll
+    - consequence_type, consequence (narrative text), mechanical_effect, severity
+    - extra_rolls (damage dice, debt amounts, winnings, etc. pre-rolled)
+    - calendar (updated in-game date)
+    - dm_note with instructions for applying mechanical effects
+
+    Jeff Rients carousing XP rule: GP spent = XP earned, period. The night out
+    is its own reward. The hangover/enemy/tattoo is the game.
+    """
+    return db_carouse(gold_spent=gold_spent, calendar_note=calendar_note)
+
+
+@mcp.tool()
+def research_spell(
+    spell_name: Annotated[
+        str,
+        "Name of the spell being researched or copied into the spellbook.",
+    ],
+    spell_level: Annotated[
+        int,
+        "Level of the spell (1-9). Determines minimum research time, "
+        "expected gold cost (100 gp x level x weeks), and XP awarded on success.",
+    ],
+    days: Annotated[
+        int,
+        "Number of days spent on research. Minimum viable: spell_level days. "
+        "Typical: spell_level weeks (e.g. level 3 spell = 21 days). "
+        "Extra weeks beyond the minimum add +5% to success chance each.",
+    ],
+    gold_spent: Annotated[
+        int,
+        "Gold pieces spent on materials, components, and library access. "
+        "Guideline: 100 gp x spell_level x weeks worked. "
+        "Underfunding does not directly penalise success but is tracked.",
+    ],
+    calendar_note: Annotated[
+        str,
+        "Current in-game date after the research period, e.g. 'Coldeven 28, 576 CY'. "
+        "If omitted, '+N days' is appended to the existing calendar entry.",
+    ] = "",
+) -> dict:
+    """
+    Magic-User researches a new spell or copies one from a discovered scroll/tome.
+
+    Success chance formula:
+      Base 45% + (Intelligence modifier × 5%) + (extra weeks over minimum × 5%)
+      Capped at 5% minimum / 95% maximum.
+
+    On success:
+    - Spell is noted as added to spellbook (DM calls update_world_fact to record it)
+    - XP awarded: 100 × spell_level
+    - Calendar advances by days spent
+
+    On failure:
+    - Half the time invested (research notes exist; retry possible)
+    - All gold spent (materials consumed)
+    - No XP
+
+    The spell is not memorized upon research — use memorize_spells after the
+    next long rest to prepare it.
+
+    Returns: spell_name, spell_level, success, roll, success_chance_pct,
+    days_spent, gold_spent, expected_cost_gp, xp_awarded, calendar, dm_note.
+    """
+    return db_research_spell(
+        spell_name=spell_name,
+        spell_level=spell_level,
+        days=days,
+        gold_spent=gold_spent,
+        calendar_note=calendar_note,
+    )
+
+
+@mcp.tool()
+def gather_rumors(
+    settlement: Annotated[
+        str,
+        "Name of the settlement where rumours are gathered "
+        "(e.g. 'Rillford', 'Quasquetan', 'the border fort').",
+    ],
+    days: Annotated[
+        int,
+        "Days spent in taverns, markets, and common rooms. "
+        "1 day = quality 1-2 gossip; 4+ days = quality 3 intelligence; "
+        "8+ days = quality 4 reliable sources.",
+    ],
+    gold_spent: Annotated[
+        int,
+        "Gold pieces spent on drinks, bribes, and introductions. "
+        "0 gp = free gossip only; 50+ gp = quality 3; 100+ gp = quality 4. "
+        "Deducted from primary treasury.",
+    ],
+    calendar_note: Annotated[
+        str,
+        "In-game date after the investigation period. "
+        "If omitted, '+N days' appended to existing calendar.",
+    ] = "",
+) -> dict:
+    """
+    Spend time and coin in a settlement gathering rumours and intelligence.
+
+    Quality tiers:
+    - Quality 1: Common tavern gossip — colourful but often distorted or wrong.
+    - Quality 2: Credible traveller reports — details may be off but leads are real.
+    - Quality 3: Reliable local sources — specific, actionable, mostly accurate.
+    - Quality 4: Solid intelligence from insiders — treat as confirmed fact.
+
+    Charisma modifier extends the maximum quality tier available.
+
+    All gathered rumours are stored in world_facts (category='rumors') for
+    future reference. XP: 10 per day of investigation.
+
+    Returns: settlement, days_spent, gold_spent, rumors_learned, rumors list
+    (each with quality and text), max_quality, xp_awarded, calendar, dm_note.
+    """
+    return db_gather_rumors(
+        settlement=settlement,
+        days=days,
+        gold_spent=gold_spent,
+        calendar_note=calendar_note,
+    )
+
+
+@mcp.tool()
+def religious_observance(
+    deity: Annotated[
+        str,
+        "Name of the deity whose rites are being observed "
+        "(e.g. 'Trithereon', 'Vecna', 'Pelor', 'St. Cuthbert').",
+    ],
+    observance_type: Annotated[
+        str,
+        "Type of religious duty being performed: "
+        "'weekly' — standard prayers (1 day, 50 XP, clears 1 missed mark); "
+        "'holy_day' — seasonal feast day rites (1 day, 200 XP, +1 saves 7 days); "
+        "'atonement' — formal penance for offences against the deity (2 days, 100 XP, clears ALL penalties); "
+        "'major_ritual' — full ceremony with sacrifice or great deed (3 days, 300 XP, divine favour 14 days).",
+    ],
+    calendar_note: Annotated[
+        str,
+        "Current in-game date, e.g. 'Coldeven 7, 576 CY'. "
+        "If omitted, the appropriate days are appended to the existing calendar.",
+    ] = "",
+) -> dict:
+    """
+    Cleric fulfils obligations to their patron deity.
+
+    Tracking: missed observances accumulate in world_facts
+    (category='religious_obligations'). If missed_count reaches 3 or more, the
+    cleric loses their highest memorized spell level until atonement is performed.
+
+    Performing any observance reduces missed_count by 1 (except atonement, which
+    resets it to 0). The appropriate bonus is granted immediately.
+
+    Bonuses:
+    - weekly: prayer_bonus_24h — +1 to next Wisdom check
+    - holy_day: holy_day_bonus_7d — +1 to all saving throws for 7 days
+    - atonement: atonement_cleared — all penalties removed; standing restored
+    - major_ritual: divine_favour_14d — +1 morale to all followers 14 days;
+      +1 to the cleric's next turn undead attempt
+
+    Vital for Aelric (Vecna) — missed Vecna rites carry especially severe
+    consequences given the Eye's ongoing demands.
+
+    Returns: deity, observance_type, penalty_before/after, missed_before/after,
+    bonus_granted, xp_awarded, description, calendar, dm_note.
+    """
+    return db_religious_observance(
+        deity=deity,
+        observance_type=observance_type,
+        calendar_note=calendar_note,
+    )
+
+
+@mcp.tool()
+def domain_administration(
+    days: Annotated[
+        int,
+        "Days spent holding court and administering the domain (1-14). "
+        "3+ days grants +1 roll bonus; 7+ days grants an additional +1.",
+    ],
+    focus: Annotated[
+        str,
+        "Focus of the court session: "
+        "'general' — petitions, disputes, all quarters (default); "
+        "'military' — troop readiness, supply, deployment; "
+        "'economic' — guild reports, trade routes, treasury; "
+        "'diplomatic' — emissaries, envoys, foreign relations; "
+        "'justice' — crimes, punishments, outstanding disputes.",
+    ] = "general",
+    calendar_note: Annotated[
+        str,
+        "In-game date after the court session. "
+        "If omitted, '+N days' appended to existing calendar.",
+    ] = "",
+) -> dict:
+    """
+    Theron holds court and administers the realm of Quasquetan.
+
+    Mechanic: d20 + Charisma modifier + duration bonus (max +2 for 7+ days).
+    Result tiers:
+    - 18-20 (excellent): NPC loyalty +1; treasury efficiency +10%; petition resolved.
+    - 14-17 (good): NPCs satisfied; one intelligence item surfaces through channels.
+    - 9-13 (adequate): Routine. No complications.
+    - 5-8 (poor): One NPC quietly disgruntled; surfaces as complication later.
+    - 1-4 (crisis): Serious dispute erupted; requires follow-up action next session.
+
+    XP: 20 × days × outcome_multiplier (0 for poor/crisis, 1-3 for adequate-excellent).
+
+    Critical for maintaining the loyalty of key NPCs (Aldric, Mira, Fingolfin,
+    the Greenreach lords) and troop morale across Theron's extended realm.
+
+    Returns: days_spent, focus, d20_roll, modifier, final_roll, outcome_tier,
+    outcome, npc_mood, troop_mood, bonus_effect, xp_awarded, calendar, dm_note.
+    """
+    return db_domain_administration(
+        days=days,
+        focus=focus,
+        calendar_note=calendar_note,
+    )
+
+
+@mcp.tool()
+def recovery(
+    injury_description: Annotated[
+        str,
+        "Brief description of the injury, ailment, or condition being treated "
+        "(e.g. 'severe stab wounds', 'mummy rot', 'magical exhaustion after Eye use', "
+        "'broken ribs from giant blow').",
+    ],
+    days_resting: Annotated[
+        int,
+        "Days of complete bed rest (1-90). "
+        "7+ days: minor ailments cleared. "
+        "14+ days: moderate ailments cleared. "
+        "30+ days: ALL ailments cleared (status_notes reset to null). "
+        "HP recovery: 2 HP × character level per week "
+        "(vs. 1 HP × level per night for normal rest).",
+    ],
+    calendar_note: Annotated[
+        str,
+        "In-game date after recovery, e.g. 'Planting 5, 576 CY'. "
+        "If omitted, '+N days' appended to existing calendar.",
+    ] = "",
+) -> dict:
+    """
+    Extended rest for serious injuries or magical ailments beyond normal healing.
+
+    Normal rest: 1 HP per character level per night.
+    Recovery rest: 2 HP per character level per week (bed rest, no strenuous activity).
+
+    Partial weeks still recover HP at the normal 1/level/day rate.
+
+    Ailment clearing:
+    - 7+ days: minor ailments (light wounds, fatigue, light poison)
+    - 14+ days: moderate ailments (serious wounds, disease, heavy exhaustion)
+    - 30+ days: ALL ailments — status_notes field cleared entirely
+
+    Magical conditions (curses, lycanthropy, charm, energy drain, mummy rot)
+    require Remove Curse / Cure Disease / Restoration — bed rest alone cannot
+    cure them, but rest IS still required for HP recovery.
+
+    XP: 5 per day (time-cost only — the character is not adventuring).
+
+    Returns: injury_description, days_resting, hp_before, hp_after, hp_recovered,
+    ailments_cleared, recovery_note, xp_awarded, calendar, dm_note.
+    """
+    return db_recovery(
+        injury_description=injury_description,
+        days_resting=days_resting,
+        calendar_note=calendar_note,
+    )
+
+
+@mcp.tool()
+def craft_item(
+    item_name: Annotated[
+        str,
+        "Name of the item being crafted (e.g. 'Iron shortbow', "
+        "'Scroll of Fireball', 'Antitoxin potion', 'Ring of Feather Falling').",
+    ],
+    item_type: Annotated[
+        str,
+        "Category of item being crafted — determines base success chance and minimum time: "
+        "'mundane' — standard equipment (90% success, 1+ days); "
+        "'masterwork' — exceptional quality mundane item (70% success, 7+ days); "
+        "'scroll' — spell scroll (65% success, 3+ days, requires caster); "
+        "'potion' — magical potion (60% success, 7+ days, requires caster); "
+        "'minor_magic' — minor enchanted item (45% success, 14+ days, requires caster).",
+    ],
+    materials_gp: Annotated[
+        int,
+        "Gold pieces spent on materials and components. Deducted from primary treasury. "
+        "On failure, half the materials are recovered (refunded).",
+    ],
+    days: Annotated[
+        int,
+        "Days spent crafting. Extra days beyond the type minimum add +5% success chance "
+        "per additional period equal to the minimum (e.g. for scroll: each extra 3 days = +5%).",
+    ],
+    calendar_note: Annotated[
+        str,
+        "In-game date after crafting. If omitted, '+N days' appended to existing calendar.",
+    ] = "",
+) -> dict:
+    """
+    Craft a mundane or minor magical item from raw materials.
+
+    Success chance: base% + (Intelligence modifier × 3%) + (extra periods × 5%).
+    Capped at 5% minimum / 98% maximum.
+
+    On success:
+    - Item is immediately added to the PC's inventory (items + inventory tables)
+    - XP awarded: type base XP + materials_gp ÷ 10
+    - Calendar advances by days spent
+
+    On failure:
+    - Half the materials are lost (half refunded to treasury)
+    - No XP, no item
+    - Retry is always allowed (start fresh with new materials)
+
+    Item types and use cases:
+    - mundane: replacement gear, trade goods, tools
+    - masterwork: +1 non-magical to hit/damage (DM ruling), trade at premium
+    - scroll: one-shot spell use; caster must know the spell
+    - potion: consumable magical effect; requires alchemical knowledge
+    - minor_magic: permanent minor enchantment; subject to campaign rulings
+
+    Returns: item_name, item_type, days_spent, materials_gp, success_chance,
+    roll, success, item_added, xp_awarded, calendar, note, dm_note.
+    """
+    return db_craft_item(
+        item_name=item_name,
+        item_type=item_type,
+        materials_gp=materials_gp,
+        days=days,
+        calendar_note=calendar_note,
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════

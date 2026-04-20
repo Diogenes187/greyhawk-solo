@@ -188,7 +188,7 @@ rolls, then call `create_character` to commit the final choices to a new databas
 
 ## MCP Tools
 
-Claude has access to 42 tools automatically:
+Claude has access to 49 tools automatically:
 
 ### Session
 | Tool | What it does |
@@ -263,6 +263,17 @@ Claude has access to 42 tools automatically:
 | `generate_weather` | Roll daily weather for the given season and region: precipitation, wind, temperature, visibility, movement modifier, survival check flag |
 | `get_current_weather` | Return today's weather and 3-day forecast |
 
+### Carousing & Downtime
+| Tool | What it does |
+|---|---|
+| `carouse` | Spend gold in taverns; XP = GP spent (always); roll d20 + spend-tier bonus for consequence from the 20-entry Jeff Rients table |
+| `research_spell` | Magic-User researches or copies a spell into the spellbook; success chance = 45% base + INT mod×5% + extra weeks×5%; 100×level XP on success |
+| `gather_rumors` | Spend days and coin in a settlement; generates quality-tiered rumours (1=gossip, 4=solid intel); stored in world_facts for future reference |
+| `religious_observance` | Cleric fulfils weekly/holy day/atonement/major ritual obligations; tracks missed_count and bonuses; 3 missed observances = lose highest spell level |
+| `domain_administration` | Hold court for 1-14 days; d20 + Cha roll determines outcome tier (excellent → crisis) affecting NPC loyalty and troop morale |
+| `recovery` | Extended bed rest: 2 HP × character level per week; 7 days clears minor ailments; 30 days resets all status conditions |
+| `craft_item` | Craft mundane / masterwork / scroll / potion / minor magic item; success chance scales with INT and time; item added to inventory on success |
+
 ### Character Setup
 | Tool | What it does |
 |---|---|
@@ -323,7 +334,7 @@ greyhawk-solo/
 │   ├── ddl.sql               # DDL only — used internally for fast new-DB creation
 │   └── new_character_template.sql  # Manual fill-in-the-blanks alternative
 ├── server/
-│   └── mcp_server.py         # FastMCP server; 42 tools; connects to Claude Desktop
+│   └── mcp_server.py         # FastMCP server; 49 tools; connects to Claude Desktop
 ├── saves/                    # Your campaign DB goes here (git-ignored)
 │   └── .gitkeep
 ├── create_character.py       # Interactive character creation CLI
@@ -369,7 +380,7 @@ echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":
 {"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' | python server/mcp_server.py
 ```
 
-You should see 42 tools listed in the response.
+You should see 49 tools listed in the response.
 
 ---
 

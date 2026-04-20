@@ -78,7 +78,7 @@ greyhawk-solo/
 │   ├── ddl.sql               # DDL only — used by create_character_db() for fast DB init
 │   └── new_character_template.sql  # Manual fill-in-the-blanks PC setup
 ├── server/
-│   └── mcp_server.py         # FastMCP server; 42 tools
+│   └── mcp_server.py         # FastMCP server; 49 tools
 ├── saves/                    # git-ignored — campaign DBs live here
 │   └── .gitkeep
 ├── create_character.py       # Interactive character creation CLI
@@ -181,6 +181,18 @@ greyhawk-solo/
 | `get_lost` | Trigger a lost event: roll direction error and wander distance, return reorientation time and instructions |
 | `generate_weather` | Roll a full daily weather result for the given season and region: precipitation, wind, temperature, visibility, movement modifier, survival check flag |
 | `get_current_weather` | Return today's weather and the 3-day forecast stored in world_facts |
+
+### Carousing & Downtime tools
+
+| Tool | Description |
+|---|---|
+| `carouse` | Spend gold in taverns; XP = GP spent (always); roll d20 + spend-tier bonus for consequence (20-entry Jeff Rients table); logs to downtime_log |
+| `research_spell` | Magic-User researches or copies a spell; success = 45% base + INT mod×5% + extra weeks×5%; XP on success = 100×level |
+| `gather_rumors` | Spend days and coin in a settlement; quality tier 1-4 by time/gold/Cha; results stored in world_facts category='rumors' |
+| `religious_observance` | Cleric performs weekly/holy_day/atonement/major_ritual; tracks missed_count and bonuses; 3 missed = lose highest spell level |
+| `domain_administration` | Hold court 1-14 days; d20 + Cha mod + duration bonus → outcome tier affects NPC loyalty and troop morale |
+| `recovery` | Extended bed rest: 2 HP × level per week; 7d = minor ailments cleared; 30d = all ailments (status_notes) reset |
+| `craft_item` | Craft mundane/masterwork/scroll/potion/minor_magic; success = base% + INT×3% + extra periods×5%; item added to inventory on success |
 
 ### Character setup
 
@@ -308,3 +320,4 @@ Roll 1d20; meet or beat the listed number to save.
 | Phase 3 — Dungeon | **Complete** | Random encounter tables (d20→table, d100→monster), wandering monster check with turn counter, full treasure generation A–Z |
 | Phase 4 — Domain | **Complete** | Seasonal turns, per-holding income rolls, troop upkeep, construction queue with automatic week-tracking, d20 realm events table (36 tools total) |
 | Phase 5A — Travel & Weather | **Complete** | Hex-crawl travel with terrain movement rates, mount types, get_lost; daily weather by season with precipitation/wind/visibility/movement modifiers; world_facts JSON persistence (42 tools total) |
+| Phase 5B — Carousing & Downtime | **Complete** | Jeff Rients d20 carousing table (XP=GP, 20 consequences); spell research (INT+time+gold formula); rumour gathering by quality tier 1-4; religious observance with missed-penalty/bonus tracking; domain administration court rolls; extended recovery; crafting (mundane/scroll/potion/minor magic) — all log to downtime_log world_fact (49 tools total) |
