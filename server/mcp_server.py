@@ -7,16 +7,19 @@ The game is played entirely inside Claude.ai chat. Claude acts as DM and calls
 these tools to read/write persistent game state stored in saves/theron.db.
 
 Tools exposed:
+  SESSION
+  session_start         -- One-call briefing: character + scene + history + pending updates
+
   READ
   get_character_state   -- Theron's full stats, HP, AC, inventory, abilities
   get_realm_state       -- All locations, troops, treasury, active projects
   roll_dice             -- Parse and roll any dice expression (e.g. "3d6+2")
   get_current_scene     -- Current location, active NPCs, recent events
-  save_turn             -- Write player action + DM narrative to the database
   get_recent_history    -- Last N turns from ai_turns table
   get_pending_updates   -- Turns with state_changes notes not yet DB-committed
 
   WRITE
+  save_turn             -- Write player action + DM narrative to the database
   update_character_status  -- Change HP, AC, status notes on Theron
   update_treasury          -- Add/subtract coins or gems from a treasury account
   add_location             -- Insert a new location into the realm
@@ -389,6 +392,14 @@ def save_turn(
         "turn_id":      turn_id,
         "location":     scene_location or "(unchanged)",
         "notes_stored": bool(scene_notes),
+        "world_fact_reminder": (
+            "Check this turn for anything that should be written to the database "
+            "immediately — do not let it live only in chat history. Call "
+            "update_world_fact for: named NPCs encountered or mentioned, items "
+            "acquired or lost, decisions made, quests opened or closed, rulings "
+            "established, alliances or hostilities formed. Call add_npc for any "
+            "new named character. Call add_item for any new item Theron now carries."
+        ),
     }
 
 
@@ -946,6 +957,81 @@ def create_character(
         return {"error": str(e)}
     except Exception as e:
         return {"error": f"Unexpected error: {e}"}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TOOL: session_start
+# ══════════════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def session_start() -> dict:
+    """
+    Call this FIRST at the start of every session, before any narration.
+
+    Returns a single consolidated briefing containing everything needed to
+    resume the campaign accurately:
+
+      character       -- Full PC stats, HP, AC, ability scores, inventory
+      scene           -- Current location and last turn context
+      recent_history  -- Last 10 turns in chronological order
+      pending_updates -- Turns whose state_changes have not yet been committed
+                         to the database (HP adjustments, treasure, etc.)
+      briefing_notes  -- Session startup checklist for the DM
+
+    After receiving this briefing you should:
+      1. Resolve any pending_updates before starting — call the appropriate
+         write tools (update_character_status, update_treasury, etc.) for
+         each uncommitted change listed there.
+      2. Orient the player: tell them where they are, what just happened, and
+         what immediate situation they face.
+      3. Never invent a state that contradicts what this briefing contains.
+    """
+    # ── Character (same flattening as get_character_state) ────────────────────
+    char = load_character() or {}
+    status    = char.pop("status", {}) or {}
+    abilities = char.pop("abilities", {}) or {}
+    char.update({
+        "hp_current":        status.get("hp_current"),
+        "hp_max":            status.get("hp_max"),
+        "ac":                status.get("ac"),
+        "movement":          status.get("movement"),
+        "attacks_per_round": status.get("attacks_per_round"),
+        "status_notes":      status.get("status_notes"),
+        "str": abilities.get("strength"),
+        "int": abilities.get("intelligence"),
+        "wis": abilities.get("wisdom"),
+        "dex": abilities.get("dexterity"),
+        "con": abilities.get("constitution"),
+        "cha": abilities.get("charisma"),
+    })
+
+    # ── Scene ─────────────────────────────────────────────────────────────────
+    scene   = load_current_scene() or {}
+    history = load_recent_ai_turns(limit=10)
+
+    if history:
+        scene["last_player_action"]       = history[-1]["player_action"]
+        scene["last_dm_response_preview"] = (history[-1]["dm_response"] or "")[:300]
+
+    # ── Pending updates ───────────────────────────────────────────────────────
+    pending = db_get_pending_updates(limit=30)
+
+    return {
+        "character":       char if char else {"error": "Character not found in database."},
+        "scene":           scene,
+        "recent_history":  history,
+        "pending_updates": pending,
+        "briefing_notes": (
+            "SESSION STARTUP CHECKLIST — complete before narrating: "
+            "(1) If pending_updates is non-empty, commit each unresolved state "
+            "change now using the appropriate write tools. "
+            "(2) Orient the player from the scene and recent_history context. "
+            "(3) After each turn, call save_turn then act on its "
+            "world_fact_reminder — write every named NPC, item, decision, and "
+            "quest development to the database immediately. Nothing important "
+            "should exist only in chat history."
+        ),
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════

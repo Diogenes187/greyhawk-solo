@@ -188,7 +188,12 @@ rolls, then call `create_character` to commit the final choices to a new databas
 
 ## MCP Tools
 
-Claude has access to 18 tools automatically:
+Claude has access to 19 tools automatically:
+
+### Session
+| Tool | What it does |
+|---|---|
+| `session_start` | One-call briefing: character state + current scene + last 10 turns + pending updates. Call this first, every session. |
 
 ### Read
 | Tool | What it returns |
@@ -203,7 +208,7 @@ Claude has access to 18 tools automatically:
 ### Write
 | Tool | What it does |
 |---|---|
-| `save_turn` | Appends player action + DM narrative to the log |
+| `save_turn` | Appends player action + DM narrative to the log; returns a reminder to call `update_world_fact` / `add_npc` / `add_item` for anything new this turn |
 | `update_character_status` | Changes HP, AC, or status notes |
 | `update_treasury` | Adds or subtracts coins (with overdraft protection) |
 | `add_location` | Records a new location in the realm |
@@ -321,7 +326,7 @@ echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":
 {"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' | python server/mcp_server.py
 ```
 
-You should see 18 tools listed in the response.
+You should see 19 tools listed in the response.
 
 ---
 

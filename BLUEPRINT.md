@@ -138,6 +138,12 @@ greyhawk-solo/
 
 ## MCP Tools
 
+### Session tool
+
+| Tool | Description |
+|---|---|
+| `session_start` | One-call briefing: character + scene + last 10 turns + pending updates. First call every session. Includes startup checklist in `briefing_notes`. |
+
 ### Read tools
 
 | Tool | Description |
@@ -153,7 +159,7 @@ greyhawk-solo/
 
 | Tool | Description |
 |---|---|
-| `save_turn` | Persist player action + DM narrative; update scene |
+| `save_turn` | Persist player action + DM narrative; update scene. Response includes `world_fact_reminder` prompting immediate `update_world_fact` / `add_npc` / `add_item` calls for anything new this turn. |
 | `update_character_status` | Change HP, AC, status notes |
 | `update_treasury` | Add/subtract coins with overdraft protection |
 | `add_location` | Add a new location to the realm |
@@ -286,7 +292,7 @@ Roll 1d20; meet or beat the listed number to save.
 
 | Phase | Status | Scope |
 |---|---|---|
-| Phase 1 — Core Loop | **Complete** | Character engine, DB layer, 18 MCP tools, interactive CLI |
+| Phase 1 — Core Loop | **Complete** | Character engine, DB layer, 19 MCP tools, interactive CLI |
 | Phase 2 — Combat | Planned | Combat tracker, initiative, morale, flee/pursuit |
 | Phase 3 — Spells | Planned | Memorization, casting events, spell effects tracking |
 | Phase 4 — Dungeon | Planned | Random encounter tables, wandering monsters, loot generation |
