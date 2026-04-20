@@ -98,6 +98,17 @@ from engine.db import (
     # Phase 3 — dungeon
     get_random_dungeon_encounter, roll_treasure_by_type,
     get_dungeon_turn_count, increment_dungeon_turn,
+    # Phase 4 — domain
+    get_full_domain_state,
+    db_add_construction_project,
+    db_collect_income,
+    db_pay_upkeep,
+    db_roll_realm_event,
+    db_create_domain_turn,
+    db_advance_construction,
+    _credit_treasury,
+    _record_ledger_entry,
+    _REALM_EVENTS,
 )
 
 # ── Server instance ────────────────────────────────────────────────────────────
@@ -2347,6 +2358,454 @@ def generate_treasure(
     )
 
     return hoard
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PHASE 4 — DOMAIN MANAGEMENT
+# Domain turns · Income · Upkeep · Construction · Realm Events
+# ══════════════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def get_domain_state() -> dict:
+    """
+    Return the complete domain status snapshot.
+
+    Covers:
+      - All holdings (locations) with their income range and active status
+      - All troop groups with headcount, location, and monthly upkeep cost
+      - All treasury accounts with current balances and a GP total
+      - All construction projects — both established and in-progress — with
+        weeks_remaining and cost_per_week for projects in the construction queue
+      - Estimated monthly income range (sum of active holding rates)
+      - Total monthly troop upkeep
+      - Estimated net monthly range (income minus upkeep)
+      - Last domain turn record
+
+    Call this at the start of every domain management session and after any
+    major transaction. Does not modify any state.
+    """
+    return get_full_domain_state()
+
+
+@mcp.tool()
+def add_construction_project(
+    name: Annotated[
+        str,
+        "Full name of the project, e.g. 'Rillford Market Hall'.",
+    ],
+    project_type: Annotated[
+        str,
+        "Category: Keep, Tower, Road, Mill, Workshop, Inn, Civic, Stable, "
+        "Lodge, Causeway, School, or any descriptive type.",
+    ],
+    cost_gp: Annotated[
+        int,
+        "Total gold piece cost of the project.",
+    ],
+    weeks_total: Annotated[
+        int,
+        "Estimated construction time in weeks. "
+        "Typical ranges: Tower 8–12 weeks, Keep 16–24 weeks, "
+        "Workshop 4–8 weeks, Road (per league) 2–4 weeks.",
+    ],
+    location_name: Annotated[
+        str,
+        "Name of the existing location where this project is being built, "
+        "e.g. 'Quasquetan'. Leave blank if the location is new or unknown.",
+    ] = "",
+    notes: Annotated[
+        str,
+        "Brief description of the project's purpose or special features.",
+    ] = "",
+) -> dict:
+    """
+    Queue a new construction project.
+
+    Inserts a row into the projects table (status = 'Funded/In Progress') and
+    registers the project in the construction queue (world_facts category
+    'construction_queue') with its time and cost tracking data.
+
+    The construction queue is consumed by domain_turn(), which advances all
+    projects by the season's week count and marks completed ones as
+    'Established/Completed'. Cost is NOT automatically deducted here — use
+    update_treasury() to record the capital expenditure separately.
+
+    Returns the new project's full record including its project_id.
+    """
+    # Resolve location_id from name
+    location_id: int | None = None
+    if location_name.strip():
+        from engine.db import _get_conn as _ec, _CAMPAIGN_ID as _cid
+        with _ec(read_only=True) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT location_id FROM locations "
+                "WHERE campaign_id = ? AND LOWER(name) LIKE LOWER(?) LIMIT 1",
+                (_cid, f"%{location_name.strip()}%"),
+            )
+            row = cur.fetchone()
+            if row:
+                location_id = row["location_id"]
+
+    project = db_add_construction_project(
+        name        = name,
+        location_id = location_id,
+        project_type= project_type,
+        cost_gp     = cost_gp,
+        weeks_total = weeks_total,
+        notes       = notes,
+    )
+
+    project["note"] = (
+        f"Project '{name}' queued. {weeks_total} weeks to completion at "
+        f"~{project['cost_per_week']} gp/week. "
+        "Run domain_turn() each season to advance all projects. "
+        "Use update_treasury() to record the capital cost now if already funded."
+    )
+    return project
+
+
+@mcp.tool()
+def collect_income(
+    months: Annotated[
+        int,
+        "Number of months to collect income for (1 = monthly, 3 = seasonal). "
+        "Each active holding rolls its income range independently per month.",
+    ] = 1,
+    credit_treasury: Annotated[
+        bool,
+        "If true (default), automatically add the total income to the primary "
+        "treasury (treasury_id=1). Set false to review before crediting.",
+    ] = True,
+) -> dict:
+    """
+    Roll and record income from all active domain holdings.
+
+    Each active location rolls its monthly income range (based on location_type)
+    independently for each month requested. The total is logged in
+    domain_income_expenses and optionally credited to the primary treasury.
+
+    Income rates by type (monthly, rough range):
+      Keep ~120–220 gp · City ~150–350 gp · District ~70–130 gp
+      Mill ~55–105 gp · Farm ~45–85 gp · Workshop ~25–55 gp
+      Lodge ~15–35 gp · Inn ~25–55 gp · Civic ~10–30 gp
+
+    Call this once per game month or as part of domain_turn() for a full
+    seasonal cycle. Returns a per-holding breakdown with individual rolls.
+    """
+    result = db_collect_income(months=months)
+
+    if credit_treasury:
+        _credit_treasury(result["total_gp"])
+        result["treasury_credited"] = True
+        result["treasury_note"] = (
+            f"{result['total_gp']:,} gp credited to primary treasury."
+        )
+    else:
+        result["treasury_credited"] = False
+        result["treasury_note"] = (
+            "Treasury NOT updated. Call update_treasury() to credit manually."
+        )
+
+    result["note"] = (
+        f"Income collected: {result['total_gp']:,} gp from "
+        f"{result['holdings_rolled']} holdings over {months} month(s)."
+    )
+    return result
+
+
+@mcp.tool()
+def pay_upkeep(
+    months: Annotated[
+        int,
+        "Number of months of upkeep to pay (1 = monthly, 3 = seasonal). "
+        "All troop groups are charged their full rate.",
+    ] = 1,
+) -> dict:
+    """
+    Calculate and deduct troop upkeep for the given number of months.
+
+    Each troop group is charged its per-type monthly rate:
+      Ogres 15 gp · Elves 5 gp · Mounted Humans 6 gp · Dwarves/Gnomes 4 gp
+      Human Soldiers 3 gp · Hobgoblins 2 gp · Halflings 2 gp
+      Goblins/Orcs/Laborers 1 gp · Constructs 0 gp
+
+    Deducts the total from the primary treasury (treasury_id=1) and records
+    the transaction in domain_income_expenses. The treasury will not go below
+    zero — if the realm is insolvent the shortfall is noted but not enforced
+    mechanically (the DM handles the narrative consequences).
+
+    Returns a per-group breakdown with individual costs and the total charged.
+    """
+    result = db_pay_upkeep(months=months)
+
+    result["note"] = (
+        f"Upkeep paid: {result['total_gp_charged']:,} gp for "
+        f"{result['troop_groups_charged']} troop groups over {months} month(s). "
+        f"Monthly upkeep baseline: {result['total_monthly_upkeep']:,} gp."
+    )
+    return result
+
+
+@mcp.tool()
+def realm_event(
+    force_roll: Annotated[
+        int,
+        "Force a specific d20 result (1–20) instead of rolling randomly. "
+        "Leave at 0 to roll normally.",
+    ] = 0,
+) -> dict:
+    """
+    Roll one random realm event on the d20 domain events table.
+
+    The 20-entry table covers the full range of peacetime domain developments:
+      Positive (rolls 1–10): Harvest bonuses, trade windfalls, settlers, festivals,
+        skilled craftsmen, mercenary offers, diplomatic openings.
+      Negative (rolls 11–19): Harsh weather, bandits, monster raids, plague,
+        crop failure, spy activity, unrest, rival claimants.
+      Special (roll 20): Great Fortune — roll twice, apply both results.
+
+    The result includes a mechanical_key that describes what action to take:
+      income_bonus_*   → call collect_income or update_treasury for the bonus
+      income_loss_*    → call update_treasury to deduct the penalty
+      gain_d4_laborers → call add_troop_group
+      construction_speed_up_2_weeks → call domain_turn with extra weeks
+      lose_d4_troops_* → call update_troop_count
+      narrative_only   → no mechanical change; narrate the event
+      roll_twice       → call realm_event() twice more
+
+    This tool rolls the event and describes it; mechanical application is your
+    responsibility — the event result tells you what to do.
+    """
+    if force_roll and 1 <= force_roll <= 20:
+        roll = force_roll
+        event = next(
+            (e for e in _REALM_EVENTS if e[0] == roll),
+            (roll, "Quiet Season", "Nothing notable occurs. The realm rests.", "narrative_only"),
+        )
+        event_dict = {
+            "roll":           roll,
+            "title":          event[1],
+            "description":    event[2],
+            "mechanical_key": event[3],
+            "forced":         True,
+        }
+    else:
+        event_dict = db_roll_realm_event()
+        event_dict["forced"] = False
+
+    # Resolve secondary dice for mechanical effects
+    key = event_dict["mechanical_key"]
+    effect_roll: int | None = None
+    effect_gp:   int | None = None
+
+    if "d6x50" in key:
+        effect_roll = random.randint(1, 6)
+        effect_gp   = effect_roll * 50
+    elif "d4x30" in key:
+        effect_roll = random.randint(1, 4)
+        effect_gp   = effect_roll * 30
+    elif "d6x30" in key:
+        effect_roll = random.randint(1, 6)
+        effect_gp   = effect_roll * 30
+    elif "d4x25" in key:
+        effect_roll = random.randint(1, 4)
+        effect_gp   = effect_roll * 25
+    elif "d6x20" in key:
+        effect_roll = random.randint(1, 6)
+        effect_gp   = effect_roll * 20
+    elif "d4x50" in key:
+        effect_roll = random.randint(1, 4)
+        effect_gp   = effect_roll * 50
+    elif "d4x40" in key:
+        effect_roll = random.randint(1, 4)
+        effect_gp   = effect_roll * 40
+    elif "d6x15" in key:
+        effect_roll = random.randint(1, 6)
+        effect_gp   = effect_roll * 15
+    elif "d4_laborers" in key:
+        effect_roll = random.randint(1, 4)
+    elif "d4_troops" in key:
+        effect_roll = random.randint(1, 4)
+    elif "10pct" in key:
+        effect_roll = 10   # percentage
+
+    if effect_roll is not None:
+        event_dict["effect_roll"] = effect_roll
+    if effect_gp is not None:
+        event_dict["effect_gp"] = effect_gp
+
+    # Generate next-step instructions
+    instructions: list[str] = []
+    if "income_bonus" in key and effect_gp:
+        instructions.append(
+            f"Call update_treasury(account='Quasquetan Treasury', delta_gp={effect_gp}) "
+            f"to credit the {effect_gp} gp windfall."
+        )
+    elif "income_loss" in key and effect_gp:
+        instructions.append(
+            f"Call update_treasury(account='Quasquetan Treasury', delta_gp=-{effect_gp}) "
+            f"to deduct the {effect_gp} gp loss."
+        )
+    elif "10pct" in key:
+        instructions.append(
+            "Income this season is reduced by 10%. Adjust collect_income total accordingly."
+        )
+    elif "gain_d4_laborers" in key:
+        instructions.append(
+            f"{effect_roll} new laborers arrive. Call add_troop_group() to record them."
+        )
+    elif "construction_speed_up" in key:
+        instructions.append(
+            "Call domain_turn() with extra_weeks=2 to apply the early completion bonus."
+        )
+    elif "lose_d4_troops" in key:
+        instructions.append(
+            f"{effect_roll} troops fall ill. Call update_troop_count() to reduce a "
+            "relevant garrison by that amount."
+        )
+    elif key == "roll_twice":
+        instructions.append(
+            "Roll twice more using realm_event() and apply both results "
+            "(re-roll if you get 20 again)."
+        )
+    elif key == "narrative_only":
+        instructions.append("No mechanical change required — narrate the event.")
+
+    if instructions:
+        event_dict["instructions"] = instructions
+
+    return event_dict
+
+
+@mcp.tool()
+def domain_turn(
+    season_label: Annotated[
+        str,
+        "Label for this domain turn, e.g. 'Coldeven 576 CY' or 'Spring 577'. "
+        "Used as the turn_label in domain_turns.",
+    ],
+    start_date: Annotated[
+        str,
+        "In-game start date of this season, e.g. '1 Readying 576 CY'.",
+    ] = "",
+    end_date: Annotated[
+        str,
+        "In-game end date of this season, e.g. '28 Coldeven 576 CY'.",
+    ] = "",
+    weeks_in_season: Annotated[
+        int,
+        "Number of construction weeks this turn covers. Standard season = 13 weeks. "
+        "Use a higher number if extra construction speed applies (realm event, etc.).",
+    ] = 13,
+    roll_event: Annotated[
+        bool,
+        "If true (default), roll one realm event at the end of the turn.",
+    ] = True,
+) -> dict:
+    """
+    Advance the domain by one full season.
+
+    Performs all five domain turn steps in sequence:
+
+    1. Creates a new domain_turns record for the season.
+    2. Collects income from all active holdings for 3 months. Credits treasury.
+    3. Pays troop upkeep for 3 months. Debits treasury.
+    4. Advances all construction projects by weeks_in_season weeks. Projects that
+       reach 0 weeks_remaining are marked 'Established/Completed' automatically.
+    5. Rolls one realm event (if roll_event=True).
+
+    Returns a complete season report: income breakdown, upkeep breakdown, net
+    treasury change, project progress, and the realm event. The treasury is
+    updated for income and upkeep automatically. All transactions are recorded
+    in domain_income_expenses.
+
+    Call get_domain_state() after this to see the updated realm snapshot.
+    """
+    SEASON_MONTHS = 3
+    report: dict = {
+        "season_label":    season_label,
+        "start_date":      start_date,
+        "end_date":        end_date,
+        "weeks_in_season": weeks_in_season,
+    }
+
+    # ── Step 1: Create turn record ─────────────────────────────────────────────
+    turn_id = db_create_domain_turn(season_label, start_date, end_date)
+    report["domain_turn_id"] = turn_id
+
+    # ── Step 2: Collect income ─────────────────────────────────────────────────
+    income = db_collect_income(months=SEASON_MONTHS)
+    _credit_treasury(income["total_gp"])
+    _record_ledger_entry(
+        entry_type     = "income",
+        amount_gp      = income["total_gp"],
+        description    = f"Seasonal income — {season_label}",
+        domain_turn_id = turn_id,
+    )
+    report["income"] = {
+        "total_gp":        income["total_gp"],
+        "holdings_rolled": income["holdings_rolled"],
+        "breakdown":       income["breakdown"],
+    }
+
+    # ── Step 3: Pay upkeep ─────────────────────────────────────────────────────
+    upkeep = db_pay_upkeep(months=SEASON_MONTHS)
+    _record_ledger_entry(
+        entry_type     = "expense",
+        amount_gp      = upkeep["total_gp_charged"],
+        description    = f"Seasonal upkeep — {season_label}",
+        domain_turn_id = turn_id,
+    )
+    report["upkeep"] = {
+        "total_gp_charged":     upkeep["total_gp_charged"],
+        "monthly_baseline_gp":  upkeep["total_monthly_upkeep"],
+        "breakdown":            upkeep["breakdown"],
+    }
+
+    # ── Step 4: Advance construction ──────────────────────────────────────────
+    construction = db_advance_construction(weeks=weeks_in_season)
+    report["construction"] = construction
+
+    for completed in construction.get("completed", []):
+        _record_ledger_entry(
+            entry_type     = "project_complete",
+            amount_gp      = 0,
+            description    = f"Project completed: {completed['name']}",
+            domain_turn_id = turn_id,
+            project_id     = completed["project_id"],
+        )
+
+    # ── Step 5: Realm event ────────────────────────────────────────────────────
+    if roll_event:
+        event = db_roll_realm_event()
+        # Apply simple automatic effects
+        auto_gp_delta = 0
+        if "income_bonus" in event["mechanical_key"]:
+            for r_entry, title, desc, key in _REALM_EVENTS:
+                if key == event["mechanical_key"]:
+                    # Already rolled by db_roll_realm_event but we need the bonus
+                    break
+        report["realm_event"] = event
+    else:
+        report["realm_event"] = None
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    net_gp = income["total_gp"] - upkeep["total_gp_charged"]
+    report["net_gp_this_season"] = net_gp
+    report["completed_projects"] = [c["name"] for c in construction.get("completed", [])]
+    report["summary"] = (
+        f"Season {season_label}: "
+        f"Income {income['total_gp']:,} gp | "
+        f"Upkeep {upkeep['total_gp_charged']:,} gp | "
+        f"Net {net_gp:+,} gp | "
+        f"{len(construction.get('advanced', []))} projects progressed, "
+        f"{len(construction.get('completed', []))} completed."
+    )
+    if roll_event and report["realm_event"]:
+        report["summary"] += f" Realm event: {report['realm_event']['title']}."
+
+    return report
 
 
 # ══════════════════════════════════════════════════════════════════════════════

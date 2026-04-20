@@ -1978,3 +1978,589 @@ def increment_dungeon_turn() -> int:
             (_CAMPAIGN_ID, str(count)),
         )
     return count
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PHASE 4 — DOMAIN MANAGEMENT
+# Domain turns · Income · Upkeep · Construction · Realm Events
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ---------------------------------------------------------------------------
+# Income rate table  (gp per month, low–high; rolled as randint(lo, hi))
+# ---------------------------------------------------------------------------
+_HOLDING_INCOME_RATE: dict[str, tuple[int, int]] = {
+    # Calibrated so active holdings sum to ~1,190 gp/month (matches world_facts)
+    "Keep":                      (120, 220),
+    "Farm/Hub":                  (45,   85),
+    "Mill/Granary":              (55,  105),
+    "Estate/Gardens":            (25,   55),
+    "Tower/Keep":                (15,   35),
+    "District":                  (70,  130),
+    "Inn/Lodge":                 (25,   55),
+    "Lodge":                     (15,   35),
+    "Workshop":                  (25,   55),
+    "Workshop Yard":             (20,   45),
+    "Food Works":                (30,   60),
+    "Stable/Remount":            (20,   40),
+    "Fortified Mill":            (40,   80),
+    "Civic Building":            (10,   30),
+    "School":                    (0,    20),
+    "Archive/Chancery":          (0,    10),
+    "Practice Yard/Fairground":  (10,   25),
+    "Shrine/Manor":              (5,    20),
+    "Settlement":                (80,  180),   # allied settlement
+    "City":                      (150, 350),   # Greenreach cities
+    "Default":                   (10,   30),
+}
+
+# ---------------------------------------------------------------------------
+# Troop upkeep  (gp per month per individual)
+# ---------------------------------------------------------------------------
+_TROOP_UPKEEP_GP: dict[str, int] = {
+    "Goblins":       1,
+    "Hobgoblins":    2,
+    "Orcs":          1,
+    "Human Troops":  3,
+    "Human Soldiers": 3,
+    "Mounted Humans": 6,   # horse upkeep included
+    "Halflings":     2,
+    "Elves":         5,
+    "Dwarves":       4,
+    "Gnomes":        4,
+    "Ogres":         15,   # they eat a lot
+    "Laborers":      1,
+    "Constructs":    0,    # no food
+    "Default":       3,
+}
+
+# ---------------------------------------------------------------------------
+# Realm event table  (d20)
+# Each entry: (title, description, mechanical_key)
+# mechanical_key drives the mcp tool's effect application
+# ---------------------------------------------------------------------------
+_REALM_EVENTS: list[tuple[int, str, str, str]] = [
+    # roll, title, description, mechanical_key
+    (1,  "Exceptional Harvest",
+         "Bumper crops across the realm's farms and granaries. Peasants are cheerful.",
+         "income_bonus_d6x50"),
+    (2,  "Good Harvest",
+         "A solid growing season. Stores are full and traders are active.",
+         "income_bonus_d4x30"),
+    (3,  "Trade Windfall",
+         "A merchant caravan chose your realm as a hub. Unexpected coin flows in.",
+         "income_bonus_d6x30"),
+    (4,  "New Settlers Arrive",
+         "A band of families seeks safety behind your walls. Labor pool increases.",
+         "gain_d4_laborers"),
+    (5,  "Religious Festival",
+         "A traveling cleric declares a holy day. Donations arrive; morale rises.",
+         "income_bonus_d4x25"),
+    (6,  "Skilled Craftsmen Offer Service",
+         "A group of artisans seeks patronage. Construction projects may accelerate.",
+         "construction_speed_up_2_weeks"),
+    (7,  "Mercenary Company Passes Through",
+         "A mercenary band offers short-term service at 1.5× normal rate.",
+         "mercenary_offer"),
+    (8,  "Diplomatic Overture",
+         "A neighboring power sends an envoy. Relations may shift.",
+         "narrative_only"),
+    (9,  "Minor Border Dispute",
+         "Settlers squabble over boundary stones with a neighboring village.",
+         "narrative_only"),
+    (10, "Rumour of Treasure",
+         "Locals whisper of something valuable in your territory. May be true.",
+         "narrative_only"),
+    (11, "Harsh Weather",
+         "A brutal cold snap or prolonged rain disrupts travel and commerce.",
+         "income_penalty_10pct"),
+    (12, "Bandit Activity",
+         "A bandit gang has been raiding caravans on the realm's roads.",
+         "income_loss_d6x20"),
+    (13, "Monster Raid",
+         "A monster pack strikes an outlying holding before the garrison can respond.",
+         "income_loss_d4x50_and_location_damaged"),
+    (14, "Plague or Sickness",
+         "A fever sweeps through a garrison. Some troops fall ill.",
+         "lose_d4_troops_random_unit"),
+    (15, "Crop Failure",
+         "Blight strikes part of the realm's farmland. Food stores take a hit.",
+         "income_loss_d4x40"),
+    (16, "Spy Uncovered",
+         "An enemy agent is found passing information to a rival. Costly to clean up.",
+         "income_loss_d4x25"),
+    (17, "Rival Claimant Stirs",
+         "A distant noble asserts a claim to part of your territory. No troops yet.",
+         "narrative_only"),
+    (18, "Unrest in a District",
+         "Dissatisfied tenants in one district slow their tithes.",
+         "income_loss_d6x15"),
+    (19, "Alliance Opportunity",
+         "A minor lord sends feelers about a mutual defence pact.",
+         "narrative_only"),
+    (20, "Great Fortune",
+         "The stars align. Roll twice and apply both results (re-roll another 20).",
+         "roll_twice"),
+]
+
+
+# ---------------------------------------------------------------------------
+# Construction queue  (world_facts category: 'construction_queue')
+# Stored as JSON: {str(project_id): {weeks_total, weeks_remaining, cost_per_week}}
+# ---------------------------------------------------------------------------
+
+def _get_construction_queue() -> dict[str, dict]:
+    """Load construction queue from world_facts. Returns {} if not set."""
+    with _get_conn(read_only=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT fact_text FROM world_facts "
+            "WHERE campaign_id = ? AND category = 'construction_queue' LIMIT 1",
+            (_CAMPAIGN_ID,),
+        )
+        row = cur.fetchone()
+    if not row:
+        return {}
+    try:
+        return json.loads(row["fact_text"])
+    except (json.JSONDecodeError, TypeError):
+        return {}
+
+
+def _set_construction_queue(queue: dict[str, dict]) -> None:
+    """Persist construction queue to world_facts."""
+    with _get_conn() as conn:
+        conn.execute(
+            "DELETE FROM world_facts "
+            "WHERE campaign_id = ? AND category = 'construction_queue'",
+            (_CAMPAIGN_ID,),
+        )
+        conn.execute(
+            "INSERT INTO world_facts (campaign_id, category, fact_text, source_note) "
+            "VALUES (?, 'construction_queue', ?, 'domain_system')",
+            (_CAMPAIGN_ID, json.dumps(queue)),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def get_full_domain_state() -> dict:
+    """
+    Return a complete snapshot of the domain:
+      - All locations with income rate and status
+      - All troop groups with count and monthly upkeep
+      - All treasury accounts with current balances
+      - All active construction projects with weeks_remaining
+      - Monthly and seasonal income/upkeep estimates
+      - Last domain_turn record
+    """
+    with _get_conn(read_only=True) as conn:
+        cur = conn.cursor()
+
+        # Holdings
+        cur.execute(
+            "SELECT location_id, name, location_type, status, notes "
+            "FROM locations WHERE campaign_id = ? ORDER BY location_id",
+            (_CAMPAIGN_ID,),
+        )
+        locations = [dict(r) for r in cur.fetchall()]
+
+        # Troops
+        cur.execute(
+            "SELECT t.troop_id, t.group_name, t.troop_type, t.count, t.notes, "
+            "l.name AS location_name "
+            "FROM troops t LEFT JOIN locations l ON t.location_id = l.location_id "
+            "WHERE t.campaign_id = ?",
+            (_CAMPAIGN_ID,),
+        )
+        troops = [dict(r) for r in cur.fetchall()]
+
+        # Treasury
+        cur.execute(
+            "SELECT ta.treasury_id, ta.account_name, ta.gp, ta.sp, ta.cp, ta.pp, "
+            "ta.gems_gp_value, ta.notes, l.name AS location_name "
+            "FROM treasury_accounts ta "
+            "LEFT JOIN locations l ON ta.location_id = l.location_id "
+            "WHERE ta.campaign_id = ?",
+            (_CAMPAIGN_ID,),
+        )
+        treasury = [dict(r) for r in cur.fetchall()]
+
+        # Projects
+        cur.execute(
+            "SELECT p.project_id, p.name, p.project_type, p.status, p.cost_gp, p.notes, "
+            "l.name AS location_name "
+            "FROM projects p "
+            "LEFT JOIN locations l ON p.location_id = l.location_id "
+            "WHERE p.campaign_id = ? ORDER BY p.project_id",
+            (_CAMPAIGN_ID,),
+        )
+        projects = [dict(r) for r in cur.fetchall()]
+
+        # Last domain turn
+        cur.execute(
+            "SELECT * FROM domain_turns WHERE campaign_id = ? "
+            "ORDER BY domain_turn_id DESC LIMIT 1",
+            (_CAMPAIGN_ID,),
+        )
+        last_turn_row = cur.fetchone()
+        last_turn = dict(last_turn_row) if last_turn_row else None
+
+    # Annotate locations with income rates
+    for loc in locations:
+        lo, hi = _HOLDING_INCOME_RATE.get(
+            loc["location_type"],
+            _HOLDING_INCOME_RATE["Default"],
+        )
+        loc["monthly_income_range"] = f"{lo}–{hi} gp"
+        loc["income_active"] = loc["status"] in (
+            "Active", "Established", "Allied – Church of Trithereon",
+            "Allied – Lady Ysela", "Active – House Vale-Fingolfin",
+            "Stabilized",
+        ) or loc["status"].startswith("Active")
+
+    # Annotate troops with upkeep
+    monthly_upkeep = 0
+    for t in troops:
+        rate = _TROOP_UPKEEP_GP.get(t["troop_type"], _TROOP_UPKEEP_GP["Default"])
+        t["upkeep_per_month_gp"] = rate * t["count"]
+        monthly_upkeep += t["upkeep_per_month_gp"]
+
+    # Estimate monthly income from active holdings
+    monthly_income_lo = sum(
+        _HOLDING_INCOME_RATE.get(l["location_type"], _HOLDING_INCOME_RATE["Default"])[0]
+        for l in locations if l.get("income_active")
+    )
+    monthly_income_hi = sum(
+        _HOLDING_INCOME_RATE.get(l["location_type"], _HOLDING_INCOME_RATE["Default"])[1]
+        for l in locations if l.get("income_active")
+    )
+
+    # Merge construction queue data into projects
+    queue = _get_construction_queue()
+    for proj in projects:
+        pid = str(proj["project_id"])
+        if pid in queue:
+            proj["weeks_remaining"] = queue[pid].get("weeks_remaining")
+            proj["weeks_total"]     = queue[pid].get("weeks_total")
+            proj["cost_per_week"]   = queue[pid].get("cost_per_week", 0)
+        else:
+            proj["weeks_remaining"] = None
+            proj["weeks_total"]     = None
+            proj["cost_per_week"]   = 0
+
+    total_gp = sum(acc["gp"] or 0 for acc in treasury)
+
+    return {
+        "holdings":              locations,
+        "troops":                troops,
+        "treasury_accounts":     treasury,
+        "treasury_total_gp":     total_gp,
+        "projects":              projects,
+        "last_domain_turn":      last_turn,
+        "monthly_income_range":  f"{monthly_income_lo:,}–{monthly_income_hi:,} gp",
+        "monthly_upkeep_gp":     monthly_upkeep,
+        "monthly_net_range":     f"{monthly_income_lo - monthly_upkeep:,}–{monthly_income_hi - monthly_upkeep:,} gp",
+    }
+
+
+def db_add_construction_project(
+    name: str,
+    location_id: int | None,
+    project_type: str,
+    cost_gp: int,
+    weeks_total: int,
+    notes: str,
+) -> dict:
+    """
+    Insert a new project row and register it in the construction queue.
+    Returns the new project dict including its assigned project_id.
+    """
+    with _get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO projects (campaign_id, name, location_id, project_type, "
+            "status, cost_gp, notes) VALUES (?, ?, ?, ?, 'Funded/In Progress', ?, ?)",
+            (_CAMPAIGN_ID, name, location_id, project_type, cost_gp, notes),
+        )
+        project_id = cur.lastrowid
+
+    # Register in construction queue
+    cost_per_week = max(1, cost_gp // max(weeks_total, 1))
+    queue = _get_construction_queue()
+    queue[str(project_id)] = {
+        "name":          name,
+        "weeks_total":   weeks_total,
+        "weeks_remaining": weeks_total,
+        "cost_per_week": cost_per_week,
+        "cost_gp":       cost_gp,
+    }
+    _set_construction_queue(queue)
+
+    return {
+        "project_id":    project_id,
+        "name":          name,
+        "project_type":  project_type,
+        "location_id":   location_id,
+        "cost_gp":       cost_gp,
+        "weeks_total":   weeks_total,
+        "weeks_remaining": weeks_total,
+        "cost_per_week": cost_per_week,
+        "status":        "Funded/In Progress",
+        "notes":         notes,
+    }
+
+
+def db_collect_income(months: int = 1) -> dict:
+    """
+    Roll income for all active holdings for the given number of months.
+    Records each entry in domain_income_expenses.
+    Returns per-holding breakdown and totals.
+    """
+    with _get_conn(read_only=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT location_id, name, location_type, status "
+            "FROM locations WHERE campaign_id = ? ORDER BY location_id",
+            (_CAMPAIGN_ID,),
+        )
+        locations = [dict(r) for r in cur.fetchall()]
+
+    # Determine which accounts to credit (use treasury_id=1 as default)
+    breakdown: list[dict] = []
+    total_gp = 0
+
+    income_active_statuses = {
+        "Active", "Established", "Stabilized",
+    }
+
+    for loc in locations:
+        # Only generate income for active/established holdings
+        status = loc["status"] or ""
+        is_active = (
+            status in income_active_statuses
+            or status.startswith("Active")
+            or status.startswith("Established")
+            or status.startswith("Allied")
+        )
+        if not is_active:
+            continue
+
+        lo, hi = _HOLDING_INCOME_RATE.get(
+            loc["location_type"],
+            _HOLDING_INCOME_RATE["Default"],
+        )
+        if hi == 0:
+            continue
+
+        month_rolls = []
+        for _ in range(months):
+            month_rolls.append(random.randint(lo, hi))
+        holding_total = sum(month_rolls)
+        total_gp += holding_total
+
+        breakdown.append({
+            "location_id":   loc["location_id"],
+            "location_name": loc["name"],
+            "location_type": loc["location_type"],
+            "monthly_range": f"{lo}–{hi}",
+            "rolls":         month_rolls,
+            "total_gp":      holding_total,
+        })
+
+    # Record in ledger
+    _record_ledger_entry(
+        entry_type="income",
+        amount_gp=total_gp,
+        description=(
+            f"Domain income — {months} month{'s' if months > 1 else ''} "
+            f"across {len(breakdown)} active holdings"
+        ),
+    )
+
+    return {
+        "months":          months,
+        "holdings_rolled": len(breakdown),
+        "breakdown":       breakdown,
+        "total_gp":        total_gp,
+    }
+
+
+def db_pay_upkeep(months: int = 1) -> dict:
+    """
+    Calculate and deduct troop and holding upkeep for the given number of months.
+    Deducts from treasury_id=1 (primary account). Returns breakdown and total.
+    """
+    with _get_conn(read_only=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT troop_id, group_name, troop_type, count "
+            "FROM troops WHERE campaign_id = ?",
+            (_CAMPAIGN_ID,),
+        )
+        troops = [dict(r) for r in cur.fetchall()]
+
+    breakdown: list[dict] = []
+    total_monthly = 0
+
+    for t in troops:
+        rate = _TROOP_UPKEEP_GP.get(t["troop_type"], _TROOP_UPKEEP_GP["Default"])
+        monthly = rate * t["count"]
+        if monthly == 0:
+            continue
+        total_monthly += monthly
+        breakdown.append({
+            "group_name":       t["group_name"],
+            "troop_type":       t["troop_type"],
+            "count":            t["count"],
+            "gp_per_month_each": rate,
+            "monthly_gp":       monthly,
+        })
+
+    # Add holding maintenance (~10% of income as rough AD&D standard)
+    # We skip this for now — Claude can narrate ad-hoc maintenance costs
+
+    total_gp = total_monthly * months
+
+    # Deduct from primary treasury
+    _deduct_treasury(total_gp)
+
+    # Record in ledger
+    _record_ledger_entry(
+        entry_type="expense",
+        amount_gp=total_gp,
+        description=(
+            f"Troop upkeep — {months} month{'s' if months > 1 else ''}, "
+            f"{sum(t['count'] for t in troops)} troops total"
+        ),
+    )
+
+    return {
+        "months":                months,
+        "troop_groups_charged":  len(breakdown),
+        "breakdown":             breakdown,
+        "total_monthly_upkeep":  total_monthly,
+        "total_gp_charged":      total_gp,
+    }
+
+
+def db_roll_realm_event() -> dict:
+    """
+    Roll 1d20 on the realm events table.
+    Returns the event with its mechanical_key for the tool layer to apply.
+    """
+    roll = random.randint(1, 20)
+    for (r, title, desc, key) in _REALM_EVENTS:
+        if r == roll:
+            return {
+                "roll":          roll,
+                "title":         title,
+                "description":   desc,
+                "mechanical_key": key,
+            }
+    # Fallback (should never hit)
+    return {
+        "roll":          roll,
+        "title":         "Quiet Season",
+        "description":   "Nothing notable occurs. The realm rests.",
+        "mechanical_key": "narrative_only",
+    }
+
+
+def db_create_domain_turn(turn_label: str, start_date: str = "", end_date: str = "") -> int:
+    """Insert a domain_turns row. Returns the new domain_turn_id."""
+    with _get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO domain_turns (campaign_id, turn_label, start_date, end_date) "
+            "VALUES (?, ?, ?, ?)",
+            (_CAMPAIGN_ID, turn_label, start_date or None, end_date or None),
+        )
+        return cur.lastrowid
+
+
+def db_advance_construction(weeks: int) -> dict:
+    """
+    Advance all projects in the construction queue by `weeks` weeks.
+    Projects that reach 0 weeks_remaining are marked 'Established/Completed'
+    in the projects table and removed from the queue.
+
+    Returns: {advanced: [...], completed: [...]}
+    """
+    queue = _get_construction_queue()
+    advanced: list[dict] = []
+    completed: list[dict] = []
+
+    for pid_str, entry in list(queue.items()):
+        prev_weeks = entry.get("weeks_remaining", 0)
+        new_weeks  = max(0, prev_weeks - weeks)
+        entry["weeks_remaining"] = new_weeks
+
+        item_info = {
+            "project_id":      int(pid_str),
+            "name":            entry.get("name", f"Project #{pid_str}"),
+            "weeks_before":    prev_weeks,
+            "weeks_after":     new_weeks,
+            "weeks_advanced":  min(weeks, prev_weeks),
+        }
+
+        if new_weeks == 0:
+            # Mark complete in projects table
+            with _get_conn() as conn:
+                conn.execute(
+                    "UPDATE projects SET status = 'Established/Completed' "
+                    "WHERE project_id = ? AND campaign_id = ?",
+                    (int(pid_str), _CAMPAIGN_ID),
+                )
+            del queue[pid_str]
+            completed.append(item_info)
+        else:
+            queue[pid_str] = entry
+            advanced.append(item_info)
+
+    _set_construction_queue(queue)
+    return {"advanced": advanced, "completed": completed}
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _record_ledger_entry(
+    entry_type: str,
+    amount_gp:  int,
+    description: str,
+    domain_turn_id: int | None = None,
+    project_id:     int | None = None,
+) -> None:
+    """Append a row to domain_income_expenses."""
+    with _get_conn() as conn:
+        conn.execute(
+            "INSERT INTO domain_income_expenses "
+            "(campaign_id, domain_turn_id, treasury_id, entry_type, "
+            "amount_gp, description, related_project_id) "
+            "VALUES (?, ?, 1, ?, ?, ?, ?)",
+            (_CAMPAIGN_ID, domain_turn_id, entry_type, amount_gp,
+             description, project_id),
+        )
+
+
+def _deduct_treasury(amount_gp: int) -> None:
+    """Subtract gp from treasury_id=1 (primary account). Floor at 0."""
+    with _get_conn() as conn:
+        conn.execute(
+            "UPDATE treasury_accounts SET gp = MAX(0, gp - ?) "
+            "WHERE treasury_id = 1 AND campaign_id = ?",
+            (amount_gp, _CAMPAIGN_ID),
+        )
+
+
+def _credit_treasury(amount_gp: int) -> None:
+    """Add gp to treasury_id=1 (primary account)."""
+    with _get_conn() as conn:
+        conn.execute(
+            "UPDATE treasury_accounts SET gp = gp + ? "
+            "WHERE treasury_id = 1 AND campaign_id = ?",
+            (amount_gp, _CAMPAIGN_ID),
+        )

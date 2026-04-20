@@ -188,7 +188,7 @@ rolls, then call `create_character` to commit the final choices to a new databas
 
 ## MCP Tools
 
-Claude has access to 30 tools automatically:
+Claude has access to 36 tools automatically:
 
 ### Session
 | Tool | What it does |
@@ -242,6 +242,16 @@ Claude has access to 30 tools automatically:
 | `check_wandering_monster` | Roll 1-in-6 wandering monster check for one dungeon turn (10 min); triggers a full random encounter if it hits; increments the persistent turn counter |
 | `random_encounter` | Roll a random encounter for the given dungeon level using the AD&D 1e two-step system (d20 → monster level table, d100 → monster); returns full stat block |
 | `generate_treasure` | Roll a complete treasure haul for a type A–Z: each coin denomination, gems (individually typed), jewelry (individually valued), and magic items from their subtables |
+
+### Domain
+| Tool | What it does |
+|---|---|
+| `get_domain_state` | Full realm snapshot: all holdings with income ranges, troops with upkeep, treasury balances, construction projects with weeks remaining, monthly net estimate |
+| `domain_turn` | Advance one full season: collect 3 months of income, pay 3 months of upkeep, advance all construction projects, roll one realm event — all in one call |
+| `add_construction_project` | Queue a new building with name, type, cost, location, and weeks-to-completion; registers in the construction queue for automatic progress tracking |
+| `collect_income` | Roll income for all active holdings for N months; optionally credit the primary treasury |
+| `pay_upkeep` | Deduct troop upkeep for N months from the primary treasury; returns per-group breakdown |
+| `realm_event` | Roll on the d20 realm events table (harvests, raids, trade windfalls, plague, diplomacy, etc.); returns the event and instructions for applying its mechanical effect |
 
 ### Character Setup
 | Tool | What it does |
@@ -303,7 +313,7 @@ greyhawk-solo/
 │   ├── ddl.sql               # DDL only — used internally for fast new-DB creation
 │   └── new_character_template.sql  # Manual fill-in-the-blanks alternative
 ├── server/
-│   └── mcp_server.py         # FastMCP server; 30 tools; connects to Claude Desktop
+│   └── mcp_server.py         # FastMCP server; 36 tools; connects to Claude Desktop
 ├── saves/                    # Your campaign DB goes here (git-ignored)
 │   └── .gitkeep
 ├── create_character.py       # Interactive character creation CLI
@@ -349,7 +359,7 @@ echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":
 {"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' | python server/mcp_server.py
 ```
 
-You should see 30 tools listed in the response.
+You should see 36 tools listed in the response.
 
 ---
 
