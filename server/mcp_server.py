@@ -94,6 +94,7 @@ Run standalone for testing:
 import json
 import random
 import re
+import sqlite3
 import sys
 from pathlib import Path
 from typing import Annotated
@@ -4056,6 +4057,196 @@ def negotiate_surrender(
         terms_offered=terms_offered,
         calendar_note=calendar_note,
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TOOL: list_campaigns
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _read_campaign_info(db_path: Path) -> dict:
+    """Extract PC name and class levels from a campaign DB (read-only)."""
+    info = {
+        "filename":  db_path.name,
+        "path":      f"saves/{db_path.name}",
+        "character": None,
+        "classes":   None,
+        "error":     None,
+    }
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        try:
+            row = cur.execute(
+                "SELECT name FROM characters WHERE character_id = 1"
+            ).fetchone()
+            if row:
+                info["character"] = row[0]
+        except Exception:
+            pass
+        try:
+            rows = cur.execute(
+                "SELECT class_name, level FROM class_levels "
+                "WHERE character_id = 1 ORDER BY class_name"
+            ).fetchall()
+            if rows:
+                info["classes"] = " / ".join(
+                    f"{r['class_name']} {r['level']}" for r in rows
+                )
+        except Exception:
+            pass
+        conn.close()
+    except sqlite3.OperationalError as e:
+        info["error"] = f"Cannot open: {e}"
+    return info
+
+
+def _active_campaign_rel() -> str:
+    """Return the active_campaign_db value from config.json (normalised), or ''."""
+    config_path = _ROOT / "config.json"
+    if not config_path.exists():
+        return ""
+    try:
+        cfg = json.loads(config_path.read_text(encoding="utf-8"))
+        return cfg.get("active_campaign_db", "").replace("\\", "/")
+    except Exception:
+        return ""
+
+
+@mcp.tool()
+def list_campaigns() -> dict:
+    """
+    List every campaign database in saves/ with its character name and class.
+
+    Returns a dict with:
+      campaigns -- list of {filename, path, character, classes, active}
+                   where classes is a string like "Fighter 7 / Magic-User 7".
+      count     -- number of .db files found.
+
+    Use before switch_campaign so the player can see what's available.
+    Does not modify anything on disk.
+    """
+    saves_dir = _ROOT / "saves"
+    db_files = sorted(saves_dir.glob("*.db"))
+    active_rel = _active_campaign_rel()
+
+    campaigns = []
+    for db_path in db_files:
+        info = _read_campaign_info(db_path)
+        info["active"] = (info["path"] == active_rel)
+        campaigns.append(info)
+
+    return {"campaigns": campaigns, "count": len(campaigns)}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TOOL: switch_campaign
+# ══════════════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def switch_campaign(
+    identifier: Annotated[
+        str,
+        "Either a database filename ('aelric_silvertongue.db'), a relative "
+        "path ('saves/aelric_silvertongue.db'), the DB stem ('aelric_silvertongue'), "
+        "or the character's name ('Aelric Silvertongue', 'aelric'). Matching "
+        "is case-insensitive and falls back to substring search if an exact "
+        "match is not found.",
+    ],
+) -> dict:
+    """
+    Point config.json at a different campaign database.
+
+    The MCP server reads config.json once at startup, so after this tool
+    succeeds the player must fully quit and relaunch Claude Desktop for the
+    change to take effect. The databases themselves are not modified.
+
+    Returns on success:
+      character -- PC name from the newly-selected DB
+      classes   -- Class levels string (e.g. "Fighter 7 / Magic-User 7")
+      database  -- Relative DB path now stored in config.json
+      note      -- Reminder to restart Claude Desktop
+
+    Returns an error dict if no matching DB is found, the identifier is
+    ambiguous, or the selected DB cannot be read.
+    """
+    saves_dir = _ROOT / "saves"
+    db_files = sorted(saves_dir.glob("*.db"))
+    if not db_files:
+        return {"error": "No .db files found in saves/."}
+
+    raw = identifier.strip()
+    if not raw:
+        return {"error": "Identifier is empty."}
+
+    needle = raw.replace("\\", "/")
+    if needle.lower().startswith("saves/"):
+        needle = needle[len("saves/"):]
+    needle_lower = needle.lower()
+
+    # 1. Exact filename / stem match
+    matches: list[Path] = []
+    for db_path in db_files:
+        if needle_lower in (db_path.name.lower(), db_path.stem.lower()):
+            matches = [db_path]
+            break
+
+    # 2. Exact character-name match
+    if not matches:
+        for db_path in db_files:
+            info = _read_campaign_info(db_path)
+            char = (info.get("character") or "").lower()
+            if char and needle_lower == char:
+                matches = [db_path]
+                break
+
+    # 3. Substring match across both filename stem and character name
+    if not matches:
+        for db_path in db_files:
+            info = _read_campaign_info(db_path)
+            char = (info.get("character") or "").lower()
+            if needle_lower in db_path.stem.lower() or (char and needle_lower in char):
+                matches.append(db_path)
+
+    if not matches:
+        return {
+            "error":     f"No campaign matching '{identifier}' found in saves/.",
+            "available": [p.name for p in db_files],
+        }
+    if len(matches) > 1:
+        return {
+            "error":   f"'{identifier}' matches multiple campaigns; be more specific.",
+            "matched": [p.name for p in matches],
+        }
+
+    selected = matches[0]
+    info = _read_campaign_info(selected)
+    if info.get("error"):
+        return {"error": f"Selected DB unreadable: {info['error']}"}
+
+    rel = f"saves/{selected.name}"
+
+    # Preserve any other config keys when rewriting
+    config_path = _ROOT / "config.json"
+    cfg: dict = {}
+    if config_path.exists():
+        try:
+            cfg = json.loads(config_path.read_text(encoding="utf-8"))
+        except Exception:
+            cfg = {}
+    cfg["active_campaign_db"] = rel
+    config_path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+
+    return {
+        "character": info.get("character"),
+        "classes":   info.get("classes"),
+        "database":  rel,
+        "note":      (
+            "config.json updated. Fully quit and relaunch Claude Desktop "
+            "to activate the new campaign — the MCP server reads config.json "
+            "once at startup."
+        ),
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
