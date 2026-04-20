@@ -157,6 +157,13 @@ from engine.db import (
     db_advance_time,
     db_aging_check,
     db_get_character_age,
+    # Phase 5D — siege mechanics
+    db_start_siege,
+    db_siege_turn,
+    db_artillery_fire,
+    db_assault,
+    db_get_siege_state,
+    db_negotiate_surrender,
     # Phase 4 — domain
     get_full_domain_state,
     db_add_construction_project,
@@ -3773,6 +3780,282 @@ def get_character_age(
     years_to_next_check, natural_lifespan_max, ability_changes_applied, dm_note.
     """
     return db_get_character_age(character_id=character_id)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SIEGE MECHANICS  (Phase 5D)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@mcp.tool()
+def start_siege(
+    target_location: Annotated[
+        str,
+        "Name of the location being besieged (e.g. 'Quasquetan', 'Iron Marsh Tower').",
+    ],
+    fortification_type: Annotated[
+        str,
+        "Type of fortification: palisade, tower, keep, castle, city_walls, "
+        "fortified_mill, or fortress. Determines wall/gate hit points and resist rating.",
+    ],
+    role: Annotated[
+        str,
+        "PC's side: 'attacker' or 'defender'.",
+    ],
+    attacker_name: Annotated[
+        str,
+        "Label for the attacking force (e.g. 'Theron's host', 'Orcish warband').",
+    ],
+    attacker_count: Annotated[
+        int,
+        "Effective troop strength of the attacking force.",
+    ],
+    attacker_supplies: Annotated[
+        int,
+        "Weeks of supplies the attackers have (each 100 troops consume 1 week/week).",
+    ],
+    defender_name: Annotated[
+        str,
+        "Label for the defending garrison (e.g. 'Quasquetan garrison', 'Iron Watch').",
+    ],
+    defender_count: Annotated[
+        int,
+        "Effective troop strength of the defending garrison.",
+    ],
+    defender_supplies: Annotated[
+        int,
+        "Weeks of supplies the defenders have.",
+    ],
+    artillery: Annotated[
+        list,
+        "List of artillery pieces. Each entry is a dict with keys: "
+        "name (str), type (str: stone_caster | light_catapult | heavy_catapult | "
+        "ballista | trebuchet), condition (str: operational | damaged). "
+        "stone_caster entries automatically record Brak, Hurn, and Tollug as crew "
+        "with +2 to-hit and +1d6 damage bonus. Pass [] if no artillery.",
+    ],
+    calendar_note: Annotated[
+        str,
+        "Campaign date or note for the log (e.g. 'Planting 4, 576 CY').",
+    ] = "",
+) -> dict:
+    """
+    Initiate a siege. Overwrites any prior siege state.
+
+    Use this to open a formal siege against a fortified location.
+    The fortification_type determines starting wall/gate integrity and resist rating.
+
+    Stone-caster artillery automatically registers Brak, Hurn, and Tollug as crew
+    (Theron's trained ogre artillery crew) with +2 to-hit and +1d6 bonus damage.
+
+    After starting the siege, advance it with:
+    - siege_turn()       — weekly attrition, disease, sallies, morale
+    - artillery_fire()   — daily bombardment to reduce wall/gate integrity
+    - assault()          — direct storm of walls or gate
+    - negotiate_surrender() — attempt to end the siege diplomatically
+
+    Returns wall/gate starting integrity, both sides' troop counts, and a
+    reminder of which tools to call next.
+    """
+    return db_start_siege(
+        target_location=target_location,
+        fortification_type=fortification_type,
+        role=role,
+        attacker_name=attacker_name,
+        attacker_count=attacker_count,
+        attacker_supplies=attacker_supplies,
+        defender_name=defender_name,
+        defender_count=defender_count,
+        defender_supplies=defender_supplies,
+        artillery=artillery,
+        calendar_note=calendar_note,
+    )
+
+
+@mcp.tool()
+def siege_turn(
+    mining: Annotated[
+        bool,
+        "True if the attacker has sappers actively digging under the walls this week. "
+        "Each week of successful mining contributes to eventual wall collapse.",
+    ] = False,
+    calendar_note: Annotated[
+        str,
+        "Campaign date or note for the log (e.g. 'Planting 11, 576 CY — Week 2 of siege').",
+    ] = "",
+) -> dict:
+    """
+    Resolve one week of siege operations.
+
+    Rolls for all weekly siege events:
+    - Supply attrition (each side loses supply_weeks based on troop count)
+    - Disease outbreak (1-in-6 per side; 5% casualties if it hits)
+    - Defender sally attempt (if morale ≥ 7)
+    - Relief force arrival check
+    - Morale degradation from casualties and starvation
+    - Mining progress (if mining=True)
+
+    Call this once per game week during a siege. Use artillery_fire() between
+    turns for daily bombardment, and assault() when ready to storm.
+
+    Returns: week number, supply state, disease outcomes, sally result,
+    morale for both sides, mining progress, and any critical events.
+    """
+    return db_siege_turn(mining=mining, calendar_note=calendar_note)
+
+
+@mcp.tool()
+def artillery_fire(
+    engine_name: Annotated[
+        str,
+        "Name of the artillery piece to fire. Must match a name registered in start_siege(). "
+        "For Theron's stone-caster, use 'Stone-caster (ogre-operated)' or the name you gave it.",
+    ],
+    target: Annotated[
+        str,
+        "What to target: 'walls' (reduces wall_integrity), 'gate' (reduces gate_integrity), "
+        "or 'defenders' (direct casualties against garrison).",
+    ] = "walls",
+    volleys: Annotated[
+        int,
+        "Number of shots fired this day. Catapults typically fire 1-3 per day depending "
+        "on crew rest. Stone-casters (ogre crew) can sustain 2-3 per day.",
+    ] = 1,
+    calendar_note: Annotated[
+        str,
+        "Campaign date or note (e.g. 'Planting 5, 576 CY — Day 2 bombardment').",
+    ] = "",
+) -> dict:
+    """
+    Resolve one day of artillery bombardment against a fortified target.
+
+    Each volley rolls THAC0 vs AC 8 (walls/gate). Hit = damage rolled, reduced
+    by the fortification's resist rating. The stone-caster operated by Brak,
+    Hurn, and Tollug gets +2 to-hit and +1d6 bonus damage per hit.
+
+    When wall_integrity drops below 30, a breach opens (assault without scaling
+    ladders becomes possible). When gate_integrity drops below 20, the gate is
+    destroyed.
+
+    Returns: per-volley hit/miss/damage breakdown, updated wall/gate integrity,
+    breach status, and engine condition (may be damaged by counter-battery fire).
+    """
+    return db_artillery_fire(
+        engine_name=engine_name,
+        target=target,
+        volleys=volleys,
+        calendar_note=calendar_note,
+    )
+
+
+@mcp.tool()
+def assault(
+    breach_point: Annotated[
+        str,
+        "Where to assault: 'walls' (requires breach or scaling_ladders=True), "
+        "'gate' (requires battering_ram=True or gate_integrity < 20), "
+        "or 'breach' (if a breach exists in the walls).",
+    ] = "walls",
+    waves: Annotated[
+        int,
+        "Number of assault waves (1-3). More waves = more casualties on both sides, "
+        "but higher chance of success. Each wave after the first suffers additional "
+        "defender penalties.",
+    ] = 1,
+    scaling_ladders: Annotated[
+        bool,
+        "True if attackers are using scaling ladders against intact walls. "
+        "Allows assault without a breach but adds +5% attacker casualties per wave.",
+    ] = False,
+    battering_ram: Annotated[
+        bool,
+        "True if a battering ram is targeting the gate. Adds +3% attacker casualties "
+        "from concentrated defensive fire.",
+    ] = False,
+    calendar_note: Annotated[
+        str,
+        "Campaign date or note (e.g. 'Planting 18, 576 CY — The storm begins').",
+    ] = "",
+) -> dict:
+    """
+    Resolve a direct assault on the fortification's walls, gate, or breach.
+
+    Requires at least one of: an open breach (wall_integrity < 30),
+    scaling_ladders=True, or battering_ram=True (gate assault).
+
+    Each wave rolls attacker vs defender casualties based on fort type, wall
+    condition, troop numbers, and assault method. Success is determined by
+    whether attackers break through before their morale collapses.
+
+    Returns: wave-by-wave casualty reports, assault outcome (success/repelled),
+    defender morale impact, and any gate/breach changes.
+    """
+    return db_assault(
+        breach_point=breach_point,
+        waves=waves,
+        scaling_ladders=scaling_ladders,
+        battering_ram=battering_ram,
+        calendar_note=calendar_note,
+    )
+
+
+@mcp.tool()
+def get_siege_state() -> dict:
+    """
+    Return the full current siege status.
+
+    Returns a complete snapshot of the active siege including:
+    - Wall and gate integrity percentages
+    - Both sides: troop count, casualties, strength %, supply weeks, morale
+    - Breach points (if any)
+    - Whether the last assault was repelled
+    - Last 5 siege events log
+    - Artillery pieces (name, type, condition, shots fired, crew)
+
+    Returns an error dict if no siege is currently active.
+
+    Call this at the start of each siege-related scene to orient the DM narration.
+    """
+    return db_get_siege_state()
+
+
+@mcp.tool()
+def negotiate_surrender(
+    terms_offered: Annotated[
+        str,
+        "Brief description of the terms being proposed to the defender "
+        "(e.g. 'Quarter for all, garrison may leave with swords', "
+        "'Surrender weapons and swear fealty', 'Unconditional — no quarter'). "
+        "The terms should reflect the PC's intent; the roll determines acceptance.",
+    ],
+    calendar_note: Annotated[
+        str,
+        "Campaign date or note (e.g. 'Planting 25, 576 CY — Parley under truce flag').",
+    ] = "",
+) -> dict:
+    """
+    Attempt to negotiate the defender's surrender.
+
+    Rolls d20 + modifiers to determine whether the defender accepts terms.
+    Modifiers account for: attacker numerical superiority, wall/gate damage,
+    defender supply state, defender morale, and PC Charisma.
+
+    Result tiers (Jeff Rients-style):
+    - 20+: unconditional surrender (siege ends)
+    - 16-19: honourable terms accepted (siege ends)
+    - 12-15: hard terms — defender stalls, negotiating for time
+    - 8-11: terms refused
+    - 4-7: offer insulted — defender morale briefly rises
+    - 1-3: betrayal — ambush or attack under the truce flag
+
+    Returns: roll breakdown, modifier notes, result tier, and DM guidance
+    for resolving the outcome. If siege_ends=True, call end_combat/update_troop_count
+    to close out the engagement.
+    """
+    return db_negotiate_surrender(
+        terms_offered=terms_offered,
+        calendar_note=calendar_note,
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════

@@ -188,7 +188,7 @@ rolls, then call `create_character` to commit the final choices to a new databas
 
 ## MCP Tools
 
-Claude has access to 56 tools automatically:
+Claude has access to 62 tools automatically:
 
 ### Session
 | Tool | What it does |
@@ -285,6 +285,16 @@ Claude has access to 56 tools automatically:
 | `aging_check` | Apply AD&D 1e ability score changes at middle_age / old / venerable thresholds; permanently modifies character_abilities in the DB |
 | `get_character_age` | Return current age, race thresholds (Elves: middle age at 350), aging stage, and years to the next aging check |
 
+### Siege
+| Tool | What it does |
+|---|---|
+| `start_siege` | Initiate a siege: register fortification type, both sides' troop counts and supplies, artillery (stone-caster auto-registers Brak, Hurn, Tollug as crew) |
+| `siege_turn` | Advance one week: supply attrition, disease, defender sally, relief attempt, morale degradation, optional mining |
+| `artillery_fire` | Resolve one day of bombardment: THAC0 vs AC 8 per volley; stone-caster crew +2 to-hit and +1d6 bonus damage; reduces wall/gate integrity |
+| `assault` | Storm walls, gate, or breach: multi-wave assault with casualties on both sides; requires breach, scaling ladders, or battering ram |
+| `get_siege_state` | Full siege snapshot: wall/gate integrity, both sides' strength/supply/morale, breach points, artillery status, last 5 events |
+| `negotiate_surrender` | Attempt to end the siege: d20 + modifiers (strength, supply, walls, morale, Charisma); 6-tier outcome from unconditional surrender to betrayal |
+
 ### Character Setup
 | Tool | What it does |
 |---|---|
@@ -345,7 +355,7 @@ greyhawk-solo/
 │   ├── ddl.sql               # DDL only — used internally for fast new-DB creation
 │   └── new_character_template.sql  # Manual fill-in-the-blanks alternative
 ├── server/
-│   └── mcp_server.py         # FastMCP server; 56 tools; connects to Claude Desktop
+│   └── mcp_server.py         # FastMCP server; 62 tools; connects to Claude Desktop
 ├── saves/                    # Your campaign DB goes here (git-ignored)
 │   └── .gitkeep
 ├── create_character.py       # Interactive character creation CLI
@@ -391,7 +401,7 @@ echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":
 {"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' | python server/mcp_server.py
 ```
 
-You should see 56 tools listed in the response.
+You should see 62 tools listed in the response.
 
 ---
 

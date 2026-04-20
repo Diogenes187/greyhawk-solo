@@ -5334,3 +5334,926 @@ def db_get_character_age(character_id: int) -> dict:
             "Call aging_check(character_id, threshold_stage) when a threshold is crossed."
         ),
     }
+
+
+# ==============================================================================
+# PHASE 5D — SIEGE MECHANICS (FINAL PHASE)
+# start_siege · siege_turn · artillery_fire · assault
+# get_siege_state · negotiate_surrender
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# SIEGE CONSTANTS
+# ------------------------------------------------------------------------------
+
+# Fortification type → (wall_integrity, gate_integrity, base_resist, label)
+# base_resist: subtracted from artillery damage (stone construction hardness)
+_FORT_TYPES: dict[str, dict] = {
+    "palisade":      {"wall": 40,  "gate": 30, "resist": 2, "label": "Wooden palisade"},
+    "tower":         {"wall": 60,  "gate": 50, "resist": 4, "label": "Stone tower"},
+    "keep":          {"wall": 80,  "gate": 70, "resist": 6, "label": "Stone keep"},
+    "castle":        {"wall": 100, "gate": 90, "resist": 8, "label": "Castle"},
+    "city_walls":    {"wall": 100, "gate": 80, "resist": 7, "label": "City walls"},
+    "fortified_mill":{"wall": 50,  "gate": 40, "resist": 3, "label": "Fortified mill"},
+    "fortress":      {"wall": 100, "gate": 90, "resist": 9, "label": "Fortress"},
+}
+
+# Artillery type → {thac0, wall_dice, wall_sides, pers_dice, pers_sides, crew}
+_ARTILLERY_TYPES: dict[str, dict] = {
+    "light_catapult": {
+        "thac0": 15, "wall_d": 1, "wall_s": 10,
+        "pers_d": 1, "pers_s": 10, "crew": 4,
+        "label": "Light catapult",
+    },
+    "heavy_catapult": {
+        "thac0": 12, "wall_d": 2, "wall_s": 10,
+        "pers_d": 2, "pers_s": 10, "crew": 6,
+        "label": "Heavy catapult",
+    },
+    "stone_caster": {
+        "thac0": 12, "wall_d": 2, "wall_s": 10,
+        "pers_d": 2, "pers_s": 10, "crew": 3,
+        "label": "Stone-caster (ogre-operated)",
+        "crew_names": ["Brak", "Hurn", "Tollug"],
+        "crew_bonus_hit": 2,    # ogre Str bonus to hit
+        "crew_bonus_dmg_d": 1,  # extra d6 damage from ogre power
+        "crew_bonus_dmg_s": 6,
+    },
+    "ballista": {
+        "thac0": 13, "wall_d": 1, "wall_s": 4,
+        "pers_d": 2, "pers_s": 6, "crew": 3,
+        "label": "Ballista",
+    },
+    "trebuchet": {
+        "thac0": 10, "wall_d": 3, "wall_s": 10,
+        "pers_d": 3, "pers_s": 10, "crew": 10,
+        "label": "Trebuchet",
+    },
+}
+
+# Supply consumption: units per side per week (1 unit = supplies for 10 men 1 week)
+# Attacker: 1 unit per 10 men; Defender: 1 unit per 8 men (siege rationing harder)
+_SUPPLY_PER_10_MEN_ATTACKER = 1
+_SUPPLY_PER_10_MEN_DEFENDER = 1   # weeks, not units — stored directly as weeks remaining
+
+# Surrender terms result table
+_SURRENDER_TERMS: list[tuple[int, str, str]] = [
+    # (min_roll, label, description)
+    (20, "unconditional",
+     "Unconditional surrender. Garrison lays down arms; all terms dictated by victor."),
+    (16, "honourable",
+     "Honourable terms. Garrison departs with personal weapons; no looting of civilians."),
+    (12, "hard",
+     "Hard terms. Officers ransomed; common soldiers disarmed; limited looting permitted."),
+    (8,  "refused",
+     "Terms refused. Defenders will fight to the last. Parley buys time, nothing more."),
+    (4,  "insulted",
+     "Offer insulted. The garrison commander is offended; morale improves for defenders."),
+    (1,  "betrayal",
+     "Betrayal. Defenders use parley to launch a surprise sally. Initiative goes to defenders."),
+]
+
+
+# ------------------------------------------------------------------------------
+# SIEGE STATE HELPERS
+# ------------------------------------------------------------------------------
+
+def _get_siege_state() -> dict | None:
+    """Return the active siege state from world_facts, or None."""
+    with _get_conn(read_only=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT world_fact_id, fact_text FROM world_facts "
+            "WHERE campaign_id = ? AND category = 'siege_state' LIMIT 1",
+            (_CAMPAIGN_ID,),
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
+    try:
+        d = json.loads(row["fact_text"])
+        d["_fact_id"] = row["world_fact_id"]
+        return d
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def _set_siege_state(state: dict) -> None:
+    """Upsert the siege state world_fact."""
+    fact_id = state.pop("_fact_id", None)
+    payload = json.dumps(state)
+    with _get_conn() as conn:
+        if fact_id:
+            conn.execute(
+                "UPDATE world_facts SET fact_text = ? WHERE world_fact_id = ?",
+                (payload, fact_id),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO world_facts (campaign_id, category, fact_text, source_note) "
+                "VALUES (?, 'siege_state', ?, 'siege_engine')",
+                (_CAMPAIGN_ID, payload),
+            )
+
+
+def _clear_siege_state() -> None:
+    """Remove the siege state when a siege ends."""
+    with _get_conn() as conn:
+        conn.execute(
+            "DELETE FROM world_facts WHERE campaign_id = ? AND category = 'siege_state'",
+            (_CAMPAIGN_ID,),
+        )
+
+
+def _roll_to_hit_wall(thac0: int, bonus: int = 0) -> tuple[int, bool]:
+    """Roll d20 + bonus to hit wall AC 8. Returns (roll, hit)."""
+    roll = random.randint(1, 20)
+    return roll, (roll + bonus) >= (thac0 - 8 + 1)   # needs thac0 - AC
+
+
+def _pct_casualties(count: int, pct: float) -> int:
+    """Convert a percentage casualty rate to a whole-number count."""
+    return max(0, round(count * pct / 100))
+
+
+# ------------------------------------------------------------------------------
+# PUBLIC SIEGE FUNCTIONS
+# ------------------------------------------------------------------------------
+
+def db_start_siege(
+    target_location:    str,
+    fortification_type: str,
+    role:               str,
+    attacker_name:      str,
+    attacker_count:     int,
+    attacker_supplies:  int,
+    defender_name:      str,
+    defender_count:     int,
+    defender_supplies:  int,
+    artillery:          list[dict],
+    calendar_note:      str = "",
+) -> dict:
+    """
+    Initiate a new siege. Clears any existing siege state.
+
+    artillery: list of dicts, each with keys:
+      {name, type, condition}
+      type must be one of: light_catapult, heavy_catapult, stone_caster,
+                           ballista, trebuchet
+    The stone_caster entry automatically records Brak, Hurn, and Tollug as crew.
+    """
+    fort_type = fortification_type.lower().strip()
+    fort      = _FORT_TYPES.get(fort_type, _FORT_TYPES["keep"])
+    role_str  = role.lower().strip()
+    if role_str not in ("attacker", "defender"):
+        return {"error": "role must be 'attacker' or 'defender'"}
+
+    # Build artillery list with full stats
+    artillery_records = []
+    for art in (artillery or []):
+        art_type = art.get("type", "light_catapult")
+        art_data = dict(_ARTILLERY_TYPES.get(art_type, _ARTILLERY_TYPES["light_catapult"]))
+        artillery_records.append({
+            "name":      art.get("name", art_data["label"]),
+            "type":      art_type,
+            "label":     art_data["label"],
+            "condition": art.get("condition", "operational"),
+            "shots_fired_total": 0,
+            "hits_total":        0,
+            "crew":      art_data.get("crew_names", []),
+        })
+
+    attacker_side = {
+        "name":           attacker_name,
+        "pc_side":        role_str == "attacker",
+        "count":          max(1, attacker_count),
+        "supply_weeks":   max(0, attacker_supplies),
+        "morale":         9,
+        "casualties":     0,
+        "artillery":      artillery_records if role_str == "attacker" else [],
+        "has_artillery":  bool(artillery_records) and role_str == "attacker",
+    }
+
+    defender_side = {
+        "name":           defender_name,
+        "pc_side":        role_str == "defender",
+        "count":          max(1, defender_count),
+        "supply_weeks":   max(0, defender_supplies),
+        "morale":         9,
+        "casualties":     0,
+        "artillery":      artillery_records if role_str == "defender" else [],
+        "has_artillery":  bool(artillery_records) and role_str == "defender",
+    }
+
+    state = {
+        "active":            True,
+        "role":              role_str,
+        "target_location":   target_location,
+        "fortification_type": fort_type,
+        "fortification_label": fort["label"],
+        "start_date":        calendar_note or "campaign date",
+        "weeks_elapsed":     0,
+        "wall_integrity":    fort["wall"],
+        "gate_integrity":    fort["gate"],
+        "base_resist":       fort["resist"],
+        "breach_points":     [],
+        "last_assault_repelled": False,
+        "attacker":          attacker_side,
+        "defender":          defender_side,
+        "events_log":        [],
+    }
+
+    _set_siege_state(state)
+
+    return {
+        "siege_started":        True,
+        "target_location":      target_location,
+        "fortification":        fort["label"],
+        "role":                 role_str,
+        "attacker":             attacker_name,
+        "attacker_count":       attacker_count,
+        "attacker_supplies":    attacker_supplies,
+        "defender":             defender_name,
+        "defender_count":       defender_count,
+        "defender_supplies":    defender_supplies,
+        "wall_integrity":       fort["wall"],
+        "gate_integrity":       fort["gate"],
+        "artillery_registered": len(artillery_records),
+        "stone_caster_crew":    ["Brak", "Hurn", "Tollug"],
+        "dm_note": (
+            "Siege initiated. Call siege_turn() weekly to advance the siege. "
+            "Call artillery_fire() each day of bombardment before siege_turn(). "
+            "Call assault() when ready to attempt a direct attack. "
+            "Breach opens when wall_integrity drops below 30."
+        ),
+    }
+
+
+def db_siege_turn(
+    mining:        bool  = False,
+    calendar_note: str   = "",
+) -> dict:
+    """
+    Resolve one week of siege operations.
+    Rolls for: supply attrition, disease, sally attempt, relief attempt,
+    morale degradation, and optional mining progress.
+    mining: True if attacker has sappers digging under the walls.
+    """
+    state = _get_siege_state()
+    if not state:
+        return {"error": "No active siege. Call start_siege() first."}
+
+    fact_id = state.pop("_fact_id", None)
+    events: list[str] = []
+    week = state["weeks_elapsed"] + 1
+
+    # ── Supply attrition ──────────────────────────────────────────────────────
+    for side_key in ("attacker", "defender"):
+        side = state[side_key]
+        # Each side uses 1 supply week per 100 effective combatants
+        consumption = max(1, side["count"] // 100)
+        old_supply  = side["supply_weeks"]
+        side["supply_weeks"] = max(0, old_supply - consumption)
+        if side["supply_weeks"] == 0 and old_supply > 0:
+            events.append(f"{side['name']} has exhausted their supplies!")
+        elif side["supply_weeks"] <= 1 and old_supply > 1:
+            events.append(f"{side['name']} is down to final week of supplies.")
+
+    # ── Morale from supply state ──────────────────────────────────────────────
+    for side_key in ("attacker", "defender"):
+        side = state[side_key]
+        if side["supply_weeks"] == 0:
+            side["morale"] = max(2, side["morale"] - 1)
+            events.append(f"{side['name']} morale drops (no supplies). Morale now {side['morale']}.")
+        casualty_pct = (side["casualties"] / max(1, side["count"] + side["casualties"])) * 100
+        if casualty_pct > 30 and random.randint(1, 6) <= 2:
+            side["morale"] = max(2, side["morale"] - 1)
+            events.append(
+                f"{side['name']} morale shaken by heavy losses ({casualty_pct:.0f}% casualties). "
+                f"Morale now {side['morale']}."
+            )
+
+    # ── Disease check ─────────────────────────────────────────────────────────
+    disease_results = {}
+    for side_key in ("attacker", "defender"):
+        side   = state[side_key]
+        d_roll = random.randint(1, 6)
+        if d_roll == 1:
+            sick   = _pct_casualties(side["count"], 5)
+            side["count"]      = max(0, side["count"]      - sick)
+            side["casualties"] = side.get("casualties", 0) + sick
+            disease_results[side_key] = {"outbreak": True, "sick": sick}
+            events.append(
+                f"Disease breaks out in {side['name']}! {sick} men fall ill. "
+                f"Effective strength now {side['count']}."
+            )
+        else:
+            disease_results[side_key] = {"outbreak": False}
+
+    # ── Sally attempt (defender only) ─────────────────────────────────────────
+    sally_result = {"attempted": False}
+    defender     = state["defender"]
+    def_morale   = defender["morale"]
+    sally_roll   = random.randint(1, 6)
+    if sally_roll <= 2 and def_morale >= 7:
+        # Sally attempted
+        attacker = state["attacker"]
+        sally_strength = _pct_casualties(defender["count"], 20)  # 20% of garrison sallies
+        att_loss = _pct_casualties(attacker["count"], 3)
+        def_loss = _pct_casualties(sally_strength,    15)
+        attacker["count"]      = max(0, attacker["count"]      - att_loss)
+        attacker["casualties"] = attacker.get("casualties", 0) + att_loss
+        defender["count"]      = max(0, defender["count"]      - def_loss)
+        defender["casualties"] = defender.get("casualties", 0) + def_loss
+        # Check if siege engine damaged
+        engine_damaged = random.random() < 0.25 and attacker.get("has_artillery")
+        sally_result   = {
+            "attempted":      True,
+            "sally_strength": sally_strength,
+            "attacker_loss":  att_loss,
+            "defender_loss":  def_loss,
+            "engine_damaged": engine_damaged,
+        }
+        if engine_damaged:
+            # Mark first operational engine as damaged
+            for art in attacker.get("artillery", []):
+                if art["condition"] == "operational":
+                    art["condition"] = "damaged"
+                    break
+        events.append(
+            f"Garrison sallies! {sally_strength} defenders attack the siege lines. "
+            f"Attacker loses {att_loss} men; defender loses {def_loss}."
+            + (" A siege engine is damaged in the raid!" if engine_damaged else "")
+        )
+    else:
+        events.append("No sally this week.")
+
+    # ── Relief attempt ────────────────────────────────────────────────────────
+    relief_roll   = random.randint(1, 6)
+    relief_result = {
+        "spotted":     relief_roll == 1,
+        "description": (
+            "A relief force has been spotted in the distance! The siege may be threatened."
+            if relief_roll == 1 else
+            "No relief force observed this week."
+        ),
+    }
+    if relief_roll == 1:
+        events.append("Relief force spotted! Attacker may need to detach forces.")
+
+    # ── Mining / countermining ────────────────────────────────────────────────
+    mining_result = {"attempted": False}
+    if mining:
+        mine_roll = random.randint(1, 6)
+        if mine_roll <= 1:
+            mining_result = {"attempted": True, "outcome": "countermined",
+                             "description": "Defenders countermined the tunnel — it collapses harmlessly."}
+            events.append("Mining tunnel countermined by defenders.")
+        elif mine_roll <= 4:
+            wall_dmg = random.randint(5, 15)
+            wall_dmg = max(0, wall_dmg - state["base_resist"])
+            state["wall_integrity"] = max(0, state["wall_integrity"] - wall_dmg)
+            mining_result = {"attempted": True, "outcome": "progress",
+                             "wall_damage": wall_dmg,
+                             "wall_integrity": state["wall_integrity"],
+                             "description": f"Mining progresses. Wall integrity reduced by {wall_dmg} to {state['wall_integrity']}%."}
+            events.append(f"Mining tunnel advances — wall cracked for {wall_dmg} points of damage.")
+        else:
+            wall_dmg = random.randint(15, 30)
+            wall_dmg = max(0, wall_dmg - state["base_resist"] // 2)
+            state["wall_integrity"] = max(0, state["wall_integrity"] - wall_dmg)
+            if state["wall_integrity"] < 30 and "mine_collapse" not in state["breach_points"]:
+                state["breach_points"].append("mine_collapse")
+            mining_result = {"attempted": True, "outcome": "major_collapse",
+                             "wall_damage": wall_dmg,
+                             "wall_integrity": state["wall_integrity"],
+                             "description": f"Mine collapses under the wall! {wall_dmg} damage — wall at {state['wall_integrity']}%."}
+            events.append(f"MINE COLLAPSE! Wall breached for {wall_dmg} damage.")
+
+    # ── Check for breach ──────────────────────────────────────────────────────
+    if state["wall_integrity"] < 30 and "wall" not in state["breach_points"]:
+        state["breach_points"].append("wall")
+        events.append("BREACH! Wall integrity below 30% — assault is now possible at the breach.")
+    if state["gate_integrity"] < 20 and "gate" not in state["breach_points"]:
+        state["breach_points"].append("gate")
+        events.append("GATE BREACH! Gate has been destroyed — the way is open.")
+
+    # ── Update state ──────────────────────────────────────────────────────────
+    state["weeks_elapsed"] = week
+    state["events_log"]    = (state.get("events_log", []) + events)[-20:]  # keep last 20
+
+    state["_fact_id"] = fact_id
+    _set_siege_state(state)
+
+    return {
+        "week":             week,
+        "events":           events,
+        "supply": {
+            "attacker_weeks_left": state["attacker"]["supply_weeks"],
+            "defender_weeks_left": state["defender"]["supply_weeks"],
+        },
+        "disease":          disease_results,
+        "sally":            sally_result,
+        "relief":           relief_result,
+        "mining":           mining_result,
+        "wall_integrity":   state["wall_integrity"],
+        "gate_integrity":   state["gate_integrity"],
+        "breach_points":    state["breach_points"],
+        "attacker_morale":  state["attacker"]["morale"],
+        "defender_morale":  state["defender"]["morale"],
+        "attacker_count":   state["attacker"]["count"],
+        "defender_count":   state["defender"]["count"],
+        "calendar":         calendar_note or f"Week {week} of siege",
+        "dm_note": (
+            "Call artillery_fire() between turns for bombardment damage. "
+            "When breach_points is non-empty or supplies are exhausted, "
+            "consider calling assault() or negotiate_surrender()."
+        ),
+    }
+
+
+def db_artillery_fire(
+    engine_name:    str,
+    target:         str  = "walls",
+    volleys:        int  = 1,
+    calendar_note:  str  = "",
+) -> dict:
+    """
+    Resolve one day of artillery bombardment.
+    engine_name: name of the artillery piece (e.g. 'Stone-Caster').
+    target: 'walls', 'gate', or 'defenders'.
+    volleys: number of shots this day (typically 1-3 for catapults).
+    """
+    state = _get_siege_state()
+    if not state:
+        return {"error": "No active siege. Call start_siege() first."}
+
+    fact_id = state.pop("_fact_id", None)
+
+    # Find the engine
+    all_artillery = (
+        state["attacker"].get("artillery", []) +
+        state["defender"].get("artillery", [])
+    )
+    engine = next(
+        (a for a in all_artillery
+         if a["name"].lower() == engine_name.lower()),
+        None,
+    )
+    if engine is None:
+        # Try partial match
+        engine = next(
+            (a for a in all_artillery
+             if engine_name.lower() in a["name"].lower()),
+            None,
+        )
+    if engine is None:
+        state["_fact_id"] = fact_id
+        _set_siege_state(state)
+        return {"error": f"Artillery engine '{engine_name}' not found. "
+                         f"Registered engines: {[a['name'] for a in all_artillery]}"}
+
+    if engine.get("condition") == "destroyed":
+        state["_fact_id"] = fact_id
+        _set_siege_state(state)
+        return {"error": f"'{engine_name}' is destroyed and cannot fire."}
+
+    art_data  = _ARTILLERY_TYPES.get(engine["type"], _ARTILLERY_TYPES["heavy_catapult"])
+    thac0     = art_data["thac0"]
+    hit_bonus = art_data.get("crew_bonus_hit", 0)
+
+    # Damaged engine penalty
+    if engine.get("condition") == "damaged":
+        thac0 += 2
+        hit_bonus = max(0, hit_bonus - 1)
+
+    volleys = max(1, min(5, volleys))
+    shot_results = []
+    total_wall_damage = 0
+    total_gate_damage = 0
+    total_pers_damage = 0
+
+    for v in range(volleys):
+        roll, hit = _roll_to_hit_wall(thac0, hit_bonus)
+
+        if not hit:
+            shot_results.append({"volley": v + 1, "roll": roll, "hit": False})
+            continue
+
+        # Calculate raw damage
+        if target in ("walls", "wall"):
+            raw_dmg = sum(random.randint(1, art_data["wall_s"])
+                          for _ in range(art_data["wall_d"]))
+            if "crew_bonus_dmg_d" in art_data:
+                raw_dmg += sum(random.randint(1, art_data["crew_bonus_dmg_s"])
+                               for _ in range(art_data["crew_bonus_dmg_d"]))
+            actual_dmg = max(0, raw_dmg - state["base_resist"])
+            state["wall_integrity"] = max(0, state["wall_integrity"] - actual_dmg)
+            total_wall_damage += actual_dmg
+            shot_results.append({
+                "volley": v + 1, "roll": roll, "hit": True,
+                "target": "walls", "raw_damage": raw_dmg,
+                "resist": state["base_resist"], "net_damage": actual_dmg,
+                "wall_integrity": state["wall_integrity"],
+            })
+
+        elif target in ("gate",):
+            raw_dmg = sum(random.randint(1, art_data["wall_s"])
+                          for _ in range(art_data["wall_d"]))
+            if "crew_bonus_dmg_d" in art_data:
+                raw_dmg += sum(random.randint(1, art_data["crew_bonus_dmg_s"])
+                               for _ in range(art_data["crew_bonus_dmg_d"]))
+            # Gates have lower resist than walls
+            gate_resist = max(1, state["base_resist"] // 2)
+            actual_dmg  = max(0, raw_dmg - gate_resist)
+            state["gate_integrity"] = max(0, state["gate_integrity"] - actual_dmg)
+            total_gate_damage += actual_dmg
+            shot_results.append({
+                "volley": v + 1, "roll": roll, "hit": True,
+                "target": "gate", "raw_damage": raw_dmg,
+                "resist": gate_resist, "net_damage": actual_dmg,
+                "gate_integrity": state["gate_integrity"],
+            })
+
+        else:  # defenders
+            raw_dmg = sum(random.randint(1, art_data["pers_s"])
+                          for _ in range(art_data["pers_d"]))
+            # Personnel damage: 1 casualty per 5 points in the impact zone
+            casualties = max(0, raw_dmg // 5)
+            # Hits the defender side
+            target_side = state["defender"] if state["role"] == "attacker" else state["attacker"]
+            target_side["count"]      = max(0, target_side["count"]      - casualties)
+            target_side["casualties"] = target_side.get("casualties", 0) + casualties
+            total_pers_damage += casualties
+            shot_results.append({
+                "volley": v + 1, "roll": roll, "hit": True,
+                "target": "defenders", "raw_damage": raw_dmg,
+                "casualties": casualties,
+            })
+
+    # Update engine stats
+    engine["shots_fired_total"] = engine.get("shots_fired_total", 0) + volleys
+    engine["hits_total"]        = engine.get("hits_total",        0) + sum(
+        1 for s in shot_results if s.get("hit")
+    )
+
+    # Check for new breaches
+    events_added = []
+    if state["wall_integrity"] < 30 and "wall" not in state["breach_points"]:
+        state["breach_points"].append("wall")
+        events_added.append("BREACH! Wall integrity below 30% — assault is now possible.")
+    if state["gate_integrity"] < 20 and "gate" not in state["breach_points"]:
+        state["breach_points"].append("gate")
+        events_added.append("GATE BREACH! Gates destroyed.")
+
+    state["_fact_id"] = fact_id
+    _set_siege_state(state)
+
+    stone_caster_note = ""
+    if engine["type"] == "stone_caster":
+        stone_caster_note = (
+            "Brak, Hurn, and Tollug crew this weapon. Their ogre strength grants "
+            "+2 to hit and +1d6 bonus damage per hit."
+        )
+
+    return {
+        "engine_name":       engine["name"],
+        "engine_type":       engine.get("label", engine["type"]),
+        "engine_condition":  engine.get("condition", "operational"),
+        "target":            target,
+        "volleys_fired":     volleys,
+        "shots":             shot_results,
+        "hits":              sum(1 for s in shot_results if s.get("hit")),
+        "total_wall_damage": total_wall_damage,
+        "total_gate_damage": total_gate_damage,
+        "total_pers_casualties": total_pers_damage,
+        "wall_integrity":    state["wall_integrity"],
+        "gate_integrity":    state["gate_integrity"],
+        "breach_points":     state["breach_points"],
+        "new_events":        events_added,
+        "stone_caster_note": stone_caster_note,
+        "dm_note": (
+            "Wall integrity < 30 opens a breach; assault becomes possible. "
+            "Gate integrity < 20 destroys the gate; assault through the gate is possible. "
+            "Call assault() to storm the breach or gate."
+        ),
+    }
+
+
+def db_assault(
+    breach_point:   str  = "walls",
+    waves:          int  = 1,
+    scaling_ladders: bool = False,
+    battering_ram:  bool  = False,
+    calendar_note:  str   = "",
+) -> dict:
+    """
+    Resolve a direct assault on walls or gates.
+    breach_point: 'walls', 'gate', or 'breach'.
+    waves: number of assault waves (1-3). Each wave costs casualties.
+    scaling_ladders: attackers use ladders (higher attacker casualties, no breach needed).
+    battering_ram: targeting the gate specifically.
+    """
+    state = _get_siege_state()
+    if not state:
+        return {"error": "No active siege. Call start_siege() first."}
+
+    fact_id  = state.pop("_fact_id", None)
+    attacker = state["attacker"]
+    defender = state["defender"]
+
+    # Validate assault preconditions
+    has_breach = bool(state["breach_points"])
+    if not has_breach and not scaling_ladders and not battering_ram:
+        state["_fact_id"] = fact_id
+        _set_siege_state(state)
+        return {
+            "error": (
+                "Cannot assault — no breach point, scaling ladders, or battering ram. "
+                f"Wall integrity: {state['wall_integrity']}%; "
+                f"Gate integrity: {state['gate_integrity']}%. "
+                "Use artillery_fire() to create a breach, or specify scaling_ladders=True."
+            )
+        }
+
+    waves = max(1, min(3, waves))
+    wave_reports = []
+    assault_success = False
+
+    for w in range(waves):
+        # Base attacker casualty rate: 10% per wave
+        att_base_pct = 10.0
+        def_base_pct = 8.0
+
+        # Modifiers
+        if scaling_ladders:
+            att_base_pct += 5.0   # exposed on ladders
+        if battering_ram:
+            att_base_pct += 3.0   # concentrated defenders at gate
+            def_base_pct += 2.0   # ram crew take hits
+        if "breach" in state["breach_points"] or "wall" in state["breach_points"]:
+            att_base_pct -= 3.0   # attacker advantages at breach
+            def_base_pct += 4.0   # defenders compressed at breach point
+        if "gate" in state["breach_points"] or "mine_collapse" in state["breach_points"]:
+            att_base_pct -= 2.0
+            def_base_pct += 3.0
+        if attacker["morale"] <= 5:
+            att_base_pct += 5.0
+        if defender["morale"] <= 5:
+            def_base_pct += 5.0
+
+        # Numerical superiority: attacker > 3× defender
+        if attacker["count"] >= defender["count"] * 3:
+            def_base_pct += 5.0
+        if defender["count"] >= attacker["count"] * 2:
+            att_base_pct += 3.0
+
+        att_pct = max(2.0, att_base_pct)
+        def_pct = max(1.0, def_base_pct)
+
+        att_lost = _pct_casualties(attacker["count"], att_pct)
+        def_lost = _pct_casualties(defender["count"], def_pct)
+
+        attacker["count"]      = max(0, attacker["count"]      - att_lost)
+        attacker["casualties"] = attacker.get("casualties", 0) + att_lost
+        defender["count"]      = max(0, defender["count"]      - def_lost)
+        defender["casualties"] = defender.get("casualties", 0) + def_lost
+
+        # Morale checks after each wave
+        att_morale_roll = random.randint(2, 12)
+        def_morale_roll = random.randint(2, 12)
+        att_routes = att_morale_roll > attacker["morale"] and w == waves - 1
+        def_routes = def_morale_roll > defender["morale"]
+
+        wave_reports.append({
+            "wave":                w + 1,
+            "attacker_casualties": att_lost,
+            "defender_casualties": def_lost,
+            "attacker_remaining":  attacker["count"],
+            "defender_remaining":  defender["count"],
+            "attacker_morale_roll": att_morale_roll,
+            "defender_morale_roll": def_morale_roll,
+            "defender_routes":     def_routes,
+            "attacker_routes":     att_routes,
+        })
+
+        if def_routes:
+            assault_success = True
+            break
+        if att_routes:
+            # Assault repelled
+            state["last_assault_repelled"] = True
+            defender["morale"] = min(12, defender["morale"] + 1)  # morale boost for repelling
+            break
+
+    else:
+        # All waves complete — check if defender is below 25%
+        def_strength = defender["count"] / max(1, defender["count"] + defender["casualties"])
+        if def_strength < 0.25:
+            assault_success = True
+
+    state["last_assault_repelled"] = not assault_success
+
+    state["_fact_id"] = fact_id
+    _set_siege_state(state)
+
+    total_att_casualties = sum(w["attacker_casualties"] for w in wave_reports)
+    total_def_casualties = sum(w["defender_casualties"] for w in wave_reports)
+
+    return {
+        "assault_type":         "breach" if has_breach else ("ladders" if scaling_ladders else "ram"),
+        "breach_point":         breach_point,
+        "waves_attempted":      len(wave_reports),
+        "assault_succeeded":    assault_success,
+        "assault_repelled":     state["last_assault_repelled"],
+        "wave_reports":         wave_reports,
+        "total_attacker_casualties": total_att_casualties,
+        "total_defender_casualties": total_def_casualties,
+        "attacker_remaining":   attacker["count"],
+        "defender_remaining":   defender["count"],
+        "attacker_morale":      attacker["morale"],
+        "defender_morale":      defender["morale"],
+        "wall_integrity":       state["wall_integrity"],
+        "gate_integrity":       state["gate_integrity"],
+        "dm_note": (
+            "If assault_succeeded, call negotiate_surrender() for formal terms, "
+            "then record outcomes via update_world_fact and update_troop_count. "
+            "If assault_repelled, defender morale gets +1 bonus. "
+            "Attacker may try again next turn after rest and resupply."
+        ),
+    }
+
+
+def db_get_siege_state() -> dict:
+    """Return full current siege status. Returns error if no active siege."""
+    state = _get_siege_state()
+    if not state:
+        return {"error": "No active siege in progress. Call start_siege() to begin one."}
+
+    attacker = state["attacker"]
+    defender = state["defender"]
+
+    def _strength_pct(side: dict) -> float:
+        total = side["count"] + side.get("casualties", 0)
+        return round(side["count"] / max(1, total) * 100, 1)
+
+    return {
+        "active":              state.get("active", True),
+        "target_location":     state.get("target_location"),
+        "fortification":       state.get("fortification_label"),
+        "role":                state.get("role"),
+        "weeks_elapsed":       state.get("weeks_elapsed", 0),
+        "start_date":          state.get("start_date"),
+        "wall_integrity":      state.get("wall_integrity"),
+        "gate_integrity":      state.get("gate_integrity"),
+        "breach_points":       state.get("breach_points", []),
+        "last_assault_repelled": state.get("last_assault_repelled", False),
+        "attacker": {
+            "name":          attacker.get("name"),
+            "count":         attacker.get("count"),
+            "casualties":    attacker.get("casualties", 0),
+            "strength_pct":  _strength_pct(attacker),
+            "supply_weeks":  attacker.get("supply_weeks"),
+            "morale":        attacker.get("morale"),
+            "morale_label":  _score_label(attacker.get("morale", 7)),
+            "has_artillery": attacker.get("has_artillery", False),
+            "artillery":     attacker.get("artillery", []),
+        },
+        "defender": {
+            "name":          defender.get("name"),
+            "count":         defender.get("count"),
+            "casualties":    defender.get("casualties", 0),
+            "strength_pct":  _strength_pct(defender),
+            "supply_weeks":  defender.get("supply_weeks"),
+            "morale":        defender.get("morale"),
+            "morale_label":  _score_label(defender.get("morale", 7)),
+            "has_artillery": defender.get("has_artillery", False),
+        },
+        "recent_events":       state.get("events_log", [])[-5:],
+        "dm_note": (
+            "wall_integrity < 30 = breach point open. "
+            "gate_integrity < 20 = gate destroyed. "
+            "supply_weeks = 0 means the side is starving — morale drops weekly. "
+            "Call assault() when ready to storm."
+        ),
+    }
+
+
+def db_negotiate_surrender(
+    terms_offered:    str,
+    calendar_note:    str = "",
+) -> dict:
+    """
+    Attempt to negotiate surrender based on current siege state.
+    terms_offered: brief description of the terms being proposed.
+    Roll d20 + modifiers based on relative strength, supplies, wall integrity,
+    PC reputation, and Charisma.
+    """
+    state = _get_siege_state()
+    if not state:
+        return {"error": "No active siege. Call start_siege() first."}
+
+    fact_id  = state.pop("_fact_id", None)
+    attacker = state["attacker"]
+    defender = state["defender"]
+
+    # Build modifier
+    mod = 0
+    modifier_notes = []
+
+    # Numerical superiority
+    if attacker["count"] >= defender["count"] * 3:
+        mod += 3
+        modifier_notes.append("+3 (attacker outnumbers 3:1)")
+    elif attacker["count"] >= defender["count"] * 2:
+        mod += 2
+        modifier_notes.append("+2 (attacker outnumbers 2:1)")
+
+    # Wall condition
+    if state["wall_integrity"] < 20:
+        mod += 3
+        modifier_notes.append("+3 (wall nearly destroyed)")
+    elif state["wall_integrity"] < 50:
+        mod += 2
+        modifier_notes.append("+2 (walls badly damaged)")
+    elif state["wall_integrity"] < 75:
+        mod += 1
+        modifier_notes.append("+1 (walls damaged)")
+
+    # Gate condition
+    if state["gate_integrity"] < 30:
+        mod += 2
+        modifier_notes.append("+2 (gate destroyed or nearly so)")
+
+    # Defender supply
+    if defender["supply_weeks"] == 0:
+        mod += 4
+        modifier_notes.append("+4 (defender supplies exhausted)")
+    elif defender["supply_weeks"] <= 1:
+        mod += 2
+        modifier_notes.append("+2 (defender critically low on supplies)")
+
+    # Defender morale
+    if defender["morale"] <= 4:
+        mod += 3
+        modifier_notes.append("+3 (defender morale collapsing)")
+    elif defender["morale"] <= 6:
+        mod += 1
+        modifier_notes.append("+1 (defender morale poor)")
+    elif defender["morale"] >= 10:
+        mod -= 2
+        modifier_notes.append("-2 (defender morale strong)")
+
+    # Last assault repelled
+    if state.get("last_assault_repelled"):
+        mod -= 2
+        modifier_notes.append("-2 (last assault repelled)")
+
+    # PC Charisma
+    cha_score = _get_pc_ability("charisma")
+    cha_mod   = _ability_mod(cha_score)
+    if cha_mod != 0:
+        mod += cha_mod
+        modifier_notes.append(f"{cha_mod:+d} (Charisma {cha_score})")
+
+    raw_roll   = random.randint(1, 20)
+    final_roll = max(1, raw_roll + mod)
+
+    # Look up result
+    result_label = "refused"
+    result_desc  = "Terms refused."
+    for (min_r, label, desc) in _SURRENDER_TERMS:
+        if final_roll >= min_r:
+            result_label = label
+            result_desc  = desc
+            break
+
+    # Apply consequence to defender morale
+    if result_label in ("insulted", "betrayal"):
+        defender["morale"] = min(12, defender["morale"] + 1)
+    elif result_label in ("unconditional", "honourable"):
+        state["active"] = False
+
+    state["_fact_id"] = fact_id
+    _set_siege_state(state)
+
+    return {
+        "terms_offered":   terms_offered,
+        "d20_roll":        raw_roll,
+        "modifier":        mod,
+        "modifier_notes":  modifier_notes,
+        "final_roll":      final_roll,
+        "result":          result_label,
+        "description":     result_desc,
+        "siege_ends":      result_label in ("unconditional", "honourable"),
+        "attacker_count":  attacker["count"],
+        "defender_count":  defender["count"],
+        "wall_integrity":  state["wall_integrity"],
+        "defender_morale": defender["morale"],
+        "dm_note": (
+            "If siege_ends is True, call update_world_fact and update_troop_count "
+            "to record the outcome. Record NPC fate via update_npc. "
+            "If 'betrayal', resolve as an immediate assault with defenders getting "
+            "first initiative. Narrate the outcome dramatically."
+        ),
+    }

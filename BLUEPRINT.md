@@ -78,7 +78,7 @@ greyhawk-solo/
 │   ├── ddl.sql               # DDL only — used by create_character_db() for fast DB init
 │   └── new_character_template.sql  # Manual fill-in-the-blanks PC setup
 ├── server/
-│   └── mcp_server.py         # FastMCP server; 56 tools
+│   └── mcp_server.py         # FastMCP server; 62 tools
 ├── saves/                    # git-ignored — campaign DBs live here
 │   └── .gitkeep
 ├── create_character.py       # Interactive character creation CLI
@@ -334,3 +334,4 @@ Roll 1d20; meet or beat the listed number to save.
 | Phase 5A — Travel & Weather | **Complete** | Hex-crawl travel with terrain movement rates, mount types, get_lost; daily weather by season with precipitation/wind/visibility/movement modifiers; world_facts JSON persistence (42 tools total) |
 | Phase 5B — Carousing & Downtime | **Complete** | Jeff Rients d20 carousing table (XP=GP, 20 consequences); spell research (INT+time+gold formula); rumour gathering by quality tier 1-4; religious observance with missed-penalty/bonus tracking; domain administration court rolls; extended recovery; crafting (mundane/scroll/potion/minor magic) — all log to downtime_log world_fact (49 tools total) |
 | Phase 5C — Loyalty & Aging | **Complete** | 2d6 loyalty scores (2-12) for all NPCs/troops auto-initialized from relationship notes; loyalty_check with outcome tiers; adjust_loyalty; monthly henchman_morale_event; advance_time with aging threshold detection; aging_check applies AD&D 1e ability changes at middle_age/old/venerable; get_character_age with race thresholds (56 tools total) |
+| Phase 5D — Siege Mechanics | **Complete** | start_siege, siege_turn (weekly attrition/disease/sallies), artillery_fire (THAC0-based bombardment with Brak/Hurn/Tollug stone-caster crew bonuses), assault (multi-wave with breach/ladder/ram options), get_siege_state, negotiate_surrender (d20 + modifiers, 6-tier outcomes) — final phase (62 tools total) |
