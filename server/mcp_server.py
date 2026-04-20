@@ -95,6 +95,9 @@ from engine.db import (
     _CLASS_MATRIX_PRIORITY,
     # Phase 2 — spells
     get_spell_memory, set_spell_memory, lookup_spell, get_spells_for_class,
+    # Phase 3 — dungeon
+    get_random_dungeon_encounter, roll_treasure_by_type,
+    get_dungeon_turn_count, increment_dungeon_turn,
 )
 
 # ── Server instance ────────────────────────────────────────────────────────────
@@ -2118,6 +2121,232 @@ def rest(
         else "Short rest complete. Spell slots not restored."
     )
     return result
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PHASE 3 — DUNGEON SYSTEM
+# Random encounters · Wandering monster checks · Treasure generation
+# ══════════════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def check_wandering_monster(
+    dungeon_level: Annotated[
+        int,
+        "Current dungeon level (1–16+). Determines which monster level tables "
+        "are used if an encounter is triggered.",
+    ] = 1,
+    chance_in_6: Annotated[
+        int,
+        "Number of faces on a d6 that trigger an encounter. AD&D default is 1 "
+        "(1-in-6 chance per dungeon turn). Use 2 for noisy areas.",
+    ] = 1,
+) -> dict:
+    """
+    Roll a wandering monster check for one dungeon turn (10 minutes).
+
+    Rolls 1d6. If the result is ≤ chance_in_6 an encounter is triggered and a
+    full random encounter is rolled immediately (same as calling random_encounter).
+    Otherwise returns {"encounter": false}.
+
+    Also increments the persistent dungeon turn counter (world_facts category
+    'dungeon_turns') so the DM can track time and light-source duration.
+
+    Call this once per dungeon turn spent moving, searching, or doing anything
+    that takes roughly 10 minutes. Do NOT call it during combat rounds.
+    """
+    d6        = random.randint(1, 6)
+    turn_count = increment_dungeon_turn()
+    triggered  = d6 <= chance_in_6
+
+    result: dict = {
+        "encounter":    triggered,
+        "d6_roll":      d6,
+        "chance_in_6":  chance_in_6,
+        "dungeon_turn": turn_count,
+        "dungeon_level": dungeon_level,
+    }
+
+    if triggered:
+        enc = get_random_dungeon_encounter(dungeon_level)
+        result["encounter_data"] = enc
+        result["note"] = (
+            f"Wandering monster triggered! {enc['count']}× {enc['monster_name']} "
+            f"(table {enc['monster_level_table']}, d20={enc['d20_roll']}, "
+            f"d100={enc['d100_roll']}). "
+            "Call start_combat() to begin the encounter."
+        )
+        if enc.get("notes"):
+            result["table_note"] = enc["notes"]
+    else:
+        result["note"] = (
+            f"No encounter (rolled {d6}, needed ≤ {chance_in_6}). "
+            f"Dungeon turn {turn_count} passes."
+        )
+
+    return result
+
+
+@mcp.tool()
+def random_encounter(
+    dungeon_level: Annotated[
+        int,
+        "Current dungeon level (1–16+). Level 1 draws mostly from monster "
+        "table I; deeper levels escalate to tables II–X.",
+    ] = 1,
+) -> dict:
+    """
+    Roll a random dungeon encounter for the given level.
+
+    Uses the AD&D 1e two-step random encounter system:
+      1. Roll d20 → select a monster level table (I–X) based on dungeon depth.
+      2. Roll d100 → select a specific monster from that table.
+      3. Roll number appearing.
+      4. Look up the monster's full stat block.
+
+    Returns everything needed to narrate the encounter and call start_combat().
+
+    branch_type values:
+      'monster' — standard monster; monster_stats is populated.
+      'human'   — a dungeon adventuring party; see table_note for details.
+      'subtable' — special result requiring a sub-roll; see table_note.
+
+    For 'human' and 'subtable' results, narrate as appropriate and optionally
+    call start_combat() with a custom enemies list.
+    """
+    enc = get_random_dungeon_encounter(dungeon_level)
+
+    result = {
+        "monster_name":          enc["monster_name"],
+        "count":                 enc["count"],
+        "number_appearing_text": enc["number_appearing_text"],
+        "dungeon_level":         enc["dungeon_level"],
+        "monster_level_table":   enc["monster_level_table"],
+        "d20_roll":              enc["d20_roll"],
+        "d100_roll":             enc["d100_roll"],
+        "branch_type":           enc["branch_type"],
+    }
+
+    if enc.get("notes"):
+        result["table_note"] = enc["notes"]
+
+    stats = enc.get("monster_stats") or {}
+    if stats:
+        result["monster_stats"] = {
+            "ac":              stats.get("armor_class"),
+            "hd":              stats.get("hit_dice"),
+            "move":            stats.get("move"),
+            "damage":          stats.get("damage"),
+            "number_attacks":  stats.get("number_of_attacks"),
+            "special_attacks": stats.get("special_attacks"),
+            "special_defenses": stats.get("special_defenses"),
+            "treasure_type":   stats.get("treasure_type"),
+            "alignment":       stats.get("alignment"),
+            "intelligence":    stats.get("intelligence"),
+            "size":            stats.get("size"),
+        }
+        result["treasure_type"] = stats.get("treasure_type", "")
+
+    result["next_steps"] = (
+        f"Encounter: {enc['count']}× {enc['monster_name']}. "
+        "Describe the encounter, check for surprise (d6 each side, 1-2 = surprised), "
+        "then call start_combat() with the monster name and count. "
+        "After combat, call generate_treasure() with the monster's treasure_type."
+    )
+
+    return result
+
+
+@mcp.tool()
+def generate_treasure(
+    treasure_type: Annotated[
+        str,
+        "Treasure type letter A–Z (e.g. 'A', 'C', 'F'). Found in the monster's "
+        "stat block or on the AD&D 1e monster listing. Case-insensitive.",
+    ],
+    context: Annotated[
+        str,
+        "Optional description of where the treasure is found, e.g. "
+        "'goblin lair chest', 'orc chieftain body'. Stored in the return for "
+        "narrative reference only — does not affect rolls.",
+    ] = "",
+) -> dict:
+    """
+    Roll a complete AD&D 1e treasure haul for the given treasure type (A–Z).
+
+    Each component (coins, gems, jewelry, magic items) is rolled independently
+    with its published chance percentage. The treasure_types table is the
+    authoritative source — roll results are fully random per AD&D 1e rules.
+
+    Coin amounts are in the actual denomination (not thousands):
+      cp/sp/ep/gp = qty × 1,000   (copper/silver/electrum/gold thousands)
+      pp          = qty × 100     (platinum hundreds)
+
+    Gems and jewelry pieces are individually typed and valued from their
+    respective subtables (gem_base_value, jewelry_base_value).
+
+    Magic items are rolled on the category determination table first, then on
+    the appropriate subtable (potions, scrolls, rings, swords, armor, etc.).
+
+    total_gp_value is the approximate GP equivalent of the entire haul.
+
+    After reviewing the results, use add_item() to add notable items to
+    inventory and update_treasury() for coins.
+    """
+    hoard = roll_treasure_by_type(treasure_type)
+
+    if "error" in hoard:
+        return hoard
+
+    # Build a human-readable summary
+    lines: list[str] = []
+
+    coins = hoard.get("coins", {})
+    if coins:
+        coin_parts = []
+        for coin_type, amount in coins.items():
+            coin_parts.append(f"{amount:,} {coin_type.upper()}")
+        lines.append("Coins: " + ", ".join(coin_parts))
+    else:
+        lines.append("Coins: none")
+
+    gems = hoard.get("gems", [])
+    if gems:
+        gem_summary: dict[str, int] = {}
+        for g in gems:
+            gem_summary[g["type"]] = gem_summary.get(g["type"], 0) + 1
+        gem_str = ", ".join(f"{cnt}× {typ}" for typ, cnt in gem_summary.items())
+        total_gem_gp = sum(g["gp_value"] for g in gems)
+        lines.append(f"Gems ({len(gems)}): {gem_str} — {total_gem_gp:,} gp total")
+    else:
+        lines.append("Gems: none")
+
+    jewelry = hoard.get("jewelry", [])
+    if jewelry:
+        total_jewelry_gp = sum(j["gp_value"] for j in jewelry)
+        j_str = ", ".join(f"{j['type']} ({j['gp_value']:,} gp)" for j in jewelry)
+        lines.append(f"Jewelry ({len(jewelry)}): {j_str} — {total_jewelry_gp:,} gp total")
+    else:
+        lines.append("Jewelry: none")
+
+    magic_items = hoard.get("magic_items", [])
+    if magic_items:
+        mi_str = ", ".join(item["name"] for item in magic_items)
+        lines.append(f"Magic items ({len(magic_items)}): {mi_str}")
+    else:
+        lines.append("Magic items: none")
+
+    hoard["summary"] = " | ".join(lines)
+    hoard["total_gp_value_formatted"] = f"{hoard['total_gp_value']:,.0f} gp"
+
+    if context:
+        hoard["context"] = context
+
+    hoard["next_steps"] = (
+        "Use add_item() to record notable items (magic, gems, jewelry) in inventory. "
+        "Use update_treasury() to add coins to the party treasury."
+    )
+
+    return hoard
 
 
 # ══════════════════════════════════════════════════════════════════════════════

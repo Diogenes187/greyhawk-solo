@@ -188,7 +188,7 @@ rolls, then call `create_character` to commit the final choices to a new databas
 
 ## MCP Tools
 
-Claude has access to 27 tools automatically:
+Claude has access to 30 tools automatically:
 
 ### Session
 | Tool | What it does |
@@ -235,6 +235,13 @@ Claude has access to 27 tools automatically:
 | `memorize_spells` | Set the memorized spell list for the day (after a long rest) |
 | `cast_spell` | Expend a memorized slot and return full spell description + mechanical reminders |
 | `rest` | Long rest (8h): restore all spell slots, recover 1 HP/level, advance calendar. Short rest (1h): advance time only |
+
+### Dungeon
+| Tool | What it does |
+|---|---|
+| `check_wandering_monster` | Roll 1-in-6 wandering monster check for one dungeon turn (10 min); triggers a full random encounter if it hits; increments the persistent turn counter |
+| `random_encounter` | Roll a random encounter for the given dungeon level using the AD&D 1e two-step system (d20 → monster level table, d100 → monster); returns full stat block |
+| `generate_treasure` | Roll a complete treasure haul for a type A–Z: each coin denomination, gems (individually typed), jewelry (individually valued), and magic items from their subtables |
 
 ### Character Setup
 | Tool | What it does |
@@ -296,7 +303,7 @@ greyhawk-solo/
 │   ├── ddl.sql               # DDL only — used internally for fast new-DB creation
 │   └── new_character_template.sql  # Manual fill-in-the-blanks alternative
 ├── server/
-│   └── mcp_server.py         # FastMCP server; 27 tools; connects to Claude Desktop
+│   └── mcp_server.py         # FastMCP server; 30 tools; connects to Claude Desktop
 ├── saves/                    # Your campaign DB goes here (git-ignored)
 │   └── .gitkeep
 ├── create_character.py       # Interactive character creation CLI
@@ -342,7 +349,7 @@ echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":
 {"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' | python server/mcp_server.py
 ```
 
-You should see 27 tools listed in the response.
+You should see 30 tools listed in the response.
 
 ---
 

@@ -78,7 +78,7 @@ greyhawk-solo/
 │   ├── ddl.sql               # DDL only — used by create_character_db() for fast DB init
 │   └── new_character_template.sql  # Manual fill-in-the-blanks PC setup
 ├── server/
-│   └── mcp_server.py         # FastMCP server; 27 tools
+│   └── mcp_server.py         # FastMCP server; 30 tools
 ├── saves/                    # git-ignored — campaign DBs live here
 │   └── .gitkeep
 ├── create_character.py       # Interactive character creation CLI
@@ -293,6 +293,6 @@ Roll 1d20; meet or beat the listed number to save.
 | Phase | Status | Scope |
 |---|---|---|
 | Phase 1 — Core Loop | **Complete** | Character engine, DB layer, 19 MCP tools, interactive CLI |
-| Phase 2 — Combat & Spells | **Complete** | Combat tracker, initiative, THAC0 attack matrix, morale, XP; spell memorization, casting, long/short rest (27 tools total) |
-| Phase 3 — Dungeon | Planned | Random encounter tables, wandering monsters, loot generation |
+| Phase 2 — Combat & Spells | **Complete** | Combat tracker, initiative, THAC0 attack matrix, morale, XP; spell memorization, casting, long/short rest |
+| Phase 3 — Dungeon | **Complete** | Random encounter tables (d20→table, d100→monster), wandering monster check with turn counter, full treasure generation A–Z (30 tools total) |
 | Phase 4 — Domain | Planned | Seasonal turns, income, construction, army management |

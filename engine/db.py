@@ -1540,3 +1540,441 @@ def get_spells_for_class(
                 (class_name,),
             )
         return [dict(r) for r in cur.fetchall()]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PHASE 3 — DUNGEON SYSTEM
+# Random encounters · Wandering monster checks · Treasure generation
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _roll_number_appearing(text: str) -> int:
+    """Parse and roll a number-appearing string: '1-4', '6-18', '1', etc."""
+    text = text.strip()
+    m = re.match(r"^(\d+)-(\d+)$", text)
+    if m:
+        return random.randint(int(m.group(1)), int(m.group(2)))
+    try:
+        return max(1, int(float(text)))
+    except ValueError:
+        return 1
+
+
+# Base GP values keyed by gem_base_value item_name
+_GEM_BASE_GP: dict[str, int] = {
+    "Ornamental Stones":       10,
+    "Semi-precious Stones":    50,
+    "Fancy Stones":           100,
+    "Fancy Stones (Precious)": 500,
+    "Gem Stones":            1000,
+    "Gem Stones (Jewels)":   5000,
+}
+
+# GP value ranges for jewelry types (lo, hi)
+_JEWELRY_RANGES: dict[str, tuple[int, int]] = {
+    "Ivory or wrought silver":         (100,  1000),
+    "Wrought silver and gold":         (200,  1200),
+    "Wrought gold":                    (300,  1800),
+    "Jade, coral or wrought platinum": (500,  3000),
+    "Silver with gems":               (1000,  6000),
+    "Gold with gems":                 (2000,  8000),
+    "Platinum with gems":             (2000, 12000),
+}
+
+# Maps magic_item_category_determination item_name → subtable name
+_MAGIC_CATEGORY_SUBTABLE: dict[str, str] = {
+    "Potions (A.)":               "potions_01_65",
+    "Scrolls (B.)":               "scrolls_01_85",
+    "Rings (C.)":                 "rings_01_00",
+    "Rods, Staves & Wands (D.)":  "rods_staves_wands_01_00",
+    "Miscellaneous Magic (E.1.)": "misc_magic_e1_01_00",
+    "Miscellaneous Magic (E.2.)": "misc_magic_e2_01_00",
+    "Miscellaneous Magic (E.3.)": "misc_magic_e3_01_00",
+    "Miscellaneous Magic (E.4.)": "misc_magic_e4_01_00",
+    "Miscellaneous Magic (E.5.)": "misc_magic_e5_01_00",
+    "Armor & Shields (F.)":       "armor_shield_01_00",
+    "Swords (G.)":                "swords_01_95",
+    "Miscellaneous Weapons (H.)": "misc_weapons_01_00",
+}
+
+
+def _roll_one_gem() -> dict:
+    """Roll one gem on the gem_base_value table. Returns {type, gp_value, roll}."""
+    with _get_conn(read_only=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT roll_low, roll_high, item_name, gp_value_text "
+            "FROM adnd_1e_gems_jewelry WHERE subtable_name='gem_base_value' "
+            "ORDER BY roll_low"
+        )
+        table = cur.fetchall()
+
+    roll     = random.randint(1, 100)
+    gem_type = "Ornamental Stones"
+    gp_text  = "10 g.p. each"
+    for row in table:
+        if row["roll_low"] <= roll <= row["roll_high"]:
+            gem_type = row["item_name"]
+            gp_text  = row["gp_value_text"] or ""
+            break
+
+    # Parse "1,000 g.p. each" → 1000
+    gp_m   = re.search(r"([\d,]+)\s*g\.?p\.", gp_text.replace(",", ""))
+    gp_val = int(gp_m.group(1)) if gp_m else _GEM_BASE_GP.get(gem_type, 10)
+    return {"type": gem_type, "gp_value": gp_val, "roll": roll}
+
+
+def _roll_one_jewelry() -> dict:
+    """Roll one jewelry piece on the jewelry_base_value table."""
+    with _get_conn(read_only=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT roll_low, roll_high, item_name, gp_value_text "
+            "FROM adnd_1e_gems_jewelry WHERE subtable_name='jewelry_base_value' "
+            "ORDER BY roll_low"
+        )
+        table = cur.fetchall()
+
+    roll      = random.randint(1, 100)
+    item_name = "Ivory or wrought silver"
+    gp_text   = "100-1,000 g.p."
+    for row in table:
+        if row["roll_low"] <= roll <= row["roll_high"]:
+            item_name = row["item_name"]
+            gp_text   = row["gp_value_text"] or ""
+            break
+
+    # Parse range "100-1,000 g.p." or flat "500 g.p."
+    rng_m = re.search(r"([\d,]+)-([\d,]+)", gp_text.replace(",", ""))
+    if rng_m:
+        gp_val = random.randint(int(rng_m.group(1)), int(rng_m.group(2)))
+    else:
+        flat_m     = re.search(r"([\d,]+)\s*g\.?p\.", gp_text.replace(",", ""))
+        lo, hi     = _JEWELRY_RANGES.get(item_name, (100, 1000))
+        gp_val     = int(flat_m.group(1)) if flat_m else random.randint(lo, hi)
+
+    return {"type": item_name, "gp_value": gp_val, "roll": roll}
+
+
+def _roll_one_magic_item(category_roll: int | None = None) -> dict:
+    """
+    Roll one magic item.
+    1) Roll on magic_item_category_determination (d100).
+    2) Roll on the corresponding subtable (d100).
+    """
+    with _get_conn(read_only=True) as conn:
+        cur = conn.cursor()
+
+        if category_roll is None:
+            category_roll = random.randint(1, 100)
+
+        cur.execute(
+            "SELECT item_name FROM adnd_1e_magic_item_subtables "
+            "WHERE subtable_name='magic_item_category_determination' "
+            "AND roll_low <= ? AND roll_high >= ? LIMIT 1",
+            (category_roll, category_roll),
+        )
+        cat_row  = cur.fetchone()
+        category = cat_row["item_name"] if cat_row else "Potions (A.)"
+
+        subtable  = _MAGIC_CATEGORY_SUBTABLE.get(category, "potions_01_65")
+        item_roll = random.randint(1, 100)
+        cur.execute(
+            "SELECT item_name, xp_value_text, gp_value_text, charges_text "
+            "FROM adnd_1e_magic_item_subtables "
+            "WHERE subtable_name = ? AND roll_low <= ? AND roll_high >= ? LIMIT 1",
+            (subtable, item_roll, item_roll),
+        )
+        item_row = cur.fetchone()
+
+    item_name = (item_row["item_name"] if item_row else "Potion of Healing")
+    gp_text   = ((item_row["gp_value_text"] or "") if item_row else "")
+    xp_text   = ((item_row["xp_value_text"] or "") if item_row else "")
+
+    gp_m   = re.search(r"([\d,]+)", gp_text.replace(",", ""))
+    gp_val = int(gp_m.group(1)) if gp_m else 0
+
+    return {
+        "name":          item_name,
+        "category":      category,
+        "gp_value":      gp_val,
+        "xp_value":      xp_text,
+        "category_roll": category_roll,
+        "item_roll":     item_roll,
+    }
+
+
+def _parse_maps_or_magic(text: str) -> list[dict]:
+    """
+    Parse and roll a treasure type's maps_or_magic field.
+
+    Recognized patterns (with % chance check):
+      "Any 3: 30%"                → 3 random magic items
+      "Any 2 plus 1 potion: 15%" → 2 random + 1 potion
+      "Any 3 plus 1 scroll: 25%" → 3 random + 1 scroll
+      "Sword, armor, or misc. weapon: 10%" → 1 weapon/armor/sword item
+    """
+    text = text.strip()
+    if not text or text.lower() == "nil":
+        return []
+
+    chance_m = re.search(r":?\s*(\d+)%", text)
+    if not chance_m:
+        return []
+    chance = int(chance_m.group(1))
+    if random.randint(1, 100) > chance:
+        return []
+
+    items: list[dict] = []
+
+    any_m = re.search(r"Any\s+(\d+)", text, re.IGNORECASE)
+    if any_m:
+        count = int(any_m.group(1))
+        for _ in range(count):
+            items.append(_roll_one_magic_item())
+        # "plus 1 potion" / "plus 1 scroll"
+        if re.search(r"\bpotion\b", text, re.IGNORECASE):
+            items.append(_roll_one_magic_item(random.randint(1, 20)))
+        elif re.search(r"\bscroll\b", text, re.IGNORECASE):
+            items.append(_roll_one_magic_item(random.randint(21, 35)))
+    elif re.search(r"\b(sword|armor|weapon)\b", text, re.IGNORECASE):
+        cat_roll = random.choice([
+            random.randint(61, 75),   # Armor & Shields
+            random.randint(76, 86),   # Swords
+            random.randint(87, 100),  # Misc Weapons
+        ])
+        items.append(_roll_one_magic_item(cat_roll))
+    else:
+        items.append(_roll_one_magic_item())
+
+    return items
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def get_random_dungeon_encounter(dungeon_level: int) -> dict:
+    """
+    Roll a random dungeon encounter for the given dungeon level.
+
+    1. Roll d20 → look up monster_level_table from dungeon_random_monster_level_matrix.
+    2. Roll d100 → look up result_name + number_appearing from
+       dungeon_random_monster_table_entries.
+    3. Roll number_appearing.
+    4. Look up monster stats via lookup_monster().
+
+    Returns a full dict ready for start_combat or narrative use.
+    """
+    with _get_conn(read_only=True) as conn:
+        cur = conn.cursor()
+
+        d20 = random.randint(1, 20)
+        cur.execute(
+            "SELECT monster_level_table FROM dungeon_random_monster_level_matrix "
+            "WHERE dungeon_level_min <= ? "
+            "  AND (dungeon_level_max IS NULL OR dungeon_level_max >= ?) "
+            "  AND roll_min <= ? AND roll_max >= ? LIMIT 1",
+            (dungeon_level, dungeon_level, d20, d20),
+        )
+        matrix_row = cur.fetchone()
+
+        if not matrix_row:
+            # Fall back to the highest defined level band
+            cur.execute(
+                "SELECT monster_level_table FROM dungeon_random_monster_level_matrix "
+                "WHERE dungeon_level_min <= ? "
+                "ORDER BY dungeon_level_min DESC LIMIT 1",
+                (dungeon_level,),
+            )
+            matrix_row = cur.fetchone()
+
+        table_code = (matrix_row["monster_level_table"] if matrix_row else "I")
+
+        d100 = random.randint(1, 100)
+        cur.execute(
+            "SELECT result_name, number_appearing_text, branch_type, notes "
+            "FROM dungeon_random_monster_table_entries "
+            "WHERE monster_level_table = ? AND roll_min <= ? AND roll_max >= ? LIMIT 1",
+            (table_code, d100, d100),
+        )
+        entry = cur.fetchone()
+
+    if not entry:
+        return {
+            "monster_name":          "Skeleton",
+            "count":                 1,
+            "monster_level_table":   table_code,
+            "d20_roll":              d20,
+            "d100_roll":             d100,
+            "branch_type":           "monster",
+            "number_appearing_text": "1",
+            "notes":                 "Fallback — no table entry matched.",
+            "monster_stats":         {},
+        }
+
+    result_name        = entry["result_name"]
+    branch_type        = entry["branch_type"] or "monster"
+    notes              = entry["notes"] or ""
+    num_appearing_text = entry["number_appearing_text"] or "1"
+
+    # Roll count (human/subtable branches don't have a simple die range)
+    if branch_type in ("human", "subtable") or "see" in num_appearing_text.lower():
+        count = 1
+    else:
+        count = _roll_number_appearing(num_appearing_text)
+
+    monster_stats = lookup_monster(result_name) if branch_type == "monster" else {}
+
+    return {
+        "monster_name":          result_name,
+        "count":                 count,
+        "monster_level_table":   table_code,
+        "dungeon_level":         dungeon_level,
+        "d20_roll":              d20,
+        "d100_roll":             d100,
+        "branch_type":           branch_type,
+        "number_appearing_text": num_appearing_text,
+        "notes":                 notes,
+        "monster_stats":         monster_stats,
+    }
+
+
+def roll_treasure_by_type(treasure_type: str) -> dict:
+    """
+    Roll a complete AD&D 1e treasure haul for the given treasure type letter (A–Z).
+
+    Each component is checked independently:
+      - Coins  (cp/sp/ep/gp/pp): chance% roll, then qty × multiplier
+      - Gems   : chance% roll, then count gems typed from gem_base_value
+      - Jewelry: chance% roll, then count pieces valued from jewelry_base_value
+      - Magic  : maps_or_magic text parsed for chance, item count, and category
+
+    Returns itemised results plus total_gp_value (rough GP equivalent of all loot).
+    """
+    treasure_type = treasure_type.upper().strip()
+
+    with _get_conn(read_only=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT * FROM treasure_types WHERE treasure_type = ? LIMIT 1",
+            (treasure_type,),
+        )
+        row = cur.fetchone()
+
+    if not row:
+        return {"error": f"Unknown treasure type '{treasure_type}'. Valid: A–Z (not all types exist)."}
+
+    result: dict = {
+        "treasure_type":  treasure_type,
+        "coins":          {},
+        "gems":           [],
+        "jewelry":        [],
+        "magic_items":    [],
+        "total_gp_value": 0.0,
+        "rolls":          {},
+    }
+    total_gp = 0.0
+
+    gp_rate = {"cp": 0.01, "sp": 0.1, "ep": 0.5, "gp": 1.0, "pp": 5.0}
+
+    # ── Coins ──────────────────────────────────────────────────────────────────
+    coin_fields: list[tuple[str, int, str]] = [
+        ("copper_1000s",   1000, "cp"),
+        ("silver_1000s",   1000, "sp"),
+        ("electrum_1000s", 1000, "ep"),
+        ("gold_1000s",     1000, "gp"),
+        ("platinum_100s",   100, "pp"),
+    ]
+    for field_name, multiplier, coin_type in coin_fields:
+        field_text = (row[field_name] or "").strip()
+        if not field_text or field_text.lower() == "nil":
+            continue
+        m = re.match(r"^(\d+-\d+|\d+):(\d+)%", field_text)
+        if not m:
+            continue
+        chance      = int(m.group(2))
+        chance_roll = random.randint(1, 100)
+        result["rolls"][f"{coin_type}_chance"] = chance_roll
+        if chance_roll > chance:
+            continue
+        qty         = _roll_number_appearing(m.group(1))
+        result["rolls"][f"{coin_type}_qty"] = qty
+        total_coins = qty * multiplier
+        result["coins"][coin_type] = total_coins
+        total_gp   += total_coins * gp_rate[coin_type]
+
+    # ── Gems ───────────────────────────────────────────────────────────────────
+    gems_text = (row["gems"] or "").strip()
+    if gems_text and gems_text.lower() != "nil":
+        m = re.match(r"^(\d+-\d+|\d+):(\d+)%", gems_text)
+        if m:
+            chance      = int(m.group(2))
+            chance_roll = random.randint(1, 100)
+            result["rolls"]["gems_chance"] = chance_roll
+            if chance_roll <= chance:
+                count = _roll_number_appearing(m.group(1))
+                result["rolls"]["gems_count"] = count
+                gems    = [_roll_one_gem() for _ in range(count)]
+                result["gems"] = gems
+                total_gp += sum(g["gp_value"] for g in gems)
+
+    # ── Jewelry ────────────────────────────────────────────────────────────────
+    jewelry_text = (row["jewelry"] or "").strip()
+    if jewelry_text and jewelry_text.lower() != "nil":
+        m = re.match(r"^(\d+-\d+|\d+):(\d+)%", jewelry_text)
+        if m:
+            chance      = int(m.group(2))
+            chance_roll = random.randint(1, 100)
+            result["rolls"]["jewelry_chance"] = chance_roll
+            if chance_roll <= chance:
+                count = _roll_number_appearing(m.group(1))
+                result["rolls"]["jewelry_count"] = count
+                jewelry  = [_roll_one_jewelry() for _ in range(count)]
+                result["jewelry"] = jewelry
+                total_gp += sum(j["gp_value"] for j in jewelry)
+
+    # ── Maps / Magic ───────────────────────────────────────────────────────────
+    maps_text = (row["maps_or_magic"] or "").strip()
+    if maps_text and maps_text.lower() != "nil":
+        magic_items = _parse_maps_or_magic(maps_text)
+        result["magic_items"] = magic_items
+        total_gp   += sum(item.get("gp_value", 0) for item in magic_items)
+
+    result["total_gp_value"] = round(total_gp, 2)
+    return result
+
+
+def get_dungeon_turn_count() -> int:
+    """Return the current dungeon turn counter stored in world_facts."""
+    with _get_conn(read_only=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT fact_text FROM world_facts "
+            "WHERE campaign_id = ? AND category = 'dungeon_turns' LIMIT 1",
+            (_CAMPAIGN_ID,),
+        )
+        row = cur.fetchone()
+    try:
+        return int(row["fact_text"]) if row else 0
+    except (ValueError, TypeError):
+        return 0
+
+
+def increment_dungeon_turn() -> int:
+    """Increment and persist the dungeon turn counter. Returns new count."""
+    count = get_dungeon_turn_count() + 1
+    with _get_conn() as conn:
+        conn.execute(
+            "DELETE FROM world_facts WHERE campaign_id = ? AND category = 'dungeon_turns'",
+            (_CAMPAIGN_ID,),
+        )
+        conn.execute(
+            "INSERT INTO world_facts (campaign_id, category, fact_text, source_note) "
+            "VALUES (?, 'dungeon_turns', ?, 'dungeon_system')",
+            (_CAMPAIGN_ID, str(count)),
+        )
+    return count
