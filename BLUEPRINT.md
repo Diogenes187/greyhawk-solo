@@ -78,7 +78,7 @@ greyhawk-solo/
 │   ├── ddl.sql               # DDL only — used by create_character_db() for fast DB init
 │   └── new_character_template.sql  # Manual fill-in-the-blanks PC setup
 ├── server/
-│   └── mcp_server.py         # FastMCP server; 49 tools
+│   └── mcp_server.py         # FastMCP server; 56 tools
 ├── saves/                    # git-ignored — campaign DBs live here
 │   └── .gitkeep
 ├── create_character.py       # Interactive character creation CLI
@@ -193,6 +193,18 @@ greyhawk-solo/
 | `domain_administration` | Hold court 1-14 days; d20 + Cha mod + duration bonus → outcome tier affects NPC loyalty and troop morale |
 | `recovery` | Extended bed rest: 2 HP × level per week; 7d = minor ailments cleared; 30d = all ailments (status_notes) reset |
 | `craft_item` | Craft mundane/masterwork/scroll/potion/minor_magic; success = base% + INT×3% + extra periods×5%; item added to inventory on success |
+
+### Loyalty & Aging tools
+
+| Tool | Description |
+|---|---|
+| `get_loyalty_state` | All NPC/troop loyalty scores (2-12); auto-initializes from relationships + troops tables on first call; flags at_risk entries (score ≤ 5) |
+| `loyalty_check` | Roll 2d6 vs score for one entity; situational modifier ±3; outcome tiers from strong_pass to desertion_risk; score drops on serious fail |
+| `adjust_loyalty` | Direct ±N adjustment with logged reason; call after gifts, promotions, betrayals, deaths of comrades |
+| `henchman_morale_event` | Monthly 2d6 roll for all NPCs; global modifier captures realm mood; results: increased_devotion / steady / grumbling / demands / troubled / crisis |
+| `advance_time` | Advance calendar N days; detect aging threshold crossings; flag overdue religious observances |
+| `aging_check` | Apply AD&D 1e ability changes at middle_age/old/venerable threshold; permanently modifies character_abilities |
+| `get_character_age` | Current age, race thresholds, aging stage, years to next check |
 
 ### Character setup
 
@@ -321,3 +333,4 @@ Roll 1d20; meet or beat the listed number to save.
 | Phase 4 — Domain | **Complete** | Seasonal turns, per-holding income rolls, troop upkeep, construction queue with automatic week-tracking, d20 realm events table (36 tools total) |
 | Phase 5A — Travel & Weather | **Complete** | Hex-crawl travel with terrain movement rates, mount types, get_lost; daily weather by season with precipitation/wind/visibility/movement modifiers; world_facts JSON persistence (42 tools total) |
 | Phase 5B — Carousing & Downtime | **Complete** | Jeff Rients d20 carousing table (XP=GP, 20 consequences); spell research (INT+time+gold formula); rumour gathering by quality tier 1-4; religious observance with missed-penalty/bonus tracking; domain administration court rolls; extended recovery; crafting (mundane/scroll/potion/minor magic) — all log to downtime_log world_fact (49 tools total) |
+| Phase 5C — Loyalty & Aging | **Complete** | 2d6 loyalty scores (2-12) for all NPCs/troops auto-initialized from relationship notes; loyalty_check with outcome tiers; adjust_loyalty; monthly henchman_morale_event; advance_time with aging threshold detection; aging_check applies AD&D 1e ability changes at middle_age/old/venerable; get_character_age with race thresholds (56 tools total) |

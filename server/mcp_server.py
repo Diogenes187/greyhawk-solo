@@ -73,6 +73,15 @@ Tools exposed:
   recovery                -- Extended bed rest for serious injuries; enhanced HP + ailment clearing
   craft_item              -- Spend time and materials to produce mundane or minor magic items
 
+  LOYALTY & AGING
+  get_loyalty_state       -- All NPC/troop loyalty scores; auto-initializes from DB on first call
+  loyalty_check           -- 2d6 vs loyalty score for a specific entity; returns outcome tier
+  adjust_loyalty          -- Modify score ±N for gifts, betrayals, promotions, deaths
+  henchman_morale_event   -- Monthly 2d6 morale roll for every named NPC henchman
+  advance_time            -- Advance calendar N days; check aging thresholds; flag overdue observances
+  aging_check             -- Apply ability score changes at middle_age/old/venerable threshold
+  get_character_age       -- Current age, race thresholds, years to next aging check
+
 Architecture:
   - FastMCP (mcp 1.27.0) runs over stdio; Claude Desktop connects as a client.
   - All DB access goes through engine/db.py — this file contains zero SQL.
@@ -140,6 +149,14 @@ from engine.db import (
     db_domain_administration,
     db_recovery,
     db_craft_item,
+    # Phase 5C — loyalty & aging
+    db_get_loyalty_state,
+    db_loyalty_check,
+    db_adjust_loyalty,
+    db_henchman_morale_event,
+    db_advance_time,
+    db_aging_check,
+    db_get_character_age,
     # Phase 4 — domain
     get_full_domain_state,
     db_add_construction_project,
@@ -3460,6 +3477,302 @@ def craft_item(
         days=days,
         calendar_note=calendar_note,
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PHASE 5C — LOYALTY & AGING SYSTEM
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@mcp.tool()
+def get_loyalty_state() -> dict:
+    """
+    Return loyalty scores for every named NPC and troop group in the realm.
+
+    On first call, the system auto-initializes loyalty scores from the existing
+    relationships and troops tables — no manual setup required. Ruk, Pell,
+    Red Eye, Elowen, Gisir, and all other named henchmen are initialized from
+    their relationship notes.
+
+    Loyalty score scale (2-12, matching a 2d6 roll):
+    - 12: Unshakeable — cannot be bought, intimidated, or broken
+    - 10-11: Devoted — will follow into mortal danger without question
+    - 8-9: Steadfast — reliable under pressure; holds firm in adversity
+    - 6-7: Reliable — performs duties faithfully; wavering only under extreme duress
+    - 4-5: Wavering — conditional on success, pay, and good treatment
+    - 2-3: At risk — actively looking for a way out or a better offer
+
+    Theron's Charisma 17 grants a +2 bonus to all initial loyalty scores.
+
+    Returns: lists of NPC and troop records, at_risk list, dm_note with
+    instructions for running loyalty checks.
+    """
+    return db_get_loyalty_state()
+
+
+@mcp.tool()
+def loyalty_check(
+    entity_name: Annotated[
+        str,
+        "Name of the NPC or troop group to check (e.g. 'Ruk', 'Pell', "
+        "'Quasquetan Goblins'). Partial name match is supported.",
+    ],
+    situation: Annotated[
+        str,
+        "Description of the triggering situation, e.g. "
+        "'ordered into a dragon's lair', 'wages two weeks late', "
+        "'comrade killed on last mission', 'asked to betray a friend'.",
+    ],
+    modifier: Annotated[
+        int,
+        "Situational modifier to the 2d6 roll (-3 to +3). "
+        "Negative: dangerous/distressing order, poor conditions, fear. "
+        "Positive: good pay, recent victory, personal respect for the PC. "
+        "Default 0.",
+    ] = 0,
+    calendar_note: Annotated[
+        str,
+        "Current in-game date for the event log.",
+    ] = "",
+) -> dict:
+    """
+    Roll a 2d6 loyalty check for a specific NPC or troop group.
+
+    Triggered by:
+    - Dangerous or morally objectionable orders
+    - Unpaid or late wages
+    - Mistreatment, public humiliation, or being put in unnecessary danger
+    - Deaths of companions or comrades
+    - Major realm setbacks (defeats, disasters)
+    - Offers from rivals or enemies
+
+    Mechanic: roll 2d6 + modifier, compare to loyalty score.
+    - roll ≤ score-2: Strong pass — complete loyalty, no hesitation
+    - roll = score-1 or score: Pass — complies, possibly with reluctance
+    - roll = score+1: Grumbling — obeys but complains; record the grievance
+    - roll = score+2 or +3: Demands — refuses without concession
+    - roll > score+3: Desertion risk — loyalty score drops by 1; immediate action needed
+    - Natural 12: Always note-worthy, even for loyal characters
+
+    Returns: dice, roll, modifier, adjusted_roll, outcome_tier, consequence,
+    score_before/after, passed flag, dm_note.
+    """
+    return db_loyalty_check(
+        entity_name=entity_name,
+        situation=situation,
+        modifier=modifier,
+        calendar_note=calendar_note,
+    )
+
+
+@mcp.tool()
+def adjust_loyalty(
+    entity_name: Annotated[
+        str,
+        "Name of the NPC or troop group whose loyalty is being adjusted.",
+    ],
+    delta: Annotated[
+        int,
+        "Amount to change the loyalty score. Positive = improve, negative = worsen. "
+        "Typical magnitudes: "
+        "+1 for a meaningful gift, public praise, or promotion; "
+        "+2 for a life-saving act or major favour; "
+        "-1 for ignoring a demand, a comrade's death, or broken promise; "
+        "-2 for betrayal of trust or public humiliation; "
+        "-3 for serious mistreatment (rare).",
+    ],
+    reason: Annotated[
+        str,
+        "Narrative reason for the adjustment, e.g. "
+        "'Rewarded with magic item after dungeon raid', "
+        "'Fellow goblin killed by trap Ruk warned about', "
+        "'Promoted to captain of eastern watch'.",
+    ],
+    calendar_note: Annotated[
+        str,
+        "Current in-game date for the event log.",
+    ] = "",
+) -> dict:
+    """
+    Directly modify a loyalty score based on events in the campaign.
+
+    Call this after:
+    - Giving a gift, bonus pay, or magic item
+    - Promoting or publicly honouring a henchman
+    - A comrade being killed (especially if preventable)
+    - A broken promise or ignored demand
+    - A major victory the henchman contributed to
+    - An act of betrayal or public humiliation
+
+    Score is capped at 2 (minimum) and 12 (maximum).
+    All adjustments are logged in the entity's adjustment_history.
+
+    Returns: entity_name, reason, score_before, delta, score_after,
+    status_before/after, at_risk flag, dm_note.
+    """
+    return db_adjust_loyalty(
+        entity_name=entity_name,
+        delta=delta,
+        reason=reason,
+        calendar_note=calendar_note,
+    )
+
+
+@mcp.tool()
+def henchman_morale_event(
+    month_label: Annotated[
+        str,
+        "Label for the month being resolved, e.g. 'Coldeven 576 CY' or "
+        "'Readying — third month of campaign'.",
+    ],
+    global_modifier: Annotated[
+        int,
+        "Modifier applied to every henchman's roll this month (-3 to +3). "
+        "Positive modifiers: recent victory (+1), wages paid on time (+1), "
+        "excellent domain administration (+1), PC present and visible (+1). "
+        "Negative modifiers: recent defeat (-1), unpaid wages (-2), "
+        "PC absent for extended period (-1), realm under threat (-1). "
+        "Stack up to the -3/+3 cap.",
+    ] = 0,
+    calendar_note: Annotated[
+        str,
+        "Current in-game date for the event log.",
+    ] = "",
+) -> dict:
+    """
+    Monthly morale roll for every named NPC henchman.
+
+    Roll 2d6 + global_modifier for each NPC. Results:
+    - 12: Increased devotion (+1 loyalty permanently) — good scene opportunity
+    - 10-11: Steady — no change, reliable as always
+    - 8-9: Mild grumbling — minor complaint worth noting
+    - 6-7: Demands — a specific raise, recognition, or concession required
+    - 4-5: Troubled — loyalty drops by 1; something is wrong, investigate
+    - 2-3: Crisis — loyalty drops by 1; loyalty_check required or desertion likely
+
+    Call this once per in-game month as part of domain administration.
+    The global_modifier captures the overall mood of the realm that month.
+
+    Returns: per-NPC roll reports with event labels, summary of who needs
+    attention (demands, at_risk, crisis), and dm_note.
+    """
+    return db_henchman_morale_event(
+        month_label=month_label,
+        global_modifier=global_modifier,
+        calendar_note=calendar_note,
+    )
+
+
+@mcp.tool()
+def advance_time(
+    days: Annotated[
+        int,
+        "Number of in-game days to advance. "
+        "Use this for travel (journey complete), downtime periods, "
+        "seasonal turns, or any significant time skip. "
+        "For very long skips (years), use multiple calls or large day counts.",
+    ],
+    calendar_note: Annotated[
+        str,
+        "New in-game date after the time advance, e.g. 'Planting 1, 576 CY'. "
+        "If provided, this replaces the calendar entry exactly. "
+        "If omitted, '+N days' is appended to the existing entry.",
+    ] = "",
+) -> dict:
+    """
+    Advance the campaign calendar and check for aging and obligation triggers.
+
+    This is the canonical time-advancement tool. Use it for:
+    - Long dungeon expeditions (days of travel)
+    - Downtime between adventures
+    - Seasonal domain turns (90 days per season)
+    - Any skip of a week or more
+
+    Side effects automatically checked:
+    1. PC aging: current age updated from days elapsed. If an age threshold
+       is crossed (middle_age / old / venerable), aging_check_needed=True
+       is returned and aging_check() should be called immediately.
+    2. Religious observances: overdue observances (missed_count >= 3)
+       are flagged in overdue_observances.
+
+    Theron Vale is an Elf (starting age ~120). His middle_age threshold is
+    350 years — aging will not affect him within a normal campaign. The
+    system is fully functional for Human NPCs, Aelric, and future characters.
+
+    Returns: days_advanced, calendar, age_before/after, aging_stage,
+    thresholds_crossed, aging_check_needed, overdue_observances, dm_note.
+    """
+    return db_advance_time(days=days, calendar_note=calendar_note)
+
+
+@mcp.tool()
+def aging_check(
+    character_id: Annotated[
+        int,
+        "character_id of the character crossing an age threshold. "
+        "The PC is always character_id=1.",
+    ],
+    threshold_stage: Annotated[
+        str,
+        "The aging threshold just crossed: "
+        "'middle_age' — Strength -1, Constitution -1, Wisdom +1; "
+        "'old' — Strength -2, Dexterity -1, Constitution -1, Wisdom +1; "
+        "'venerable' — Strength -1, Dexterity -1, Constitution -1, Wisdom +1. "
+        "These are cumulative: a character reaching venerable from young "
+        "eventually accumulates Str -4, Dex -2, Con -3, Wis +3 total.",
+    ],
+) -> dict:
+    """
+    Apply ability score changes when a character crosses an age threshold.
+
+    Called immediately after advance_time() returns aging_check_needed=True.
+    Permanently modifies the character_abilities table in the database.
+
+    Aging effects per AD&D 1e DMG:
+    - Middle age: Str -1, Con -1, Wis +1
+    - Old:        Str -2, Dex -1, Con -1, Wis +1  (in addition to middle age)
+    - Venerable:  Str -1, Dex -1, Con -1, Wis +1  (in addition to old)
+
+    Ability scores cannot drop below 3 from aging.
+    Wisdom gains make aged characters useful as advisors even as their
+    physical stats decline — classic AD&D design intent.
+
+    Returns: threshold_stage, ability_changes dict (before/after/delta per stat),
+    full abilities_before and abilities_after, dm_note.
+    """
+    return db_aging_check(
+        character_id=character_id,
+        threshold_stage=threshold_stage,
+    )
+
+
+@mcp.tool()
+def get_character_age(
+    character_id: Annotated[
+        int,
+        "character_id of the character to check. PC is always 1.",
+    ] = 1,
+) -> dict:
+    """
+    Return the character's current age, race-based thresholds, and time
+    to the next aging check.
+
+    Auto-initializes the aging record if it doesn't exist yet.
+
+    For Theron Vale (Elf, character_id=1):
+    - Starting age: ~120 years (young adult for an elf)
+    - Middle age threshold: 350 years (~230 campaign years away)
+    - Natural lifespan max: 1200-2000 years
+    - Aging will not be a mechanical concern within a normal campaign
+
+    For human NPCs, henchmen, and characters like Aelric:
+    - Middle age: 40 years; Old: 60; Venerable: 90
+    - A 30-year campaign with a 10-year-old starting character could reach middle age
+
+    Returns: current_age, race, aging_stage, thresholds dict, thresholds_passed,
+    years_to_next_check, natural_lifespan_max, ability_changes_applied, dm_note.
+    """
+    return db_get_character_age(character_id=character_id)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

@@ -188,7 +188,7 @@ rolls, then call `create_character` to commit the final choices to a new databas
 
 ## MCP Tools
 
-Claude has access to 49 tools automatically:
+Claude has access to 56 tools automatically:
 
 ### Session
 | Tool | What it does |
@@ -274,6 +274,17 @@ Claude has access to 49 tools automatically:
 | `recovery` | Extended bed rest: 2 HP × character level per week; 7 days clears minor ailments; 30 days resets all status conditions |
 | `craft_item` | Craft mundane / masterwork / scroll / potion / minor magic item; success chance scales with INT and time; item added to inventory on success |
 
+### Loyalty & Aging
+| Tool | What it does |
+|---|---|
+| `get_loyalty_state` | Returns 2-12 loyalty scores for all NPCs and troop groups; auto-initializes from relationship data on first call; flags any entities at risk |
+| `loyalty_check` | Roll 2d6 vs loyalty score for a named entity; applies situational modifier; returns outcome tier from strong_pass to desertion_risk; score drops on serious failures |
+| `adjust_loyalty` | Directly modify a loyalty score ±N with a logged reason; call after gifts, promotions, betrayals, or deaths of comrades |
+| `henchman_morale_event` | Monthly 2d6 morale roll for every named NPC; global modifier reflects realm mood; results range from increased devotion to crisis requiring immediate action |
+| `advance_time` | Advance the campaign calendar N days; checks PC aging thresholds; flags overdue religious observances; triggers aging_check if a threshold is crossed |
+| `aging_check` | Apply AD&D 1e ability score changes at middle_age / old / venerable thresholds; permanently modifies character_abilities in the DB |
+| `get_character_age` | Return current age, race thresholds (Elves: middle age at 350), aging stage, and years to the next aging check |
+
 ### Character Setup
 | Tool | What it does |
 |---|---|
@@ -334,7 +345,7 @@ greyhawk-solo/
 │   ├── ddl.sql               # DDL only — used internally for fast new-DB creation
 │   └── new_character_template.sql  # Manual fill-in-the-blanks alternative
 ├── server/
-│   └── mcp_server.py         # FastMCP server; 49 tools; connects to Claude Desktop
+│   └── mcp_server.py         # FastMCP server; 56 tools; connects to Claude Desktop
 ├── saves/                    # Your campaign DB goes here (git-ignored)
 │   └── .gitkeep
 ├── create_character.py       # Interactive character creation CLI
@@ -380,7 +391,7 @@ echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":
 {"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' | python server/mcp_server.py
 ```
 
-You should see 49 tools listed in the response.
+You should see 56 tools listed in the response.
 
 ---
 

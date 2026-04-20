@@ -4379,3 +4379,958 @@ def db_craft_item(
     }
     _log_downtime("craft_item", result)
     return result
+
+
+# ==============================================================================
+# PHASE 5C — LOYALTY & AGING SYSTEM
+# Henchman loyalty · Morale events · Campaign calendar · Character aging
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# LOYALTY CONSTANTS
+# Loyalty scores: 2-12 integer (same range as 2d6 roll)
+# 2d6 check: roll 2d6; roll <= loyalty_score → pass
+# On a natural 12, additional narrative consequence regardless of loyalty score.
+# ------------------------------------------------------------------------------
+
+_LOYALTY_LABELS: dict[int, str] = {
+    12: "unshakeable",
+    11: "devoted",
+    10: "devoted",
+    9:  "steadfast",
+    8:  "steadfast",
+    7:  "reliable",
+    6:  "reliable",
+    5:  "wavering",
+    4:  "wavering",
+    3:  "at_risk",
+    2:  "at_risk",
+}
+
+# CHA score → loyalty bonus applied to initial score (not to checks)
+_LOYALTY_CHA_INIT_BONUS: dict = {
+    # (min, max): bonus
+    (18, 18): +3,
+    (16, 17): +2,
+    (13, 15): +1,
+    (9,  12):  0,
+    (6,   8): -1,
+    (3,   5): -2,
+}
+
+# Relationship type/notes keywords → base score before CHA modifier
+_LOYALTY_RELATION_BASE: list[tuple[str, int]] = [
+    # Checked in order; first match wins
+    ("absolute",     11),
+    ("deeply loyal", 10),
+    ("fanatical",    11),
+    ("devoted",      10),
+    ("trusted",      10),
+    ("founded",      10),
+    ("ally",          9),
+    ("allied",        9),
+    ("protected",     8),
+    ("hired",         8),
+    ("staff",         8),
+    ("faculty",       8),
+    ("ward",          6),
+    ("probationary",  5),
+]
+
+# 2d6 roll outcome tiers relative to loyalty score
+# margin = roll - loyalty_score  (negative = passed with room; positive = failed)
+_LOYALTY_CHECK_TIERS: list[tuple[range, str, str]] = [
+    (range(-99, -2),  "strong_pass",     "Unwavering. No hesitation."),
+    (range(-2,   0),  "pass",            "Holds firm. Carries out the order."),
+    (range(0,    1),  "barely_pass",     "Complies, but with visible reluctance or a quiet complaint."),
+    (range(1,    2),  "grumbling",       "Grumbles openly. Obeys, but morale note should be recorded."),
+    (range(2,    4),  "demands",         "Refuses without concession: raise, acknowledgement, or explanation required."),
+    (range(4,  100),  "desertion_risk",  "Serious loyalty crisis. Will desert or act against interests if not addressed immediately."),
+]
+
+# Natural-12 rider (applies on top of normal result for loyalty 12+ only — still note-worthy)
+_LOYALTY_NAT_12_RIDER = "Even the most devoted will remember this was asked of them."
+
+# Henchman monthly morale event results (2d6 + modifier, clamped 2-12)
+_MORALE_EVENT_TABLE: list[tuple[range, str, str, int]] = [
+    # (roll_range, label, description, loyalty_delta)
+    (range(12, 13), "increased_devotion",
+     "Reflects on recent events and feels more committed than ever.",              +1),
+    (range(10, 12), "steady",
+     "No change. Performs duties with characteristic reliability.",                 0),
+    (range(8, 10),  "mild_grumbling",
+     "Minor complaint — working conditions, recognition, or a small grievance.",    0),
+    (range(6,  8),  "demands",
+     "Raises a specific demand: raise, promotion, time off, or public acknowledgement.", 0),
+    (range(4,  6),  "troubled",
+     "Visibly troubled. Something is wrong — recent events, rumours, or personal concern.", -1),
+    (range(2,  4),  "crisis",
+     "On the edge. Loyalty check required immediately or desertion becomes likely.", -1),
+]
+
+# ------------------------------------------------------------------------------
+# AGING CONSTANTS
+# Thresholds in years: (Middle Age, Old, Venerable)
+# Effects apply once when a threshold is crossed; cumulative thereafter.
+# ------------------------------------------------------------------------------
+
+_RACE_AGE_THRESHOLDS: dict[str, tuple[int, int, int]] = {
+    "Human":    (40,  60,   90),
+    "Elf":      (350, 700, 1000),
+    "Half-Elf": (62,  93,  125),
+    "Dwarf":    (150, 250, 350),
+    "Halfling": (50,  70,   90),
+    "Half-Orc": (30,  45,   60),
+    "Gnome":    (100, 150, 200),
+}
+
+# Maximum natural age range (start_max, end_max) for lifespan reference
+_RACE_MAX_AGE: dict[str, tuple[int, int]] = {
+    "Human":    (90,  120),
+    "Elf":      (1200, 2000),
+    "Half-Elf": (160, 200),
+    "Dwarf":    (400, 450),
+    "Halfling": (100, 120),
+    "Half-Orc": (65,  80),
+    "Gnome":    (250, 300),
+}
+
+# Ability changes when hitting each threshold (applied once, cumulative)
+_AGING_EFFECTS: dict[str, dict[str, int]] = {
+    "middle_age": {
+        "strength":     -1,
+        "constitution": -1,
+        "wisdom":       +1,
+    },
+    "old": {
+        "strength":     -2,
+        "dexterity":    -1,
+        "constitution": -1,
+        "wisdom":       +1,
+    },
+    "venerable": {
+        "strength":     -1,
+        "dexterity":    -1,
+        "constitution": -1,
+        "wisdom":       +1,
+    },
+}
+
+# Greyhawk calendar months for year-parsing
+_GH_MONTHS: list[str] = [
+    "Needfest",    # festival week 0
+    "Fireseek",    # 1
+    "Readying",    # 2
+    "Coldeven",    # 3
+    "Growfest",    # festival
+    "Planting",    # 4
+    "Flocktime",   # 5
+    "Wealsun",     # 6
+    "Richfest",    # festival
+    "Reaping",     # 7
+    "Goodmonth",   # 8
+    "Harvester",   # 9
+    "Brewfest",    # festival
+    "Patchwall",   # 10
+    "Ready'reat",  # 11
+    "Sunsebb",     # 12
+]
+
+# Default campaign start year
+_DEFAULT_START_YEAR_CY = 576
+
+
+# ------------------------------------------------------------------------------
+# LOYALTY HELPERS
+# ------------------------------------------------------------------------------
+
+def _cha_init_bonus(cha_score: int) -> int:
+    """Return initial loyalty score bonus based on Charisma."""
+    for (lo, hi), bonus in _LOYALTY_CHA_INIT_BONUS.items():
+        if lo <= cha_score <= hi:
+            return bonus
+    return 0
+
+
+def _relation_base_score(rel_type: str, notes: str) -> int:
+    """
+    Determine base loyalty score from relationship type and notes text.
+    Returns an integer 2-12.
+    """
+    combined = (rel_type + " " + (notes or "")).lower()
+    for (keyword, score) in _LOYALTY_RELATION_BASE:
+        if keyword in combined:
+            return score
+    return 7   # default: neutral hired relationship
+
+
+def _score_label(score: int) -> str:
+    return _LOYALTY_LABELS.get(max(2, min(12, score)), "unknown")
+
+
+def _get_all_loyalty_records() -> list[dict]:
+    """Fetch all loyalty world_facts rows."""
+    with _get_conn(read_only=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT world_fact_id, fact_text FROM world_facts "
+            "WHERE campaign_id = ? AND category = 'loyalty'",
+            (_CAMPAIGN_ID,),
+        )
+        rows = cur.fetchall()
+    result = []
+    for row in rows:
+        try:
+            d = json.loads(row["fact_text"])
+            d["_fact_id"] = row["world_fact_id"]
+            result.append(d)
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return result
+
+
+def _get_loyalty_record(name: str) -> dict | None:
+    """Return the loyalty record for a named entity, or None."""
+    records = _get_all_loyalty_records()
+    name_lower = name.lower().strip()
+    for r in records:
+        if r.get("name", "").lower() == name_lower:
+            return r
+    return None
+
+
+def _save_loyalty_record(data: dict) -> None:
+    """Upsert a loyalty record (keyed by name)."""
+    fact_id = data.pop("_fact_id", None)
+    payload = json.dumps(data)
+    with _get_conn() as conn:
+        if fact_id:
+            conn.execute(
+                "UPDATE world_facts SET fact_text = ? WHERE world_fact_id = ?",
+                (payload, fact_id),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO world_facts (campaign_id, category, fact_text, source_note) "
+                "VALUES (?, 'loyalty', ?, ?)",
+                (_CAMPAIGN_ID, payload, data.get("name", "unknown")),
+            )
+
+
+def _initialize_loyalty_scores() -> list[dict]:
+    """
+    Bootstrap loyalty records from the relationships and troops tables.
+    Called once when loyalty records do not yet exist.
+    Returns the list of initialized records.
+    """
+    cha_score = _get_pc_ability("charisma")
+    cha_bonus = _cha_init_bonus(cha_score)
+    initialized = []
+
+    # ── Named NPCs with relationships to the PC ───────────────────────────────
+    with _get_conn(read_only=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """SELECT c.character_id, c.name, c.character_type, c.race,
+                      r.relationship_type, r.notes
+               FROM characters c
+               JOIN relationships r ON r.target_character_id = c.character_id
+               WHERE r.source_character_id = ? AND c.character_id != ?
+                 AND c.character_type != 'PC'""",
+            (_PC_CHARACTER_ID, _PC_CHARACTER_ID),
+        )
+        npc_rows = [dict(r) for r in cur.fetchall()]
+
+    for npc in npc_rows:
+        base = _relation_base_score(
+            npc.get("relationship_type", ""),
+            npc.get("notes", ""),
+        )
+        score = max(2, min(12, base + cha_bonus))
+
+        # Constructs and undead get fixed loyalty (magical compulsion / undying service)
+        race_lower = (npc.get("race") or "").lower()
+        if any(k in race_lower for k in ("construct", "undead", "lich", "spirit armor")):
+            score = 12  # constructs don't defect
+
+        record = {
+            "name":              npc["name"],
+            "entity_type":       "npc",
+            "entity_id":         npc["character_id"],
+            "race":              npc.get("race", "Unknown"),
+            "score":             score,
+            "base_score":        base,
+            "cha_bonus_applied": cha_bonus,
+            "status":            _score_label(score),
+            "last_check_date":   None,
+            "last_event":        "initialized from relationship data",
+            "at_risk":           score <= 5,
+            "adjustment_history": [],
+        }
+        _save_loyalty_record(record)
+        initialized.append(record)
+
+    # ── Troop groups ──────────────────────────────────────────────────────────
+    with _get_conn(read_only=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT troop_id, group_name, troop_type, count, notes "
+            "FROM troops WHERE campaign_id = ?",
+            (_CAMPAIGN_ID,),
+        )
+        troop_rows = [dict(r) for r in cur.fetchall()]
+
+    for troop in troop_rows:
+        troop_type_lower = (troop.get("troop_type") or "").lower()
+        notes_lower      = (troop.get("notes") or "").lower()
+
+        # Constructs have no morale
+        if any(k in troop_type_lower for k in ("construct", "spirit", "animated")):
+            score = 12
+        else:
+            # Troops default to 7 (hired/realm soldiers); adjust by notes
+            base = 7
+            if "absolute"    in notes_lower: base = 11
+            if "trusted"     in notes_lower: base = 10
+            if "well paid"   in notes_lower: base += 1
+            if "trained"     in notes_lower: base += 1
+            if "loyalty"     in notes_lower: base += 1
+            score = max(2, min(12, base + cha_bonus))
+
+        record = {
+            "name":              troop["group_name"],
+            "entity_type":       "troop",
+            "entity_id":         troop["troop_id"],
+            "troop_type":        troop.get("troop_type", "Unknown"),
+            "count":             troop.get("count", 0),
+            "score":             score,
+            "base_score":        base if "base" in dir() else 7,
+            "cha_bonus_applied": cha_bonus,
+            "status":            _score_label(score),
+            "last_check_date":   None,
+            "last_event":        "initialized from troop roster",
+            "at_risk":           score <= 5,
+            "adjustment_history": [],
+        }
+        _save_loyalty_record(record)
+        initialized.append(record)
+
+    return initialized
+
+
+# ------------------------------------------------------------------------------
+# AGING HELPERS
+# ------------------------------------------------------------------------------
+
+def _get_aging_record(character_id: int) -> dict | None:
+    """Return aging record from world_facts for given character_id."""
+    with _get_conn(read_only=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT world_fact_id, fact_text FROM world_facts "
+            "WHERE campaign_id = ? AND category = 'character_aging' "
+            "AND source_note = ? LIMIT 1",
+            (_CAMPAIGN_ID, str(character_id)),
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
+    try:
+        d = json.loads(row["fact_text"])
+        d["_fact_id"] = row["world_fact_id"]
+        return d
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def _save_aging_record(data: dict) -> None:
+    """Upsert aging record for a character."""
+    fact_id = data.pop("_fact_id", None)
+    char_id = data.get("character_id", 0)
+    payload = json.dumps(data)
+    with _get_conn() as conn:
+        if fact_id:
+            conn.execute(
+                "UPDATE world_facts SET fact_text = ? WHERE world_fact_id = ?",
+                (payload, fact_id),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO world_facts "
+                "(campaign_id, category, fact_text, source_note) "
+                "VALUES (?, 'character_aging', ?, ?)",
+                (_CAMPAIGN_ID, payload, str(char_id)),
+            )
+
+
+def _init_aging_record(character_id: int) -> dict:
+    """
+    Create a fresh aging record for a character if none exists.
+    Assumes campaign is in 576 CY; PC race is read from DB.
+    For elves, starting age is typically 100-400+ (use 120 as a young-adult default).
+    """
+    with _get_conn(read_only=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT name, race FROM characters WHERE character_id = ?",
+            (character_id,),
+        )
+        row = cur.fetchone()
+    name = row["name"] if row else "Unknown"
+    race = row["race"] if row else "Human"
+
+    # Sensible starting ages by race (young adult in 576 CY)
+    DEFAULT_START_AGES: dict[str, int] = {
+        "Human":    25,
+        "Elf":      120,
+        "Half-Elf": 35,
+        "Dwarf":    60,
+        "Halfling": 28,
+        "Half-Orc": 18,
+        "Gnome":    50,
+    }
+    start_age = DEFAULT_START_AGES.get(race, 25)
+    thresholds = _RACE_AGE_THRESHOLDS.get(race, _RACE_AGE_THRESHOLDS["Human"])
+
+    # Determine current aging stage
+    if start_age >= thresholds[2]:
+        stage = "venerable"
+    elif start_age >= thresholds[1]:
+        stage = "old"
+    elif start_age >= thresholds[0]:
+        stage = "middle_age"
+    else:
+        stage = "young"
+
+    record = {
+        "character_id":         character_id,
+        "name":                 name,
+        "race":                 race,
+        "start_age":            start_age,
+        "current_age":          start_age,
+        "campaign_days_elapsed": 0,
+        "aging_stage":          stage,
+        "thresholds_passed":    [],
+        "ability_changes_applied": {},
+        "next_threshold_age":   next(
+            (t for t in thresholds if t > start_age), None
+        ),
+    }
+    _save_aging_record(record)
+    return record
+
+
+def _age_label(age: int, thresholds: tuple[int, int, int]) -> str:
+    if age >= thresholds[2]: return "venerable"
+    if age >= thresholds[1]: return "old"
+    if age >= thresholds[0]: return "middle_age"
+    return "young"
+
+
+def _extract_year_from_calendar(cal_text: str) -> int | None:
+    """Parse a 4-digit year from a calendar string like 'Fireseek 12, 576 CY'."""
+    import re as _re
+    m = _re.search(r"\b(\d{3,4})\s*CY\b", cal_text, _re.IGNORECASE)
+    return int(m.group(1)) if m else None
+
+
+# ------------------------------------------------------------------------------
+# PUBLIC LOYALTY FUNCTIONS
+# ------------------------------------------------------------------------------
+
+def db_get_loyalty_state() -> dict:
+    """
+    Return loyalty scores for all NPCs and troop groups.
+    Auto-initializes from relationship/troop data on first call.
+    Flags any entity with score <= 5 as at_risk.
+    """
+    records = _get_all_loyalty_records()
+
+    # Auto-initialize if no records exist yet
+    if not records:
+        records = _initialize_loyalty_scores()
+
+    npcs   = [r for r in records if r.get("entity_type") == "npc"]
+    troops = [r for r in records if r.get("entity_type") == "troop"]
+    at_risk = [r["name"] for r in records if r.get("score", 10) <= 5]
+
+    # Sort each list by score descending
+    npcs.sort(  key=lambda r: r.get("score", 0), reverse=True)
+    troops.sort(key=lambda r: r.get("score", 0), reverse=True)
+
+    # Strip internal _fact_id from output
+    def _clean(r: dict) -> dict:
+        return {k: v for k, v in r.items() if not k.startswith("_")}
+
+    return {
+        "npcs":          [_clean(r) for r in npcs],
+        "troops":        [_clean(r) for r in troops],
+        "at_risk":       at_risk,
+        "total_tracked": len(records),
+        "dm_note": (
+            "Loyalty score 2-12. Check: roll 2d6 <= score to remain loyal. "
+            "Score 12 = unshakeable; score 7 = reliable (even odds); "
+            "score 5 or below = AT RISK. Call loyalty_check for specific events."
+        ),
+    }
+
+
+def db_loyalty_check(
+    entity_name:   str,
+    situation:     str,
+    modifier:      int         = 0,
+    calendar_note: str         = "",
+) -> dict:
+    """
+    Roll 2d6 loyalty check for a named NPC or troop group.
+    modifier: -3 to +3 (negative = worse situation, positive = better).
+    Returns result tier, consequence, and whether loyalty score changes.
+    """
+    record = _get_loyalty_record(entity_name)
+    if not record:
+        # Try partial match
+        all_records = _get_all_loyalty_records()
+        name_lower  = entity_name.lower()
+        record      = next(
+            (r for r in all_records if name_lower in r.get("name", "").lower()),
+            None
+        )
+    if not record:
+        return {"error": f"No loyalty record for '{entity_name}'. Call get_loyalty_state first."}
+
+    fact_id = record.pop("_fact_id", None)
+    score   = record.get("score", 7)
+
+    # Roll 2d6 with situation modifier
+    die1 = random.randint(1, 6)
+    die2 = random.randint(1, 6)
+    raw  = die1 + die2
+    roll = max(2, min(12, raw + modifier))
+
+    margin = roll - score  # negative = passed; positive = failed
+
+    # Determine outcome tier
+    tier_label = "desertion_risk"
+    tier_desc  = "Critical failure."
+    for (rng, label, desc) in _LOYALTY_CHECK_TIERS:
+        if margin in rng:
+            tier_label = label
+            tier_desc  = desc
+            break
+
+    # Natural 12 rider (even on pass — memorable moment)
+    nat_12_note = _LOYALTY_NAT_12_RIDER if raw == 12 else ""
+
+    # Loyalty score changes from check results
+    score_delta = 0
+    if tier_label == "desertion_risk":
+        score_delta = -1
+    elif tier_label == "demands" and modifier < -1:
+        score_delta = -1
+
+    new_score = max(2, min(12, score + score_delta))
+    passed    = margin <= 0
+
+    # Update record
+    record["score"]           = new_score
+    record["status"]          = _score_label(new_score)
+    record["at_risk"]         = new_score <= 5
+    record["last_check_date"] = calendar_note or "recent"
+    record["last_event"]      = f"Loyalty check: {situation} | roll={roll} vs {score} → {tier_label}"
+    if score_delta != 0:
+        record.setdefault("adjustment_history", []).append({
+            "date":   calendar_note or "recent",
+            "delta":  score_delta,
+            "reason": f"loyalty_check consequence: {tier_label}",
+        })
+
+    record["_fact_id"] = fact_id
+    _save_loyalty_record(record)
+
+    return {
+        "entity_name":     entity_name,
+        "entity_type":     record.get("entity_type", "npc"),
+        "situation":       situation,
+        "score_before":    score,
+        "score_after":     new_score,
+        "status":          _score_label(new_score),
+        "dice_rolled":     [die1, die2],
+        "raw_roll":        raw,
+        "modifier":        modifier,
+        "adjusted_roll":   roll,
+        "margin":          margin,
+        "passed":          passed,
+        "outcome_tier":    tier_label,
+        "consequence":     tier_desc,
+        "nat_12_note":     nat_12_note,
+        "score_changed":   score_delta != 0,
+        "dm_note": (
+            "For 'grumbling' / 'demands', narrate the specific complaint "
+            "and call adjust_loyalty when it is addressed. For 'desertion_risk', "
+            "an immediate intervention is needed — gifts, explanation, promotion, or "
+            "a personal appeal. Loyalty score drops by 1 on serious failures."
+        ),
+    }
+
+
+def db_adjust_loyalty(
+    entity_name:   str,
+    delta:         int,
+    reason:        str,
+    calendar_note: str = "",
+) -> dict:
+    """
+    Modify a loyalty score by delta (positive or negative).
+    Call after gifts, promotions, betrayals, deaths of comrades, pay raises, etc.
+    """
+    record = _get_loyalty_record(entity_name)
+    if not record:
+        all_records = _get_all_loyalty_records()
+        name_lower  = entity_name.lower()
+        record      = next(
+            (r for r in all_records if name_lower in r.get("name", "").lower()),
+            None
+        )
+    if not record:
+        return {"error": f"No loyalty record for '{entity_name}'. Call get_loyalty_state first."}
+
+    fact_id     = record.pop("_fact_id", None)
+    score_before = record.get("score", 7)
+    new_score   = max(2, min(12, score_before + delta))
+
+    record["score"]      = new_score
+    record["status"]     = _score_label(new_score)
+    record["at_risk"]    = new_score <= 5
+    record["last_event"] = f"Adjusted {delta:+d}: {reason}"
+    record.setdefault("adjustment_history", []).append({
+        "date":   calendar_note or "recent",
+        "delta":  delta,
+        "reason": reason,
+    })
+    record["_fact_id"] = fact_id
+    _save_loyalty_record(record)
+
+    return {
+        "entity_name":   entity_name,
+        "reason":        reason,
+        "score_before":  score_before,
+        "delta":         delta,
+        "score_after":   new_score,
+        "status_before": _score_label(score_before),
+        "status_after":  _score_label(new_score),
+        "at_risk":       new_score <= 5,
+        "dm_note": (
+            "Score is capped 2-12. Typical adjustments: "
+            "gift/raise +1; major victory +1; betrayal of trust -2; "
+            "comrade killed -1; ignored demand -1; public praise +1."
+        ),
+    }
+
+
+def db_henchman_morale_event(
+    month_label:     str,
+    global_modifier: int   = 0,
+    calendar_note:   str   = "",
+) -> dict:
+    """
+    Monthly morale roll for all named NPCs (entity_type='npc').
+    global_modifier: -3 to +3 applied to every roll.
+      Positive: recent victory, wages paid, good leadership.
+      Negative: recent defeat, unpaid wages, PC absent.
+    Returns a report for each NPC with result and any loyalty score changes.
+    """
+    records = _get_all_loyalty_records()
+    if not records:
+        records = _initialize_loyalty_scores()
+
+    npc_records = [r for r in records if r.get("entity_type") == "npc"]
+
+    reports = []
+    for record in npc_records:
+        fact_id = record.pop("_fact_id", None)
+        score   = record.get("score", 7)
+
+        die1  = random.randint(1, 6)
+        die2  = random.randint(1, 6)
+        raw   = die1 + die2
+        roll  = max(2, min(12, raw + global_modifier))
+
+        # Look up result in morale event table
+        event_label = "steady"
+        event_desc  = "No change."
+        loyalty_delta = 0
+        for (rng, label, desc, delta) in _MORALE_EVENT_TABLE:
+            if roll in rng:
+                event_label   = label
+                event_desc    = desc
+                loyalty_delta = delta
+                break
+
+        new_score = max(2, min(12, score + loyalty_delta))
+        record["score"]      = new_score
+        record["status"]     = _score_label(new_score)
+        record["at_risk"]    = new_score <= 5
+        record["last_event"] = f"Monthly morale ({month_label}): {event_label}"
+        if loyalty_delta != 0:
+            record.setdefault("adjustment_history", []).append({
+                "date":   calendar_note or month_label,
+                "delta":  loyalty_delta,
+                "reason": f"monthly_morale_event: {event_label}",
+            })
+
+        record["_fact_id"] = fact_id
+        _save_loyalty_record(record)
+
+        reports.append({
+            "name":          record.get("name"),
+            "dice":          [die1, die2],
+            "raw_roll":      raw,
+            "modifier":      global_modifier,
+            "adjusted_roll": roll,
+            "event_label":   event_label,
+            "description":   event_desc,
+            "score_before":  score,
+            "score_after":   new_score,
+            "status":        _score_label(new_score),
+            "at_risk":       new_score <= 5,
+        })
+
+    at_risk   = [r["name"] for r in reports if r["at_risk"]]
+    demands   = [r["name"] for r in reports if r["event_label"] == "demands"]
+    devoted   = [r["name"] for r in reports if r["event_label"] == "increased_devotion"]
+    crises    = [r["name"] for r in reports if r["event_label"] == "crisis"]
+
+    return {
+        "month":            month_label,
+        "global_modifier":  global_modifier,
+        "npcs_checked":     len(reports),
+        "reports":          reports,
+        "summary": {
+            "increased_devotion": devoted,
+            "demands":            demands,
+            "at_risk":            at_risk,
+            "crisis":             crises,
+        },
+        "dm_note": (
+            "Address 'demands' within the next session or loyalty drops by 1. "
+            "'crisis' requires immediate loyalty_check. 'increased_devotion' "
+            "is a good moment for a personal scene with that NPC."
+        ),
+    }
+
+
+# ------------------------------------------------------------------------------
+# PUBLIC AGING / CALENDAR FUNCTIONS
+# ------------------------------------------------------------------------------
+
+def db_advance_time(
+    days:          int,
+    calendar_note: str = "",
+) -> dict:
+    """
+    Advance the campaign calendar by the given number of days.
+    Updates the 'calendar' world_fact. Checks for aging threshold crossings
+    and flags overdue religious observances.
+    """
+    days = max(1, days)
+
+    # Load or initialize PC aging record
+    aging = _get_aging_record(_PC_CHARACTER_ID)
+    if not aging:
+        aging = _init_aging_record(_PC_CHARACTER_ID)
+
+    race       = aging.get("race", "Human")
+    thresholds = _RACE_AGE_THRESHOLDS.get(race, _RACE_AGE_THRESHOLDS["Human"])
+
+    old_age         = aging.get("current_age", 25)
+    old_days        = aging.get("campaign_days_elapsed", 0)
+    new_days        = old_days + days
+
+    # Convert days → fractional years (365.25 days/year)
+    years_elapsed   = new_days / 365.25
+    new_age         = aging.get("start_age", 25) + years_elapsed
+    old_stage       = aging.get("aging_stage", "young")
+    new_stage       = _age_label(new_age, thresholds)
+
+    # Detect threshold crossings
+    threshold_names = ["middle_age", "old", "venerable"]
+    threshold_ages  = list(thresholds)
+    newly_crossed   = []
+    for i, t_age in enumerate(threshold_ages):
+        t_name = threshold_names[i]
+        if old_age < t_age <= new_age and t_name not in aging.get("thresholds_passed", []):
+            newly_crossed.append(t_name)
+
+    # Update aging record
+    aging["current_age"]           = round(new_age, 2)
+    aging["campaign_days_elapsed"] = new_days
+    aging["aging_stage"]           = new_stage
+    aging["thresholds_passed"]     = aging.get("thresholds_passed", []) + newly_crossed
+    aging["next_threshold_age"]    = next(
+        (t for t in thresholds if t > new_age), None
+    )
+    _save_aging_record(aging)
+
+    # Update campaign calendar
+    cal = _downtime_advance_calendar(days, calendar_note)
+
+    # Check overdue religious observances
+    overdue_deities = []
+    with _get_conn(read_only=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT fact_text FROM world_facts "
+            "WHERE campaign_id = ? AND category = 'religious_obligations'",
+            (_CAMPAIGN_ID,),
+        )
+        obs_rows = cur.fetchall()
+    for obs_row in obs_rows:
+        try:
+            obs = json.loads(obs_row["fact_text"])
+            if obs.get("missed_count", 0) >= 3:
+                overdue_deities.append({
+                    "deity":        obs.get("deity"),
+                    "missed_count": obs.get("missed_count"),
+                    "penalty":      "losing highest spell level until atonement",
+                })
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    return {
+        "days_advanced":       days,
+        "calendar":            cal,
+        "character":           aging.get("name"),
+        "race":                race,
+        "age_before":          round(old_age, 2),
+        "age_after":           round(new_age, 2),
+        "aging_stage_before":  old_stage,
+        "aging_stage_after":   new_stage,
+        "thresholds_crossed":  newly_crossed,
+        "next_threshold_age":  aging["next_threshold_age"],
+        "aging_check_needed":  len(newly_crossed) > 0,
+        "overdue_observances": overdue_deities,
+        "dm_note": (
+            "If aging_check_needed is True, call aging_check() immediately. "
+            "If overdue_observances is non-empty, remind the cleric to perform "
+            "religious_observance(). For significant time jumps (seasons), "
+            "consider calling henchman_morale_event() for the elapsed months."
+        ),
+    }
+
+
+def db_aging_check(
+    character_id:    int,
+    threshold_stage: str,
+) -> dict:
+    """
+    Apply aging ability score changes when a character crosses an age threshold.
+    threshold_stage: 'middle_age' | 'old' | 'venerable'
+    Modifies character_abilities in the DB and records the changes.
+    """
+    effects = _AGING_EFFECTS.get(threshold_stage)
+    if not effects:
+        return {"error": f"Unknown threshold_stage '{threshold_stage}'. "
+                         "Use: middle_age, old, venerable"}
+
+    # Load current ability scores
+    with _get_conn(read_only=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT strength, intelligence, wisdom, dexterity, constitution, charisma "
+            "FROM character_abilities WHERE character_id = ?",
+            (character_id,),
+        )
+        row = cur.fetchone()
+    if not row:
+        return {"error": f"No ability scores found for character_id={character_id}"}
+
+    abilities_before = dict(row)
+    abilities_after  = dict(row)
+
+    for stat, delta in effects.items():
+        before_val                = abilities_after.get(stat, 10)
+        abilities_after[stat]     = max(3, before_val + delta)   # floor at 3
+
+    # Apply changes
+    with _get_conn() as conn:
+        conn.execute(
+            """UPDATE character_abilities
+               SET strength=?, dexterity=?, constitution=?, wisdom=?
+               WHERE character_id=?""",
+            (
+                abilities_after["strength"],
+                abilities_after["dexterity"],
+                abilities_after["constitution"],
+                abilities_after["wisdom"],
+                character_id,
+            ),
+        )
+
+    # Record in aging record
+    aging = _get_aging_record(character_id)
+    if aging:
+        applied = aging.get("ability_changes_applied", {})
+        applied[threshold_stage] = effects
+        aging["ability_changes_applied"] = applied
+        _save_aging_record(aging)
+
+    changes = {
+        stat: {"before": abilities_before[stat], "after": abilities_after[stat], "delta": delta}
+        for stat, delta in effects.items()
+    }
+
+    return {
+        "character_id":      character_id,
+        "threshold_stage":   threshold_stage,
+        "ability_changes":   changes,
+        "abilities_before":  abilities_before,
+        "abilities_after":   abilities_after,
+        "dm_note": (
+            f"Aging effects for {threshold_stage} applied permanently. "
+            "Abilities cannot drop below 3 from aging. Wisdom gains are cumulative "
+            "across all thresholds: a character reaching venerable from young gains "
+            "+3 Wis total. These changes are reflected in character_abilities."
+        ),
+    }
+
+
+def db_get_character_age(character_id: int) -> dict:
+    """
+    Return current age, race, aging stage, next threshold, and years remaining.
+    Auto-initializes the aging record if it doesn't exist.
+    """
+    aging = _get_aging_record(character_id)
+    if not aging:
+        aging = _init_aging_record(character_id)
+
+    race       = aging.get("race", "Human")
+    thresholds = _RACE_AGE_THRESHOLDS.get(race, _RACE_AGE_THRESHOLDS["Human"])
+    max_ages   = _RACE_MAX_AGE.get(race, (90, 120))
+    cur_age    = aging.get("current_age", 25)
+    next_t     = aging.get("next_threshold_age")
+
+    threshold_info = {
+        "middle_age": thresholds[0],
+        "old":        thresholds[1],
+        "venerable":  thresholds[2],
+    }
+
+    return {
+        "character_id":         character_id,
+        "name":                 aging.get("name"),
+        "race":                 race,
+        "current_age":          round(cur_age, 1),
+        "aging_stage":          aging.get("aging_stage", "young"),
+        "thresholds":           threshold_info,
+        "thresholds_passed":    aging.get("thresholds_passed", []),
+        "next_threshold_age":   next_t,
+        "years_to_next_check":  round(next_t - cur_age, 1) if next_t else None,
+        "natural_lifespan_max": max_ages[1],
+        "campaign_days_elapsed": aging.get("campaign_days_elapsed", 0),
+        "ability_changes_applied": aging.get("ability_changes_applied", {}),
+        "dm_note": (
+            "Aging checks are triggered by advance_time() when a threshold is crossed. "
+            "Elves rarely reach middle_age in a campaign context (threshold: 350 years). "
+            "Call aging_check(character_id, threshold_stage) when a threshold is crossed."
+        ),
+    }
