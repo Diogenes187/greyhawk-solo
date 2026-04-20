@@ -96,6 +96,7 @@ import random
 import re
 import sqlite3
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Annotated
 
@@ -4246,6 +4247,243 @@ def switch_campaign(
             "to activate the new campaign — the MCP server reads config.json "
             "once at startup."
         ),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TOOL: backup_campaign
+# ══════════════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def backup_campaign(
+    label: Annotated[
+        str,
+        "Optional short label appended to the backup filename "
+        "(e.g. 'pre_dragon_fight'). Non-alphanumeric chars are sanitised. "
+        "Leave blank for a plain timestamp-only name.",
+    ] = "",
+) -> dict:
+    """
+    Snapshot the currently active campaign DB to saves/backups/.
+
+    Uses SQLite's online backup API so the copy is consistent even with the
+    MCP server's connection open (WAL mode is respected). The backup
+    directory is created on demand.
+
+    Filename format:  <stem>_<YYYYMMDD-HHMMSS>[_<label>].db  (UTC timestamp)
+
+    Returns:
+      source     -- relative path of the active DB that was backed up
+      backup     -- relative path of the new backup file
+      bytes      -- size of the backup file
+      timestamp  -- UTC timestamp used in the filename
+
+    Call before risky moments: big combats, domain turns, one-way downtime
+    activities. Restoring is a manual swap of the file back into saves/
+    plus a switch_campaign call.
+    """
+    active_rel = _active_campaign_rel()
+    if not active_rel:
+        return {"error": "No active campaign found in config.json."}
+
+    src = (_ROOT / active_rel).resolve()
+    if not src.exists():
+        return {"error": f"Active DB missing on disk: {active_rel}"}
+
+    backups_dir = _ROOT / "saves" / "backups"
+    backups_dir.mkdir(parents=True, exist_ok=True)
+
+    ts = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    safe_label = re.sub(r"[^A-Za-z0-9_-]+", "_", label.strip()).strip("_")
+    suffix = f"_{safe_label}" if safe_label else ""
+    dest = backups_dir / f"{src.stem}_{ts}{suffix}.db"
+
+    try:
+        src_conn  = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
+        dest_conn = sqlite3.connect(dest)
+        with dest_conn:
+            src_conn.backup(dest_conn)
+        src_conn.close()
+        dest_conn.close()
+    except sqlite3.Error as e:
+        if dest.exists():
+            try: dest.unlink()
+            except Exception: pass
+        return {"error": f"Backup failed: {e}"}
+
+    return {
+        "source":    active_rel,
+        "backup":    f"saves/backups/{dest.name}",
+        "bytes":     dest.stat().st_size,
+        "timestamp": ts,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TOOL: search_history
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _snippet(text: str, needle: str, window: int = 60) -> str:
+    """Return a short snippet of `text` centred on the first case-insensitive
+    occurrence of `needle`, with ellipses on either side as needed."""
+    if not text:
+        return ""
+    lo = text.lower().find(needle.lower())
+    if lo < 0:
+        return text[: window * 2] + ("…" if len(text) > window * 2 else "")
+    start = max(0, lo - window)
+    end   = min(len(text), lo + len(needle) + window)
+    prefix = "…" if start > 0 else ""
+    suffix = "…" if end < len(text) else ""
+    return prefix + text[start:end] + suffix
+
+
+@mcp.tool()
+def search_history(
+    query: Annotated[
+        str,
+        "Keyword or phrase to search for in past turns. Matching is "
+        "case-insensitive and substring-based (SQL LIKE). Searches both the "
+        "player's action and the DM's narration.",
+    ],
+    limit: Annotated[
+        int,
+        "Maximum number of matching turns to return. Results are ordered "
+        "most-recent-first.",
+    ] = 20,
+) -> dict:
+    """
+    Search the full ai_turns history for a keyword (e.g. an NPC name, place,
+    item) and return matching turns with snippets.
+
+    Complements get_recent_history, which only returns the last N turns.
+    Use when the player references something from earlier in the campaign
+    ("that merchant in Hommlet", "the ring we found in the crypt") and you
+    need to ground the recollection in what actually happened.
+
+    Returns:
+      query   -- the search string used
+      count   -- number of matches returned
+      matches -- list of {turn_id, created_at, matched_in, player_snippet,
+                 dm_snippet} where matched_in is 'player', 'dm', or 'both'.
+    """
+    q = (query or "").strip()
+    if not q:
+        return {"error": "Query is empty."}
+    if limit < 1 or limit > 200:
+        return {"error": "limit must be between 1 and 200."}
+
+    active_rel = _active_campaign_rel()
+    if not active_rel:
+        return {"error": "No active campaign found in config.json."}
+    db_path = (_ROOT / active_rel).resolve()
+    if not db_path.exists():
+        return {"error": f"Active DB missing on disk: {active_rel}"}
+
+    like = f"%{q}%"
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT turn_id, player_action, dm_response, created_at "
+            "FROM ai_turns "
+            "WHERE player_action LIKE ? COLLATE NOCASE "
+            "   OR dm_response   LIKE ? COLLATE NOCASE "
+            "ORDER BY turn_id DESC LIMIT ?",
+            (like, like, limit),
+        ).fetchall()
+        conn.close()
+    except sqlite3.Error as e:
+        return {"error": f"Search failed: {e}"}
+
+    matches = []
+    ql = q.lower()
+    for r in rows:
+        pa = r["player_action"] or ""
+        dm = r["dm_response"]   or ""
+        in_p = ql in pa.lower()
+        in_d = ql in dm.lower()
+        matches.append({
+            "turn_id":        r["turn_id"],
+            "created_at":     r["created_at"],
+            "matched_in":     "both" if (in_p and in_d) else ("player" if in_p else "dm"),
+            "player_snippet": _snippet(pa, q) if in_p else "",
+            "dm_snippet":     _snippet(dm, q) if in_d else "",
+        })
+
+    return {"query": q, "count": len(matches), "matches": matches}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TOOL: get_world_facts
+# ══════════════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def get_world_facts(
+    category: Annotated[
+        str,
+        "Optional category filter (e.g. 'geography', 'factions', 'rumours'). "
+        "Leave blank to return every fact grouped by category.",
+    ] = "",
+) -> dict:
+    """
+    Return campaign-specific world facts stored via update_world_fact.
+
+    World facts are the DM's persistent notes about the setting — canon
+    details, secrets, established truths — that need to survive across
+    sessions. Call this whenever you need to check what has already been
+    established before narrating.
+
+    Returns:
+      count       -- total number of facts returned
+      categories  -- list of category names present in the result
+      by_category -- dict of {category: [{id, fact, source_note}, ...]}
+
+    If a category filter is given and no facts match, by_category is empty
+    and count is 0 — not an error.
+    """
+    active_rel = _active_campaign_rel()
+    if not active_rel:
+        return {"error": "No active campaign found in config.json."}
+    db_path = (_ROOT / active_rel).resolve()
+    if not db_path.exists():
+        return {"error": f"Active DB missing on disk: {active_rel}"}
+
+    cat = category.strip()
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        if cat:
+            rows = conn.execute(
+                "SELECT world_fact_id, category, fact_text, source_note "
+                "FROM world_facts "
+                "WHERE campaign_id = 1 AND category = ? COLLATE NOCASE "
+                "ORDER BY world_fact_id",
+                (cat,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT world_fact_id, category, fact_text, source_note "
+                "FROM world_facts "
+                "WHERE campaign_id = 1 "
+                "ORDER BY category, world_fact_id"
+            ).fetchall()
+        conn.close()
+    except sqlite3.Error as e:
+        return {"error": f"Read failed: {e}"}
+
+    by_category: dict[str, list[dict]] = {}
+    for r in rows:
+        by_category.setdefault(r["category"], []).append({
+            "id":          r["world_fact_id"],
+            "fact":        r["fact_text"],
+            "source_note": r["source_note"],
+        })
+
+    return {
+        "count":       len(rows),
+        "categories":  sorted(by_category.keys()),
+        "by_category": by_category,
     }
 
 
