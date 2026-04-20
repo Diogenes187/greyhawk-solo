@@ -17,6 +17,8 @@ and never touch the campaign database. The two systems are fully isolated.
 """
 
 import json
+import re
+import random
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
@@ -1238,3 +1240,303 @@ def get_pending_updates(limit: int = 30) -> list[dict]:
         })
 
     return results
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PHASE 2 — COMBAT STATE
+# ══════════════════════════════════════════════════════════════════════════════
+
+# OSRIC/AD&D 1e base XP by monster HD (no HP bonus — simplified for solo play)
+_XP_BY_HD: dict[int, int] = {
+    0: 5, 1: 10, 2: 20, 3: 35, 4: 75, 5: 175,
+    6: 275, 7: 450, 8: 650, 9: 900, 10: 900,
+}
+
+
+def _xp_for_hd(hd: float) -> int:
+    """Return base XP for a monster with the given effective HD."""
+    key = int(hd)
+    if key <= 0:
+        return _XP_BY_HD[0]
+    if key in _XP_BY_HD:
+        return _XP_BY_HD[key]
+    return 1100 + (key - 11) * 100   # 11+ HD
+
+
+def _parse_monster_hd(hd_text: str) -> tuple[int, int, int]:
+    """
+    Parse a monster HD string → (num_dice, die_sides, bonus).
+    "3"   → (3, 8, 0)    "3+1" → (3, 8, 1)    "3-1" → (3, 8, -1)
+    "½"   → (1, 4, 0)    "1/2" → (1, 4, 0)
+    """
+    text = hd_text.strip()
+    if text in ("½", "1/2", "0.5"):
+        return (1, 4, 0)
+    m = re.match(r"^(\d+)\s*([+-]\s*\d+)?$", text)
+    if m:
+        num   = int(m.group(1))
+        bonus = int(m.group(2).replace(" ", "")) if m.group(2) else 0
+        return (num, 8, bonus)
+    try:
+        return (max(1, int(float(text))), 8, 0)
+    except ValueError:
+        return (1, 8, 0)
+
+
+def _roll_monster_hp(hd_text: str) -> tuple[int, float]:
+    """Roll HP for one monster instance. Returns (hp, effective_hd)."""
+    num, sides, bonus = _parse_monster_hd(hd_text)
+    rolls  = [random.randint(1, sides) for _ in range(max(1, num))]
+    hp     = max(1, sum(rolls) + bonus)
+    eff_hd = max(0.5, num + bonus / max(sides, 1))
+    return (hp, eff_hd)
+
+
+def _roll_damage(damage_text: str) -> list[int]:
+    """
+    Parse and roll AD&D damage notation.
+    "1-8"         → [randint(1,8)]
+    "1-3/1-3/2-5" → three separate rolls
+    "2d6"         → sum of 2d6
+    """
+    results = []
+    for part in damage_text.strip().split("/"):
+        part = part.strip()
+        m = re.match(r"^(\d+)-(\d+)$", part)
+        if m:
+            results.append(random.randint(int(m.group(1)), int(m.group(2))))
+            continue
+        m2 = re.match(r"^(\d+)[dD](\d+)([+-]\d+)?$", part)
+        if m2:
+            n, s = int(m2.group(1)), int(m2.group(2))
+            mod  = int(m2.group(3)) if m2.group(3) else 0
+            results.append(max(0, sum(random.randint(1, s) for _ in range(n)) + mod))
+            continue
+        try:
+            results.append(int(part))
+        except ValueError:
+            results.append(1)
+    return results or [1]
+
+
+# Fighter-best ordering for multi-class attack matrix selection
+_CLASS_MATRIX_PRIORITY = [
+    ("fighter",    "fighter_matrix"),
+    ("ranger",     "fighter_matrix"),
+    ("paladin",    "fighter_matrix"),
+    ("bard",       "fighter_matrix"),
+    ("thief",      "thief_matrix"),
+    ("assassin",   "thief_matrix"),
+    ("cleric",     "cleric_matrix"),
+    ("druid",      "cleric_matrix"),
+    ("monk",       "cleric_matrix"),
+    ("magic-user", "magic_user_matrix"),
+    ("magic_user", "magic_user_matrix"),
+    ("illusionist","magic_user_matrix"),
+]
+
+
+def get_active_combat() -> dict | None:
+    """Return the active combat state dict, or None if no combat is running."""
+    with _get_conn(read_only=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT fact_text FROM world_facts "
+            "WHERE campaign_id = ? AND category = 'active_combat' LIMIT 1",
+            (_CAMPAIGN_ID,),
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
+    try:
+        return json.loads(row["fact_text"])
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def set_active_combat(state: dict) -> None:
+    """Persist the combat state dict to world_facts (replaces previous)."""
+    with _get_conn() as conn:
+        conn.execute(
+            "DELETE FROM world_facts "
+            "WHERE campaign_id = ? AND category = 'active_combat'",
+            (_CAMPAIGN_ID,),
+        )
+        conn.execute(
+            "INSERT INTO world_facts "
+            "(campaign_id, category, fact_text, source_note) "
+            "VALUES (?, 'active_combat', ?, 'combat_tracker')",
+            (_CAMPAIGN_ID, json.dumps(state)),
+        )
+
+
+def clear_active_combat() -> None:
+    """Delete the active combat state from world_facts."""
+    with _get_conn() as conn:
+        conn.execute(
+            "DELETE FROM world_facts "
+            "WHERE campaign_id = ? AND category = 'active_combat'",
+            (_CAMPAIGN_ID,),
+        )
+
+
+def lookup_monster(name: str) -> dict:
+    """
+    Look up a monster by exact then prefix match (case-insensitive).
+    Returns the monster row as a dict, or {} if not found.
+    """
+    cols = (
+        "monster_id, name, armor_class, hit_dice, damage, "
+        "number_of_attacks, special_attacks, special_defenses, "
+        "intelligence, alignment, treasure_type, description, notes"
+    )
+    with _get_conn(read_only=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            f"SELECT {cols} FROM monsters "
+            "WHERE LOWER(name) = LOWER(?) LIMIT 1",
+            (name,),
+        )
+        row = cur.fetchone()
+        if not row:
+            cur.execute(
+                f"SELECT {cols} FROM monsters "
+                "WHERE LOWER(name) LIKE LOWER(?) LIMIT 1",
+                (f"{name}%",),
+            )
+            row = cur.fetchone()
+    return _row_to_dict(row) if row else {}
+
+
+def get_attack_target_roll(matrix_code: str, level: int, target_ac: int) -> int:
+    """
+    Return the minimum d20 roll needed to hit target_ac for an attacker
+    using matrix_code at the given level. Falls back to THAC0 formula.
+    """
+    with _get_conn(read_only=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT target_roll FROM combat_attack_matrix_entries "
+            "WHERE matrix_code = ? AND level_min <= ? "
+            "AND (level_max IS NULL OR level_max >= ?) "
+            "AND armor_class = ? LIMIT 1",
+            (matrix_code, level, level, target_ac),
+        )
+        row = cur.fetchone()
+    if row:
+        return row["target_roll"]
+    # Fallback: THAC0 formula (fighter-paced)
+    thac0 = max(6, 20 - (level - 1))
+    return max(1, thac0 - target_ac)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PHASE 2 — SPELL MEMORY
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_spell_memory() -> dict:
+    """Return the current spell memory state, or an empty default."""
+    with _get_conn(read_only=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT fact_text FROM world_facts "
+            "WHERE campaign_id = ? AND category = 'spell_memory' LIMIT 1",
+            (_CAMPAIGN_ID,),
+        )
+        row = cur.fetchone()
+    if not row:
+        return {"memorized": [], "last_rest": None}
+    try:
+        return json.loads(row["fact_text"])
+    except (json.JSONDecodeError, TypeError):
+        return {"memorized": [], "last_rest": None}
+
+
+def set_spell_memory(state: dict) -> None:
+    """Persist the spell memory state to world_facts (replaces previous)."""
+    with _get_conn() as conn:
+        conn.execute(
+            "DELETE FROM world_facts "
+            "WHERE campaign_id = ? AND category = 'spell_memory'",
+            (_CAMPAIGN_ID,),
+        )
+        conn.execute(
+            "INSERT INTO world_facts "
+            "(campaign_id, category, fact_text, source_note) "
+            "VALUES (?, 'spell_memory', ?, 'spell_system')",
+            (_CAMPAIGN_ID, json.dumps(state)),
+        )
+
+
+def lookup_spell(spell_name: str, class_name: str | None = None) -> dict:
+    """
+    Exact then partial name match (case-insensitive).
+    class_name filters to a specific class ('magic_user', 'cleric', etc.).
+    Returns the spell row dict, or {} if not found.
+    """
+    cols = (
+        "spell_id, name, class_name, spell_level, school, "
+        "range_text, duration, area_of_effect, components, casting_time, "
+        "saving_throw, summary_text, combat_use_text, utility_use_text, description"
+    )
+    with _get_conn(read_only=True) as conn:
+        cur = conn.cursor()
+        if class_name:
+            cur.execute(
+                f"SELECT {cols} FROM spells "
+                "WHERE LOWER(name) = LOWER(?) "
+                "AND LOWER(class_name) = LOWER(?) LIMIT 1",
+                (spell_name, class_name),
+            )
+        else:
+            cur.execute(
+                f"SELECT {cols} FROM spells "
+                "WHERE LOWER(name) = LOWER(?) LIMIT 1",
+                (spell_name,),
+            )
+        row = cur.fetchone()
+        if not row:
+            like = f"%{spell_name}%"
+            if class_name:
+                cur.execute(
+                    f"SELECT {cols} FROM spells "
+                    "WHERE LOWER(name) LIKE LOWER(?) "
+                    "AND LOWER(class_name) = LOWER(?) LIMIT 1",
+                    (like, class_name),
+                )
+            else:
+                cur.execute(
+                    f"SELECT {cols} FROM spells "
+                    "WHERE LOWER(name) LIKE LOWER(?) LIMIT 1",
+                    (like,),
+                )
+            row = cur.fetchone()
+    return _row_to_dict(row) if row else {}
+
+
+def get_spells_for_class(
+    class_name: str,
+    spell_level: int | None = None,
+) -> list[dict]:
+    """Return all spells for a class, optionally filtered to a spell level."""
+    with _get_conn(read_only=True) as conn:
+        cur = conn.cursor()
+        if spell_level is not None:
+            cur.execute(
+                "SELECT spell_id, name, class_name, spell_level, school, "
+                "range_text, duration, saving_throw, summary_text "
+                "FROM spells "
+                "WHERE LOWER(class_name) = LOWER(?) AND spell_level = ? "
+                "ORDER BY name",
+                (class_name, spell_level),
+            )
+        else:
+            cur.execute(
+                "SELECT spell_id, name, class_name, spell_level, school, "
+                "range_text, duration, saving_throw, summary_text "
+                "FROM spells "
+                "WHERE LOWER(class_name) = LOWER(?) "
+                "ORDER BY spell_level, name",
+                (class_name,),
+            )
+        return [dict(r) for r in cur.fetchall()]

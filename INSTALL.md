@@ -207,7 +207,7 @@ enough.
 - **macOS:** Click the menu bar icon → **Quit Claude**
 
 After relaunching, open a new chat. Click the tools icon (🔨) in the input bar
-and confirm **greyhawk-solo** is listed with **19 tools**.
+and confirm **greyhawk-solo** is listed with **27 tools**.
 
 ---
 
@@ -249,7 +249,7 @@ Test the MCP server from the terminal before connecting Claude Desktop:
 printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}\n{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}\n' | python server/mcp_server.py
 ```
 
-You should see a JSON response listing 19 tools. If you get an import error,
+You should see a JSON response listing 27 tools. If you get an import error,
 check that the virtual environment is activated and `mcp` is installed.
 
 ---

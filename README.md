@@ -188,7 +188,7 @@ rolls, then call `create_character` to commit the final choices to a new databas
 
 ## MCP Tools
 
-Claude has access to 19 tools automatically:
+Claude has access to 27 tools automatically:
 
 ### Session
 | Tool | What it does |
@@ -219,6 +219,22 @@ Claude has access to 19 tools automatically:
 | `update_world_fact` | Records a campaign fact (quests, weather, rulings) |
 | `update_npc` | Updates an NPC's notes, type, or alignment |
 | `add_npc` | Adds a newly encountered NPC to the database |
+
+### Combat
+| Tool | What it does |
+|---|---|
+| `start_combat` | Initialise an encounter: looks up monster stats, rolls HP for each individual, rolls initiative (d10 + DEX mod for PC), builds full turn order |
+| `get_combat_state` | Current round, initiative order, HP and AC for every combatant |
+| `attack` | Resolve one attack: THAC0 vs AC lookup, damage roll, HP update, morale check; handles PC and monster attacks |
+| `end_combat` | Close the encounter, award XP, clear combat state |
+
+### Spells
+| Tool | What it does |
+|---|---|
+| `get_spell_slots` | Show today's memorized spell list and which slots are expended |
+| `memorize_spells` | Set the memorized spell list for the day (after a long rest) |
+| `cast_spell` | Expend a memorized slot and return full spell description + mechanical reminders |
+| `rest` | Long rest (8h): restore all spell slots, recover 1 HP/level, advance calendar. Short rest (1h): advance time only |
 
 ### Character Setup
 | Tool | What it does |
@@ -280,7 +296,7 @@ greyhawk-solo/
 │   ├── ddl.sql               # DDL only — used internally for fast new-DB creation
 │   └── new_character_template.sql  # Manual fill-in-the-blanks alternative
 ├── server/
-│   └── mcp_server.py         # FastMCP server; 18 tools; connects to Claude Desktop
+│   └── mcp_server.py         # FastMCP server; 27 tools; connects to Claude Desktop
 ├── saves/                    # Your campaign DB goes here (git-ignored)
 │   └── .gitkeep
 ├── create_character.py       # Interactive character creation CLI
@@ -326,7 +342,7 @@ echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":
 {"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' | python server/mcp_server.py
 ```
 
-You should see 19 tools listed in the response.
+You should see 27 tools listed in the response.
 
 ---
 

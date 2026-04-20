@@ -31,6 +31,18 @@ Tools exposed:
   update_npc               -- Change notes, status, race, alignment on an NPC
   add_npc                  -- Add a new NPC and optional relationship to Theron
 
+  COMBAT
+  start_combat         -- Initialize encounter, roll initiative, build turn order
+  get_combat_state     -- Current HP, initiative order, round number
+  attack               -- Resolve one attack: roll to-hit, damage, HP update, morale
+  end_combat           -- Close encounter, award XP, clear combat state
+
+  SPELLS
+  get_spell_slots      -- Memorized spells and remaining slots for today
+  memorize_spells      -- Set today's memorized spell list
+  cast_spell           -- Expend a memorized slot, return spell description
+  rest                 -- Long rest: restore spell slots, recover HP, advance calendar
+
 Architecture:
   - FastMCP (mcp 1.27.0) runs over stdio; Claude Desktop connects as a client.
   - All DB access goes through engine/db.py — this file contains zero SQL.
@@ -76,6 +88,13 @@ from engine.db import (
     add_npc                  as db_add_npc,
     # Create — new campaign
     create_character_db      as db_create_character_db,
+    # Phase 2 — combat
+    get_active_combat, set_active_combat, clear_active_combat,
+    lookup_monster, get_attack_target_roll,
+    _xp_for_hd, _roll_monster_hp, _roll_damage,
+    _CLASS_MATRIX_PRIORITY,
+    # Phase 2 — spells
+    get_spell_memory, set_spell_memory, lookup_spell, get_spells_for_class,
 )
 
 # ── Server instance ────────────────────────────────────────────────────────────
@@ -1032,6 +1051,1073 @@ def session_start() -> dict:
             "should exist only in chat history."
         ),
     }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PHASE 2A — COMBAT TRACKER
+# ══════════════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def start_combat(
+    encounter_name: Annotated[
+        str,
+        "Brief name for this encounter, e.g. 'Goblin ambush at the ford'.",
+    ],
+    enemies: Annotated[
+        str,
+        "JSON list of enemy groups. Each entry needs 'name' (monster name) and "
+        "'count' (number of that monster). Optional: 'hp_override' (int, sets HP "
+        "instead of rolling), 'ac_override' (int). "
+        "Example: '[{\"name\": \"Goblin\", \"count\": 3}, "
+        "{\"name\": \"Hobgoblin\", \"count\": 1}]'",
+    ],
+    location: Annotated[
+        str,
+        "Current location for the encounter log.",
+    ] = "",
+) -> dict:
+    """
+    Initialise a new combat encounter.
+
+    Looks up each enemy type in the monsters table, rolls HP for every
+    individual, rolls initiative for all sides (d10 per combatant, DEX
+    modifier applied to PC), builds the full initiative order, and stores
+    the complete combat state in world_facts so every subsequent tool call
+    can read and update it.
+
+    Returns the full initiative order with opening HP and AC for every
+    combatant. Narrate the scene, then begin calling attack() in initiative
+    order each round.
+
+    Note: if a monster name is not found in the database, a generic stat
+    block is generated (AC 10, 1 HD, 1-6 damage, 1 attack).
+    """
+    # ── Parse enemies ─────────────────────────────────────────────────────────
+    try:
+        enemy_groups = json.loads(enemies)
+        if not isinstance(enemy_groups, list):
+            return {"error": "enemies must be a JSON list."}
+    except json.JSONDecodeError as e:
+        return {"error": f"Invalid enemies JSON: {e}"}
+
+    # ── Load PC state ──────────────────────────────────────────────────────────
+    char    = load_character()
+    status  = char.get("status", {})
+    classes = char.get("classes", [])
+
+    pc_hp_cur = status.get("hp_current", 1)
+    pc_hp_max = status.get("hp_max", 1)
+    pc_ac     = status.get("ac", 10)
+
+    # DEX initiative modifier (-3 to +3 mapped from AC modifier range)
+    abilities  = char.get("abilities", {})
+    dex        = abilities.get("dexterity") or 10
+    dex_init   = {3: -3, 4: -2, 5: -2, 6: -1, 7: -1, 8: -1,
+                  15: 1, 16: 1, 17: 2, 18: 3}.get(dex, 0)
+
+    pc_init = random.randint(1, 10) + dex_init
+
+    combatants: dict = {
+        "PC": {
+            "name":       char.get("name", "PC"),
+            "side":       "party",
+            "initiative": pc_init,
+            "hp_current": pc_hp_cur,
+            "hp_max":     pc_hp_max,
+            "ac":         pc_ac,
+            "classes":    classes,
+            "is_pc":      True,
+            "status":     "active",
+        }
+    }
+
+    groups: dict = {}
+
+    # ── Build enemy combatants ─────────────────────────────────────────────────
+    for grp in enemy_groups:
+        mname = grp.get("name", "Unknown")
+        count = max(1, int(grp.get("count", 1)))
+        mdata = lookup_monster(mname)
+
+        hd_text   = mdata.get("hit_dice", "1") if mdata else "1"
+        raw_ac    = mdata.get("armor_class", "10") if mdata else "10"
+        damage    = mdata.get("damage", "1-6") if mdata else "1-6"
+        num_atk   = mdata.get("number_of_attacks", "1") if mdata else "1"
+        disp_name = mdata.get("name", mname) if mdata else mname
+
+        try:
+            base_ac = int(str(raw_ac).strip().split("/")[0])
+        except ValueError:
+            base_ac = 10
+
+        try:
+            n_attacks = int(str(num_atk).strip().split("/")[0])
+        except ValueError:
+            n_attacks = 1
+
+        group_key = disp_name
+        groups[group_key] = {
+            "initial_count": count,
+            "current_count":  count,
+            "morale_broken":  False,
+        }
+
+        for i in range(1, count + 1):
+            cid = f"{disp_name}_{i}"
+            hp_roll, eff_hd = _roll_monster_hp(hd_text)
+            hp  = int(grp.get("hp_override", hp_roll))
+            ac  = int(grp.get("ac_override", base_ac))
+            xp  = _xp_for_hd(eff_hd)
+
+            combatants[cid] = {
+                "name":        f"{disp_name} {i}",
+                "side":        "enemy",
+                "initiative":  random.randint(1, 10),
+                "hp_current":  hp,
+                "hp_max":      hp,
+                "ac":          ac,
+                "hd_text":     hd_text,
+                "effective_hd": eff_hd,
+                "damage_text": damage,
+                "num_attacks": n_attacks,
+                "xp":          xp,
+                "is_pc":       False,
+                "status":      "active",
+                "group":       group_key,
+            }
+
+    # ── Sort initiative order (highest first, PC wins ties) ───────────────────
+    order = sorted(
+        combatants.keys(),
+        key=lambda cid: (combatants[cid]["initiative"], 1 if cid == "PC" else 0),
+        reverse=True,
+    )
+
+    state = {
+        "encounter_name": encounter_name,
+        "location":       location,
+        "round":          1,
+        "status":         "active",
+        "combatants":     combatants,
+        "initiative_order": order,
+        "current_actor_index": 0,
+        "groups":         groups,
+        "combat_log":     [
+            f"Round 1 begins. Initiative: "
+            + ", ".join(
+                f"{combatants[cid]['name']}({combatants[cid]['initiative']})"
+                for cid in order
+            )
+        ],
+    }
+
+    set_active_combat(state)
+
+    # ── Return summary ─────────────────────────────────────────────────────────
+    return {
+        "encounter_name":    encounter_name,
+        "round":             1,
+        "initiative_order": [
+            {
+                "id":         cid,
+                "name":       combatants[cid]["name"],
+                "side":       combatants[cid]["side"],
+                "initiative": combatants[cid]["initiative"],
+                "hp":         combatants[cid]["hp_current"],
+                "ac":         combatants[cid]["ac"],
+            }
+            for cid in order
+        ],
+        "note": (
+            "Combat state saved. Call attack(attacker_id, target_id, ...) "
+            "in initiative order. Call get_combat_state() to review current HP "
+            "at any time. Call end_combat() when the encounter concludes."
+        ),
+    }
+
+
+@mcp.tool()
+def get_combat_state() -> dict:
+    """
+    Return the full current combat state.
+
+    Includes initiative order, current HP and status for every combatant,
+    round number, and the last 10 entries of the combat log.
+
+    Call this at the start of any round to verify current state before
+    narrating. If no combat is active, returns an informational message.
+    """
+    state = get_active_combat()
+    if not state:
+        return {
+            "active": False,
+            "message": "No combat is currently active. Call start_combat() to begin an encounter.",
+        }
+
+    combatants = state.get("combatants", {})
+    order      = state.get("initiative_order", [])
+
+    return {
+        "active":          True,
+        "encounter_name":  state.get("encounter_name", ""),
+        "location":        state.get("location", ""),
+        "round":           state.get("round", 1),
+        "current_actor":   order[state.get("current_actor_index", 0)] if order else "",
+        "initiative_order": [
+            {
+                "id":         cid,
+                "name":       combatants[cid]["name"],
+                "side":       combatants[cid]["side"],
+                "initiative": combatants[cid]["initiative"],
+                "hp_current": combatants[cid]["hp_current"],
+                "hp_max":     combatants[cid]["hp_max"],
+                "ac":         combatants[cid]["ac"],
+                "status":     combatants[cid]["status"],
+            }
+            for cid in order
+            if cid in combatants
+        ],
+        "combat_log": state.get("combat_log", [])[-10:],
+    }
+
+
+@mcp.tool()
+def attack(
+    attacker_id: Annotated[
+        str,
+        "ID of the attacker. Use 'PC' for the player character, or the "
+        "enemy ID exactly as shown in get_combat_state (e.g. 'Goblin_1').",
+    ],
+    target_id: Annotated[
+        str,
+        "ID of the target. 'PC' or an enemy ID.",
+    ],
+    weapon: Annotated[
+        str,
+        "Weapon or attack name for the log (e.g. 'longsword', 'claw', 'bite').",
+    ] = "",
+    damage_dice: Annotated[
+        str,
+        "Damage expression for PC attacks — e.g. '1d8', '1d6+2', '2d4'. "
+        "Ignored when the attacker is a monster (uses monster damage from DB).",
+    ] = "1d6",
+    attack_bonus: Annotated[
+        int,
+        "Bonus added to the d20 attack roll (magic weapon, spell, position).",
+    ] = 0,
+    damage_bonus: Annotated[
+        int,
+        "Bonus added to damage (STR bonus, magic weapon, spell).",
+    ] = 0,
+) -> dict:
+    """
+    Resolve one attack roll for one attacker against one target.
+
+    For PC attackers:
+      - Finds the best available attack matrix (Fighter > Thief > Cleric > MU).
+      - Looks up the target roll for the target's AC from combat_attack_matrix_entries.
+      - Rolls 1d20 + attack_bonus vs that target roll.
+      - On a hit, rolls damage_dice + damage_bonus.
+
+    For monster attackers:
+      - Uses the fighter_matrix at the monster's effective HD as level.
+      - Rolls damage from the monster's damage_text in the combat state.
+      - Monsters with multiple attacks make one roll per attack.
+
+    Updates HP in the combat state. If a combatant reaches 0 HP it is marked
+    dead and removed from the initiative order for subsequent rounds. Checks
+    monster group morale when casualties exceed 50% of the group's initial count.
+
+    Returns the full attack resolution: roll, whether it hit, damage dealt,
+    remaining HP, and any morale/death results.
+    """
+    state = get_active_combat()
+    if not state:
+        return {"error": "No active combat. Call start_combat() first."}
+
+    combatants = state["combatants"]
+    if attacker_id not in combatants:
+        return {"error": f"Attacker '{attacker_id}' not found in combat. "
+                         f"Valid IDs: {list(combatants.keys())}"}
+    if target_id not in combatants:
+        return {"error": f"Target '{target_id}' not found in combat. "
+                         f"Valid IDs: {list(combatants.keys())}"}
+
+    attacker = combatants[attacker_id]
+    target   = combatants[target_id]
+
+    if attacker["status"] != "active":
+        return {"error": f"{attacker['name']} is {attacker['status']} and cannot attack."}
+    if target["status"] != "active":
+        return {"error": f"{target['name']} is already {target['status']}."}
+
+    target_ac = target["ac"]
+    result    = {"attacker": attacker["name"], "target": target["name"],
+                 "weapon": weapon or "attack"}
+
+    # ── Determine attack rolls ─────────────────────────────────────────────────
+    attacks_made = []
+
+    if attacker["is_pc"]:
+        # Best available matrix
+        classes_lower = {c["class_name"].lower(): c["level"]
+                         for c in attacker.get("classes", [])}
+        matrix_code = "magic_user_matrix"
+        matrix_level = 1
+        for cls_key, mat in _CLASS_MATRIX_PRIORITY:
+            if cls_key in classes_lower:
+                matrix_code  = mat
+                matrix_level = classes_lower[cls_key]
+                break
+
+        target_roll = get_attack_target_roll(matrix_code, matrix_level, target_ac)
+        d20         = random.randint(1, 20)
+        total_roll  = d20 + attack_bonus
+        hit         = total_roll >= target_roll or d20 == 20
+        critical    = d20 == 20
+        fumble      = d20 == 1 and not hit
+
+        # Parse and roll PC damage
+        try:
+            m = re.match(r"^(\d+)[dD](\d+)([+-]\d+)?$", damage_dice.strip())
+            if m:
+                n, s   = int(m.group(1)), int(m.group(2))
+                d_mod  = int(m.group(3)) if m.group(3) else 0
+                dmg_roll = sum(random.randint(1, s) for _ in range(n)) + d_mod
+            else:
+                # Try "A-B" notation
+                m2 = re.match(r"^(\d+)-(\d+)$", damage_dice.strip())
+                dmg_roll = random.randint(int(m2.group(1)), int(m2.group(2))) if m2 else random.randint(1, 6)
+        except Exception:
+            dmg_roll = random.randint(1, 6)
+
+        damage_dealt = max(1, dmg_roll + damage_bonus) if hit else 0
+        attacks_made.append({
+            "d20": d20, "attack_bonus": attack_bonus,
+            "total": total_roll, "target_roll": target_roll,
+            "hit": hit, "critical": critical, "fumble": fumble,
+            "damage_roll": dmg_roll, "damage_bonus": damage_bonus,
+            "damage_dealt": damage_dealt,
+        })
+        total_damage = damage_dealt
+
+    else:
+        # Monster attacking: use fighter_matrix at effective HD
+        eff_hd       = attacker.get("effective_hd", 1.0)
+        matrix_level = max(1, int(eff_hd))
+        n_attacks    = attacker.get("num_attacks", 1)
+        dmg_text     = attacker.get("damage_text", "1-6")
+        total_damage = 0
+
+        for _ in range(n_attacks):
+            target_roll = get_attack_target_roll("fighter_matrix", matrix_level, target_ac)
+            d20         = random.randint(1, 20)
+            total_roll  = d20 + attack_bonus
+            hit         = total_roll >= target_roll or d20 == 20
+            critical    = d20 == 20
+            fumble      = d20 == 1 and not hit
+            # One damage value per attack (take the first damage expression for multi-attack)
+            dmg_parts = dmg_text.split("/")
+            this_dmg_text = dmg_parts[min(len(attacks_made), len(dmg_parts) - 1)]
+            rolls_list = _roll_damage(this_dmg_text)
+            dmg_roll = rolls_list[0] if rolls_list else 1
+            damage_dealt = max(1, dmg_roll + damage_bonus) if hit else 0
+            total_damage += damage_dealt
+            attacks_made.append({
+                "d20": d20, "attack_bonus": attack_bonus,
+                "total": total_roll, "target_roll": target_roll,
+                "hit": hit, "critical": critical, "fumble": fumble,
+                "damage_roll": dmg_roll, "damage_bonus": damage_bonus,
+                "damage_dealt": damage_dealt,
+            })
+
+    # ── Apply damage ───────────────────────────────────────────────────────────
+    new_hp   = target["hp_current"] - total_damage
+    dead     = new_hp <= 0
+    new_hp   = max(0, new_hp)
+    combatants[target_id]["hp_current"] = new_hp
+    result["total_damage"] = total_damage
+    result["target_hp_remaining"] = new_hp
+    result["attacks"] = attacks_made
+
+    if dead:
+        combatants[target_id]["status"] = "dead"
+        result["target_status"] = "dead"
+        # Remove from initiative order for next round
+        state["initiative_order"] = [
+            cid for cid in state["initiative_order"] if cid != target_id
+        ]
+    else:
+        result["target_status"] = "active"
+
+    # ── Morale check for monster groups ───────────────────────────────────────
+    morale_result = None
+    if dead and not target.get("is_pc", False):
+        grp_key = target.get("group")
+        if grp_key and grp_key in state.get("groups", {}):
+            grp = state["groups"][grp_key]
+            grp["current_count"] -= 1
+            if (not grp["morale_broken"] and
+                    grp["current_count"] <= grp["initial_count"] // 2):
+                # 50% casualties: morale check (2d6 >= 8 = holds, < 8 = flees)
+                morale_roll = random.randint(1, 6) + random.randint(1, 6)
+                if morale_roll < 8:
+                    grp["morale_broken"] = True
+                    # Mark all living members of this group as fled
+                    for cid, cbt in combatants.items():
+                        if (cbt.get("group") == grp_key and
+                                cbt["status"] == "active"):
+                            cbt["status"] = "fled"
+                    state["initiative_order"] = [
+                        cid for cid in state["initiative_order"]
+                        if combatants.get(cid, {}).get("group") != grp_key
+                    ]
+                    morale_result = {
+                        "roll": morale_roll,
+                        "result": "FLED",
+                        "message": f"Morale check failed (rolled {morale_roll}, needed 8+). "
+                                   f"All remaining {grp_key}s flee the battle!",
+                    }
+                else:
+                    morale_result = {
+                        "roll": morale_roll,
+                        "result": "holds",
+                        "message": f"Morale check passed (rolled {morale_roll}). {grp_key}s hold their ground.",
+                    }
+
+    if morale_result:
+        result["morale_check"] = morale_result
+
+    # ── Advance initiative index ───────────────────────────────────────────────
+    order = state["initiative_order"]
+    idx   = state["current_actor_index"]
+    if order:
+        idx = (idx + 1) % len(order)
+        if idx == 0:
+            state["round"] += 1
+            state["combat_log"].append(f"Round {state['round']} begins.")
+    state["current_actor_index"] = idx
+
+    # ── Combat log entry ───────────────────────────────────────────────────────
+    weapon_str = f" with {weapon}" if weapon else ""
+    hit_str    = f"HIT for {total_damage} damage" if total_damage > 0 else "MISS"
+    state["combat_log"].append(
+        f"R{state['round']}: {attacker['name']} attacks {target['name']}{weapon_str} — "
+        f"{hit_str}. {target['name']} HP: {new_hp}/{combatants[target_id]['hp_max']}."
+        + (f" {morale_result['message']}" if morale_result else "")
+        + (" DEAD." if dead else "")
+    )
+
+    # ── Check if combat should auto-end ───────────────────────────────────────
+    living_enemies = [c for c in combatants.values()
+                      if not c["is_pc"] and c["status"] == "active"]
+    if not living_enemies:
+        result["combat_over"] = True
+        result["combat_over_message"] = (
+            "All enemies are dead or fled. Call end_combat(result='victory') "
+            "to award XP and close the encounter."
+        )
+
+    state["combatants"] = combatants
+    set_active_combat(state)
+
+    return result
+
+
+@mcp.tool()
+def end_combat(
+    result: Annotated[
+        str,
+        "Combat outcome: 'victory', 'retreat', 'tpk', 'surrendered', 'fled'.",
+    ],
+    xp_override: Annotated[
+        int,
+        "XP to award. Pass 0 to auto-calculate from the XP values of all "
+        "dead/fled enemies in the combat state.",
+    ] = 0,
+    notes: Annotated[
+        str,
+        "Any narrative notes about how the combat ended.",
+    ] = "",
+) -> dict:
+    """
+    Close the current combat encounter.
+
+    Calculates XP earned from defeated enemies (or uses xp_override).
+    For multi-class characters, XP is divided equally among classes.
+    Updates class_levels XP totals in the database.
+    Writes a combat summary to world_facts (category 'combat_history').
+    Clears the active_combat state.
+
+    Returns a full combat summary including enemies faced, rounds fought,
+    XP awarded per class, and updated class XP totals.
+    """
+    state = get_active_combat()
+    if not state:
+        return {"error": "No active combat to end."}
+
+    combatants = state.get("combatants", {})
+    groups     = state.get("groups", {})
+
+    # ── XP calculation ────────────────────────────────────────────────────────
+    if xp_override > 0:
+        total_xp = xp_override
+        xp_source = "manual override"
+    else:
+        total_xp = sum(
+            c["xp"] for c in combatants.values()
+            if not c.get("is_pc", False) and c["status"] in ("dead", "fled")
+        )
+        xp_source = "auto-calculated from defeated enemies"
+
+    # ── Award XP to character classes ─────────────────────────────────────────
+    xp_updates = []
+    if result in ("victory", "surrendered") and total_xp > 0:
+        from engine.db import _get_conn as _ec, _PC_CHARACTER_ID as _pc_id
+        with _ec(read_only=True) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT class_level_id, class_name, level, xp "
+                "FROM class_levels WHERE character_id = ?",
+                (_pc_id,),
+            )
+            class_rows = [dict(r) for r in cur.fetchall()]
+
+        share = total_xp // max(1, len(class_rows))  # equal split for multi-class
+        with _ec() as conn:
+            for cls in class_rows:
+                new_xp = cls["xp"] + share
+                conn.execute(
+                    "UPDATE class_levels SET xp = ? "
+                    "WHERE class_level_id = ?",
+                    (new_xp, cls["class_level_id"]),
+                )
+                xp_updates.append({
+                    "class_name": cls["class_name"],
+                    "level":      cls["level"],
+                    "xp_before":  cls["xp"],
+                    "xp_gained":  share,
+                    "xp_after":   new_xp,
+                })
+
+    # ── Write combat summary to world_facts ───────────────────────────────────
+    enemy_summary = [
+        f"{grp}: {g['initial_count'] - g['current_count']}/{g['initial_count']} killed"
+        for grp, g in groups.items()
+    ]
+    summary_text = (
+        f"Combat: {state.get('encounter_name', 'Unknown')} | "
+        f"Result: {result} | Rounds: {state.get('round', 1)} | "
+        f"XP: {total_xp} | Enemies: {'; '.join(enemy_summary) or 'none'}"
+        + (f" | Notes: {notes}" if notes else "")
+    )
+    from engine.db import _get_conn as _ec2, _CAMPAIGN_ID as _cid
+    with _ec2() as conn:
+        conn.execute(
+            "INSERT INTO world_facts "
+            "(campaign_id, category, fact_text, source_note) "
+            "VALUES (?, 'combat_history', ?, 'combat_tracker')",
+            (_cid, summary_text),
+        )
+
+    clear_active_combat()
+
+    return {
+        "encounter_name":  state.get("encounter_name", ""),
+        "result":          result,
+        "rounds_fought":   state.get("round", 1),
+        "total_xp_earned": total_xp,
+        "xp_source":       xp_source,
+        "xp_per_class":    xp_updates,
+        "enemy_summary":   enemy_summary,
+        "combat_log":      state.get("combat_log", []),
+        "notes":           notes,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PHASE 2B — SPELL SYSTEM
+# ══════════════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def get_spell_slots() -> dict:
+    """
+    Return the character's memorized spells and slot availability for today.
+
+    Reads the character's current class levels, computes total spell slots
+    from classes.json (AD&D 1e tables), then cross-references with the
+    spell_memory world_fact to show which slots are expended.
+
+    Returns:
+      slots_total   -- slots available per class per spell level at current level
+      memorized     -- full list of memorized spells with expended status
+      available     -- only the non-expended memorized spells (ready to cast)
+      expended      -- spells already cast this day
+      has_unmemorized_slots -- True if any available slot has no spell assigned
+
+    Call memorize_spells() after a rest to set today's spell list.
+    """
+    import json as _json
+    from pathlib import Path as _Path
+
+    # Load classes.json for spell slot tables
+    classes_data_path = _ROOT / "data" / "classes.json"
+    with open(classes_data_path, encoding="utf-8") as f:
+        classes_data = _json.load(f)
+
+    # Load PC class levels
+    from engine.db import _get_conn as _ec, _PC_CHARACTER_ID as _pc_id
+    with _ec(read_only=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT class_name, level FROM class_levels WHERE character_id = ?",
+            (_pc_id,),
+        )
+        class_levels = {r["class_name"]: r["level"] for r in cur.fetchall()}
+
+    # Compute total slots
+    slots_total: dict = {}
+    for cls_name, lvl in class_levels.items():
+        cls_data = classes_data.get(cls_name, {})
+        slot_table = cls_data.get("spell_slots", {})
+        if not slot_table:
+            continue  # Fighters etc. have no spell slots
+        lvl_key = str(lvl)
+        if lvl_key not in slot_table:
+            # Find closest level <= current
+            avail = [int(k) for k in slot_table if int(k) <= lvl]
+            if not avail:
+                continue
+            lvl_key = str(max(avail))
+        row = slot_table[lvl_key]  # list of 9 values
+        slots_total[cls_name] = {
+            f"level_{i + 1}": row[i]
+            for i in range(len(row))
+            if row[i] > 0
+        }
+
+    # Load spell memory
+    memory = get_spell_memory()
+    memorized = memory.get("memorized", [])
+
+    available = [s for s in memorized if not s.get("expended", False)]
+    expended  = [s for s in memorized if s.get("expended", False)]
+
+    # Compute unmemorized slots
+    memorized_by_class: dict = {}
+    for slot in memorized:
+        key = (slot.get("class_name", ""), slot.get("spell_level", 1))
+        memorized_by_class[key] = memorized_by_class.get(key, 0) + 1
+
+    has_unmemorized = False
+    for cls, levels in slots_total.items():
+        cls_norm = cls.lower().replace("-", "_").replace(" ", "_")
+        for lvl_key, count in levels.items():
+            sp_lvl = int(lvl_key.split("_")[1])
+            used = sum(
+                v for (cn, sl), v in memorized_by_class.items()
+                if cn.lower().replace("-", "_").replace(" ", "_") == cls_norm
+                and sl == sp_lvl
+            )
+            if used < count:
+                has_unmemorized = True
+
+    return {
+        "slots_total":           slots_total,
+        "memorized":             memorized,
+        "available":             available,
+        "expended":              expended,
+        "last_rest":             memory.get("last_rest"),
+        "has_unmemorized_slots": has_unmemorized,
+        "note": (
+            "Call memorize_spells() after a rest to set today's spell list. "
+            "Call cast_spell() to expend a memorized slot."
+        ) if has_unmemorized else None,
+    }
+
+
+@mcp.tool()
+def memorize_spells(
+    spells: Annotated[
+        str,
+        "JSON list of spell names to memorize today. Repeat the same name "
+        "to memorize it multiple times. "
+        "Example: '[\"Magic Missile\", \"Magic Missile\", \"Sleep\", \"Fireball\"]'",
+    ],
+    class_name: Annotated[
+        str,
+        "Class these spells belong to — 'magic_user', 'cleric', 'illusionist', "
+        "'druid'. Required if the character has multiple spellcasting classes.",
+    ] = "",
+) -> dict:
+    """
+    Set today's memorized spell list for one spellcasting class.
+
+    Looks up each spell name in the database to confirm it exists and
+    retrieve its level. Validates that the memorized list does not exceed
+    the slots available at the character's current level (from classes.json).
+
+    Replaces any existing memorization for this class. Does not affect
+    memorized spells from other classes.
+
+    Returns the full memorized list with spell details, and remaining
+    available slots per level after memorization.
+    """
+    import json as _json
+
+    # Parse spell list
+    try:
+        spell_names = _json.loads(spells)
+        if not isinstance(spell_names, list):
+            return {"error": "spells must be a JSON list of strings."}
+    except _json.JSONDecodeError as e:
+        return {"error": f"Invalid spells JSON: {e}"}
+
+    # Resolve class name
+    cls_raw  = class_name.lower().replace("-", "_").replace(" ", "_") if class_name else ""
+
+    # Load class data for slot validation
+    classes_data_path = _ROOT / "data" / "classes.json"
+    with open(classes_data_path, encoding="utf-8") as f:
+        classes_data = _json.load(f)
+
+    from engine.db import _get_conn as _ec, _PC_CHARACTER_ID as _pc_id
+    with _ec(read_only=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT class_name, level FROM class_levels WHERE character_id = ?",
+            (_pc_id,),
+        )
+        class_levels = {r["class_name"]: r["level"] for r in cur.fetchall()}
+
+    # Find the correct class key in classes.json
+    target_cls_key = None
+    for cls_key in class_levels:
+        normalized = cls_key.lower().replace("-", "_").replace(" ", "_")
+        if not cls_raw or normalized == cls_raw or cls_raw in normalized:
+            cls_data = classes_data.get(cls_key, {})
+            if cls_data.get("spell_slots"):
+                target_cls_key = cls_key
+                break
+
+    if not target_cls_key:
+        # Try spellcasting class by name in DB
+        for cls_key, lvl in class_levels.items():
+            cls_data = classes_data.get(cls_key, {})
+            if cls_data.get("spell_slots"):
+                target_cls_key = cls_key
+                break
+
+    if not target_cls_key:
+        return {"error": "No spellcasting class found for this character."}
+
+    cls_level = class_levels[target_cls_key]
+    slot_table = classes_data[target_cls_key]["spell_slots"]
+    lvl_key = str(cls_level)
+    if lvl_key not in slot_table:
+        avail = [int(k) for k in slot_table if int(k) <= cls_level]
+        lvl_key = str(max(avail)) if avail else "1"
+    max_slots = slot_table[lvl_key]  # list indexed by spell_level-1
+
+    # DB class_name stored as e.g. 'magic_user'
+    db_class_name = target_cls_key.lower().replace("-", "_").replace(" ", "_")
+
+    # Look up each spell, count by level
+    resolved: list[dict] = []
+    errors:   list[str]  = []
+    counts_by_level: dict[int, int] = {}
+
+    for i, name in enumerate(spell_names):
+        spell = lookup_spell(name, db_class_name)
+        if not spell:
+            spell = lookup_spell(name)  # try without class filter
+        if not spell:
+            errors.append(f"Spell '{name}' not found in database.")
+            continue
+        sp_lvl = spell.get("spell_level", 1)
+        counts_by_level[sp_lvl] = counts_by_level.get(sp_lvl, 0) + 1
+
+        # Validate slot count
+        slot_limit = max_slots[sp_lvl - 1] if sp_lvl - 1 < len(max_slots) else 0
+        if counts_by_level[sp_lvl] > slot_limit:
+            errors.append(
+                f"Cannot memorize {counts_by_level[sp_lvl]} level-{sp_lvl} spells — "
+                f"only {slot_limit} slot(s) available at {target_cls_key} level {cls_level}."
+            )
+            continue
+
+        resolved.append({
+            "slot_id":    f"{db_class_name}_{sp_lvl}_{counts_by_level[sp_lvl]}",
+            "spell_id":   spell["spell_id"],
+            "name":       spell["name"],
+            "class_name": db_class_name,
+            "spell_level": sp_lvl,
+            "school":     spell.get("school", ""),
+            "expended":   False,
+        })
+
+    if errors:
+        return {"error": errors, "resolved_before_error": resolved}
+
+    # Merge with existing memory (keep other classes)
+    memory    = get_spell_memory()
+    existing  = [
+        s for s in memory.get("memorized", [])
+        if s.get("class_name", "").replace("-", "_") != db_class_name
+    ]
+    memory["memorized"] = existing + resolved
+    set_spell_memory(memory)
+
+    return {
+        "memorized":       resolved,
+        "class":           target_cls_key,
+        "level":           cls_level,
+        "total_memorized": len(resolved),
+        "note": f"Memorized {len(resolved)} spells for {target_cls_key}. "
+                "Call cast_spell() to expend a slot during play.",
+    }
+
+
+@mcp.tool()
+def cast_spell(
+    spell_name: Annotated[
+        str,
+        "Name of the spell to cast. Must match a non-expended slot in today's "
+        "memorized list. Partial matches accepted.",
+    ],
+    target: Annotated[
+        str,
+        "Target of the spell (for the session log).",
+    ] = "",
+    notes: Annotated[
+        str,
+        "Any notes about how the spell is being used or conditions that apply.",
+    ] = "",
+) -> dict:
+    """
+    Expend one memorized spell slot and return the spell's full description.
+
+    Finds the first non-expended slot in the memorized list that matches
+    spell_name. Marks it as expended. Retrieves the complete spell record
+    from the spells table including range, duration, area of effect, saving
+    throw, and description.
+
+    Returns everything needed to narrate the spell effect:
+      spell_name, level, school, range, duration, area, saving_throw,
+      summary_text, combat_use_text, description.
+
+    After casting, check if any mechanical results need to be resolved:
+      - If saving_throw is not empty, prompt the DM/player for a save roll
+      - If the spell deals damage, use roll_dice() for the damage expression
+      - If the spell affects HP, call update_character_status()
+    """
+    memory    = get_spell_memory()
+    memorized = memory.get("memorized", [])
+
+    # Find first matching non-expended slot
+    target_slot = None
+    slot_index  = -1
+    for i, slot in enumerate(memorized):
+        if not slot.get("expended", False):
+            if spell_name.lower() in slot["name"].lower():
+                target_slot = slot
+                slot_index  = i
+                break
+
+    if target_slot is None:
+        available_names = [s["name"] for s in memorized if not s.get("expended", False)]
+        return {
+            "error": f"No available slot for '{spell_name}'. "
+                     f"Available spells: {available_names or ['(none — all expended or none memorized)']}"
+        }
+
+    # Mark expended
+    memorized[slot_index]["expended"] = True
+    memory["memorized"] = memorized
+    set_spell_memory(memory)
+
+    # Retrieve full spell data from DB
+    spell_data = lookup_spell(
+        target_slot["name"],
+        target_slot.get("class_name"),
+    )
+
+    remaining = sum(1 for s in memorized if not s.get("expended", False))
+
+    result = {
+        "cast":        True,
+        "spell_name":  target_slot["name"],
+        "spell_level": target_slot.get("spell_level"),
+        "class_name":  target_slot.get("class_name"),
+        "target":      target,
+        "notes":       notes,
+        "slots_remaining_today": remaining,
+    }
+
+    if spell_data:
+        result.update({
+            "school":        spell_data.get("school", ""),
+            "range":         spell_data.get("range_text", ""),
+            "duration":      spell_data.get("duration", ""),
+            "area_of_effect": spell_data.get("area_of_effect", ""),
+            "components":    spell_data.get("components", ""),
+            "casting_time":  spell_data.get("casting_time", ""),
+            "saving_throw":  spell_data.get("saving_throw", ""),
+            "summary_text":  spell_data.get("summary_text", ""),
+            "combat_use":    spell_data.get("combat_use_text", ""),
+            "description":   spell_data.get("description", ""),
+        })
+
+        # Mechanical reminders
+        reminders = []
+        if spell_data.get("saving_throw") and spell_data["saving_throw"].strip():
+            reminders.append(
+                f"Saving throw required: {spell_data['saving_throw']}. "
+                "Use roll_dice('1d20') and compare against target's saving throw score."
+            )
+        if spell_data.get("combat_use_text") and "damage" in spell_data["combat_use_text"].lower():
+            reminders.append(
+                "This spell deals damage — use roll_dice() for the damage roll."
+            )
+        if reminders:
+            result["mechanical_reminders"] = reminders
+
+    return result
+
+
+@mcp.tool()
+def rest(
+    rest_type: Annotated[
+        str,
+        "'long' — 8 hours of sleep: restores all spell slots and HP. "
+        "'short' — 1 hour of rest: no spell recovery, no HP change.",
+    ] = "long",
+    calendar_note: Annotated[
+        str,
+        "Current in-game date/time to record (e.g. '576 CY Fireseek 5, dusk'). "
+        "Leave blank to auto-increment based on last recorded time.",
+    ] = "",
+) -> dict:
+    """
+    Advance time and restore resources after a rest.
+
+    Long rest (8 hours):
+      - Restores all spell slots (clears all expended flags in spell_memory).
+      - Recovers HP: 1 HP per character level (campaign ruling — fast enough
+        for solo play without being trivially instant). HP cannot exceed max.
+      - Advances the in-game calendar by 8 hours (stored in world_facts
+        category 'calendar').
+
+    Short rest (1 hour):
+      - No spell recovery.
+      - No HP recovery.
+      - Advances the in-game calendar by 1 hour.
+
+    Returns updated HP and spell slots after the rest.
+    """
+    import datetime as _dt
+
+    # ── Load PC status ─────────────────────────────────────────────────────────
+    from engine.db import _get_conn as _ec, _PC_CHARACTER_ID as _pc_id, _CAMPAIGN_ID as _cid
+    with _ec(read_only=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT hp_current, hp_max FROM character_status WHERE character_id = ?",
+            (_pc_id,),
+        )
+        row = cur.fetchone()
+
+    hp_cur = row["hp_current"] if row else 0
+    hp_max = row["hp_max"]     if row else 0
+
+    # Total character levels (sum across all classes)
+    with _ec(read_only=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT SUM(level) as total FROM class_levels WHERE character_id = ?",
+            (_pc_id,),
+        )
+        lrow = cur.fetchone()
+    total_levels = (lrow["total"] or 1) if lrow else 1
+
+    result: dict = {"rest_type": rest_type}
+
+    if rest_type.lower().startswith("long"):
+        # ── HP recovery ───────────────────────────────────────────────────────
+        hp_gained  = min(total_levels, hp_max - hp_cur)
+        new_hp     = hp_cur + hp_gained
+        with _ec() as conn:
+            conn.execute(
+                "UPDATE character_status SET hp_current = ? WHERE character_id = ?",
+                (new_hp, _pc_id),
+            )
+
+        # ── Spell slot restoration ────────────────────────────────────────────
+        memory = get_spell_memory()
+        for slot in memory.get("memorized", []):
+            slot["expended"] = False
+        memory["last_rest"] = calendar_note or "after long rest"
+        set_spell_memory(memory)
+
+        restored_slots = sum(
+            1 for s in memory.get("memorized", [])
+            if not s.get("expended", False)
+        )
+
+        result.update({
+            "hp_before":      hp_cur,
+            "hp_after":       new_hp,
+            "hp_gained":      hp_gained,
+            "hp_max":         hp_max,
+            "spell_slots_restored": restored_slots,
+            "hours_passed":   8,
+        })
+
+    else:  # short rest
+        result.update({
+            "hp_before": hp_cur,
+            "hp_after":  hp_cur,
+            "hp_gained": 0,
+            "spell_slots_restored": 0,
+            "hours_passed": 1,
+        })
+
+    # ── Advance calendar ──────────────────────────────────────────────────────
+    hours = result["hours_passed"]
+    if calendar_note:
+        new_time = calendar_note
+    else:
+        # Read existing calendar fact
+        with _ec(read_only=True) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT fact_text FROM world_facts "
+                "WHERE campaign_id = ? AND category = 'calendar' LIMIT 1",
+                (_cid,),
+            )
+            cal_row = cur.fetchone()
+        existing = cal_row["fact_text"] if cal_row else "576 CY (date unknown)"
+        new_time = f"{existing} [+{hours}h]"
+
+    with _ec() as conn:
+        conn.execute(
+            "DELETE FROM world_facts WHERE campaign_id = ? AND category = 'calendar'",
+            (_cid,),
+        )
+        conn.execute(
+            "INSERT INTO world_facts (campaign_id, category, fact_text, source_note) "
+            "VALUES (?, 'calendar', ?, 'rest')",
+            (_cid, new_time),
+        )
+
+    result["calendar_note"] = new_time
+    result["note"] = (
+        "HP recovery: 1 HP per character level per long rest (campaign ruling). "
+        "Spell slots fully restored. Call get_spell_slots() to review."
+        if rest_type.lower().startswith("long")
+        else "Short rest complete. Spell slots not restored."
+    )
+    return result
 
 
 # ══════════════════════════════════════════════════════════════════════════════
