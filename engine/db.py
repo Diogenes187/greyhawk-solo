@@ -2564,3 +2564,841 @@ def _credit_treasury(amount_gp: int) -> None:
             "WHERE treasury_id = 1 AND campaign_id = ?",
             (amount_gp, _CAMPAIGN_ID),
         )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PHASE 5A — TRAVEL & WEATHER SYSTEM
+# Hex-crawl travel · Daily resolution · Weather generation · Getting lost
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ---------------------------------------------------------------------------
+# Movement rates  (miles per day, by mount type and terrain)
+# Foot base: Road 24, Plains 18, Hills/Forest 12, Mountains/Swamp 6  (per spec)
+# Horse multipliers per AD&D 1e PHB/DMG
+# ---------------------------------------------------------------------------
+_BASE_MOVE_MPD: dict[str, dict[str, int]] = {
+    "foot": {
+        "road": 24, "plains": 18, "hills": 12, "forest": 12,
+        "mountains": 6, "swamp": 6, "marsh": 6,
+    },
+    "light_horse": {
+        # Light horse (MV 24"): 2× foot on road/plains; same in rough terrain
+        "road": 48, "plains": 36, "hills": 18, "forest": 12,
+        "mountains": 6, "swamp": 4, "marsh": 4,
+    },
+    "heavy_horse": {
+        # Heavy horse (MV 15"): 1.5× foot on road/plains; modest gain on hills
+        "road": 36, "plains": 27, "hills": 15, "forest": 12,
+        "mountains": 6, "swamp": 3, "marsh": 3,
+    },
+}
+
+# ---------------------------------------------------------------------------
+# Encounter chance per terrain  (numerator, denominator for Xd roll)
+# ---------------------------------------------------------------------------
+_TERRAIN_ENCOUNTER_CHANCE: dict[str, tuple[int, int]] = {
+    "road":      (1, 12),   # safer — infrequent
+    "plains":    (1, 6),
+    "hills":     (1, 6),
+    "forest":    (2, 6),    # denser, more dangerous
+    "mountains": (1, 6),
+    "swamp":     (2, 6),
+    "marsh":     (2, 6),
+}
+
+# ---------------------------------------------------------------------------
+# Getting-lost base chance (% per day)
+# ---------------------------------------------------------------------------
+_TERRAIN_LOST_CHANCE_PCT: dict[str, int] = {
+    "road":      0,    # roads are marked
+    "plains":    5,
+    "hills":     15,
+    "forest":    30,
+    "mountains": 25,
+    "swamp":     40,
+    "marsh":     35,
+}
+
+# ---------------------------------------------------------------------------
+# Outdoor encounter tables  (terrain → [(roll_min, roll_max, monster_name, na_text)])
+# Monsters confirmed present in the DB; all roll ranges span 1–20
+# ---------------------------------------------------------------------------
+_OUTDOOR_ENCOUNTERS: dict[str, list[tuple[int, int, str, str]]] = {
+    "road": [
+        (1,  4,  "Bandit (Brigand)", "2d6"),
+        (5,  7,  "Orc",              "2d6"),
+        (8,  10, "Goblin",           "2d6"),
+        (11, 12, "Wolf",             "1d6"),
+        (13, 14, "Berserker",        "1d4"),
+        (15, 16, "Dog (Wild)",       "2d4"),
+        (17, 18, "Ogre",             "1d3"),
+        (19, 19, "Hill Giant",       "1d2"),
+        (20, 20, "Troll",            "1"),
+    ],
+    "plains": [
+        (1,  3,  "Orc",             "2d6"),
+        (4,  5,  "Goblin",          "2d6"),
+        (6,  7,  "Bandit (Brigand)","2d4"),
+        (8,  9,  "Wolf",            "2d4"),
+        (10, 11, "Berserker",       "1d6"),
+        (12, 12, "Hill Giant",      "1d3"),
+        (13, 13, "Ogre",            "1d4"),
+        (14, 14, "Centaur",         "2d4"),
+        (15, 15, "Griffon",         "1d3"),
+        (16, 16, "Harpy",           "1d4"),
+        (17, 17, "Giant Boar",      "1d4"),
+        (18, 18, "Boar (Wild)",     "1d6"),
+        (19, 19, "Wyvern",          "1d2"),
+        (20, 20, "Chimera",         "1"),
+    ],
+    "forest": [
+        (1,  3,  "Orc",             "2d6"),
+        (4,  5,  "Goblin",          "2d6"),
+        (6,  7,  "Bugbear",         "1d6"),
+        (8,  8,  "Troll",           "1d3"),
+        (9,  9,  "Wolf",            "2d4"),
+        (10, 10, "Wolf, Dire (Worg)","1d4"),
+        (11, 11, "Black Bear",      "1d3"),
+        (12, 12, "Brown Bear",      "1d2"),
+        (13, 13, "Giant Boar",      "1d3"),
+        (14, 14, "Bandit (Brigand)","2d4"),
+        (15, 15, "Elf",             "2d6"),
+        (16, 16, "Dryad",           "1d4"),
+        (17, 17, "Treant",          "1d2"),
+        (18, 18, "Green Dragon",    "1"),
+        (19, 19, "Tiger",           "1d2"),
+        (20, 20, "Wyvern",          "1"),
+    ],
+    "hills": [
+        (1,  3,  "Orc",             "2d6"),
+        (4,  5,  "Goblin",          "2d6"),
+        (6,  7,  "Bugbear",         "1d6"),
+        (8,  8,  "Ogre",            "1d4"),
+        (9,  9,  "Hill Giant",      "1d3"),
+        (10, 10, "Stone Giant",     "1d2"),
+        (11, 11, "Troll",           "1d3"),
+        (12, 12, "Gnome",           "2d6"),
+        (13, 13, "Dwarf",           "2d6"),
+        (14, 14, "Mountain Lion",   "1d2"),
+        (15, 15, "Giant Eagle",     "1d3"),
+        (16, 16, "Griffon",         "1d2"),
+        (17, 17, "Wyvern",          "1"),
+        (18, 18, "Berserker",       "1d6"),
+        (19, 19, "Chimera",         "1"),
+        (20, 20, "Black Dragon",    "1"),
+    ],
+    "mountains": [
+        (1,  3,  "Orc",                    "2d4"),
+        (4,  5,  "Bugbear",                "1d4"),
+        (6,  6,  "Stone Giant",            "1d3"),
+        (7,  7,  "Hill Giant",             "1d3"),
+        (8,  8,  "Frost Giant",            "1d2"),
+        (9,  9,  "Troll",                  "1d3"),
+        (10, 10, "Ogre",                   "1d4"),
+        (11, 11, "Mountain Lion",          "1d2"),
+        (12, 12, "Sabre-Tooth Tiger (Smilodon)", "1"),
+        (13, 13, "Wyvern",                 "1d2"),
+        (14, 14, "Griffon",                "1d3"),
+        (15, 15, "Roc",                    "1"),
+        (16, 16, "Giant Eagle",            "1d4"),
+        (17, 17, "White Dragon",           "1"),
+        (18, 18, "Gargoyle",               "1d6"),
+        (19, 19, "Chimera",                "1"),
+        (20, 20, "Purple Worm",            "1"),
+    ],
+    "swamp": [
+        (1,  3,  "Lizard Man",             "2d4"),
+        (4,  5,  "Troll",                  "1d3"),
+        (6,  7,  "Giant Frog",             "2d6"),
+        (8,  8,  "Crocodile",              "2d4"),
+        (9,  9,  "Giant Crocodile",        "1d2"),
+        (10, 10, "Giant Centipede",        "2d6"),
+        (11, 11, "Snake, Giant Constrictor","1d2"),
+        (12, 12, "Snake, Giant Poisonous", "1d3"),
+        (13, 13, "Killer Frog",            "2d4"),
+        (14, 14, "Ghoul",                  "1d6"),
+        (15, 15, "Will-O-(the)-Wisp",      "1d3"),
+        (16, 16, "Black Dragon",           "1"),
+        (17, 17, "Giant Crayfish",         "1d3"),
+        (18, 18, "Wight",                  "1d6"),
+        (19, 19, "Orc",                    "2d4"),
+        (20, 20, "Bugbear",                "1d4"),
+    ],
+    "marsh": [
+        (1,  3,  "Lizard Man",             "2d4"),
+        (4,  5,  "Giant Frog",             "2d6"),
+        (6,  7,  "Crocodile",              "2d4"),
+        (8,  9,  "Giant Centipede",        "2d6"),
+        (10, 10, "Snake, Giant Poisonous", "1d3"),
+        (11, 11, "Killer Frog",            "2d4"),
+        (12, 12, "Troll",                  "1d2"),
+        (13, 13, "Will-O-(the)-Wisp",      "1d3"),
+        (14, 14, "Giant Crayfish",         "1d3"),
+        (15, 15, "Giant Crab",             "1d4"),
+        (16, 16, "Poisonous Frog",         "2d4"),
+        (17, 17, "Ghoul",                  "1d4"),
+        (18, 18, "Black Dragon",           "1"),
+        (19, 19, "Orc",                    "2d4"),
+        (20, 20, "Wight",                  "1d4"),
+    ],
+}
+
+# ---------------------------------------------------------------------------
+# Weather tables  —  Vesve frontier region  (cold temperate, lake-effect)
+# Each table: {element: [(cumulative_d100_threshold, value), ...]}
+# ---------------------------------------------------------------------------
+
+# Temperature ranges (°F) per season: (low, high)
+_SEASON_TEMP_RANGE: dict[str, tuple[int, int]] = {
+    "winter": (-10, 25),
+    "spring": (35, 60),
+    "summer": (65, 88),
+    "autumn": (40, 65),
+}
+
+# Precipitation table: (cumulative_d100_threshold, condition_key)
+_SEASON_PRECIP: dict[str, list[tuple[int, str]]] = {
+    "winter": [
+        (18, "clear"), (38, "overcast"), (55, "light_snow"),
+        (70, "heavy_snow"), (82, "sleet"), (92, "blizzard"),
+        (97, "ice_storm"), (100, "freezing_fog"),
+    ],
+    "spring": [
+        (25, "clear"), (45, "partly_cloudy"), (58, "overcast"),
+        (72, "light_rain"), (84, "heavy_rain"), (91, "thunderstorm"),
+        (95, "light_snow"), (100, "fog"),
+    ],
+    "summer": [
+        (35, "clear"), (55, "partly_cloudy"), (67, "overcast"),
+        (77, "light_rain"), (86, "heavy_rain"), (93, "thunderstorm"),
+        (97, "fog"), (100, "hail"),
+    ],
+    "autumn": [
+        (22, "clear"), (42, "partly_cloudy"), (56, "overcast"),
+        (68, "light_rain"), (80, "heavy_rain"), (88, "fog"),
+        (93, "light_snow"), (97, "sleet"), (100, "thunderstorm"),
+    ],
+}
+
+# Wind table: (cumulative_d100_threshold, condition_key)
+_SEASON_WIND: dict[str, list[tuple[int, str]]] = {
+    "winter": [(15, "calm"), (40, "light"), (65, "moderate"), (83, "strong"), (93, "gale"), (100, "storm")],
+    "spring": [(25, "calm"), (55, "light"), (75, "moderate"), (90, "strong"), (97, "gale"), (100, "storm")],
+    "summer": [(35, "calm"), (60, "light"), (78, "moderate"), (91, "strong"), (97, "gale"), (100, "storm")],
+    "autumn": [(20, "calm"), (48, "light"), (70, "moderate"), (86, "strong"), (95, "gale"), (100, "storm")],
+}
+
+# Movement modifier per precipitation condition
+_PRECIP_MOVE_MOD: dict[str, float] = {
+    "clear":         1.0,
+    "partly_cloudy": 1.0,
+    "overcast":      1.0,
+    "light_rain":    0.75,
+    "heavy_rain":    0.5,
+    "thunderstorm":  0.25,  # dangerous
+    "fog":           0.75,
+    "freezing_fog":  0.5,
+    "light_snow":    0.5,
+    "heavy_snow":    0.25,
+    "sleet":         0.5,
+    "blizzard":      0.0,   # halts travel
+    "ice_storm":     0.0,
+    "hail":          0.5,
+}
+
+# Additional wind movement penalty (applied on top of precip)
+_WIND_MOVE_MOD: dict[str, float] = {
+    "calm":     1.0,
+    "light":    1.0,
+    "moderate": 1.0,
+    "strong":   0.9,
+    "gale":     0.5,
+    "storm":    0.0,
+}
+
+# Visibility (miles) per condition
+_PRECIP_VISIBILITY: dict[str, float] = {
+    "clear":         10.0,
+    "partly_cloudy": 10.0,
+    "overcast":       8.0,
+    "light_rain":     3.0,
+    "heavy_rain":     1.0,
+    "thunderstorm":   0.5,
+    "fog":            0.5,
+    "freezing_fog":   0.25,
+    "light_snow":     2.0,
+    "heavy_snow":     0.5,
+    "sleet":          1.0,
+    "blizzard":       0.1,
+    "ice_storm":      0.25,
+    "hail":           1.0,
+}
+
+# Human-readable labels for weather conditions
+_PRECIP_LABEL: dict[str, str] = {
+    "clear":         "Clear",
+    "partly_cloudy": "Partly Cloudy",
+    "overcast":      "Overcast",
+    "light_rain":    "Light Rain",
+    "heavy_rain":    "Heavy Rain",
+    "thunderstorm":  "Thunderstorm",
+    "fog":           "Fog",
+    "freezing_fog":  "Freezing Fog",
+    "light_snow":    "Light Snow",
+    "heavy_snow":    "Heavy Snow",
+    "sleet":         "Sleet",
+    "blizzard":      "Blizzard",
+    "ice_storm":     "Ice Storm",
+    "hail":          "Hail",
+}
+
+_WIND_LABEL: dict[str, str] = {
+    "calm":     "Calm",
+    "light":    "Light Breeze",
+    "moderate": "Moderate Wind",
+    "strong":   "Strong Wind",
+    "gale":     "Gale",
+    "storm":    "Storm",
+}
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _roll_from_table(table: list[tuple[int, str]]) -> str:
+    """Roll d100 and return the value from the first entry whose threshold >= roll."""
+    roll = random.randint(1, 100)
+    for threshold, value in table:
+        if roll <= threshold:
+            return value
+    return table[-1][1]
+
+
+def _parse_terrain_path(terrain_path: str, total_miles: int) -> list[dict]:
+    """
+    Parse terrain path string into segment list.
+    Formats:
+      "road:20,plains:30,forest:10"  — explicit miles per segment
+      "forest:60"                    — single segment with miles
+      "forest"                       — single segment, uses total_miles
+    Returns [{"terrain": ..., "miles": ..., "miles_remaining": ...}, ...]
+    """
+    segments: list[dict] = []
+    if not terrain_path:
+        return [{"terrain": "plains", "miles": total_miles, "miles_remaining": total_miles}]
+
+    parts = [p.strip() for p in terrain_path.split(",") if p.strip()]
+    explicit_total = 0
+    parsed: list[tuple[str, int | None]] = []
+
+    for part in parts:
+        if ":" in part:
+            name, _, miles_str = part.partition(":")
+            try:
+                m = int(miles_str.strip())
+            except ValueError:
+                m = None
+        else:
+            name = part
+            m = None
+        parsed.append((name.strip().lower().replace(" ", "_"), m))
+        if m is not None:
+            explicit_total += m
+
+    # If no miles were specified, distribute total_miles equally
+    if explicit_total == 0:
+        per_seg = max(1, total_miles // max(len(parsed), 1))
+        for name, _ in parsed:
+            miles = per_seg
+            segments.append({"terrain": name, "miles": miles, "miles_remaining": miles})
+    else:
+        for name, m in parsed:
+            miles = m if m is not None else 0
+            segments.append({"terrain": name, "miles": miles, "miles_remaining": miles})
+
+    return segments
+
+
+def _build_weather_dict(season: str, date_str: str = "") -> dict:
+    """Generate one day's weather for the Vesve frontier region."""
+    season = season.lower().strip()
+    if season not in _SEASON_TEMP_RANGE:
+        season = "summer"
+
+    temp_lo, temp_hi = _SEASON_TEMP_RANGE[season]
+    temperature  = random.randint(temp_lo, temp_hi)
+
+    precip_key   = _roll_from_table(_SEASON_PRECIP[season])
+    wind_key     = _roll_from_table(_SEASON_WIND[season])
+
+    precip_mod   = _PRECIP_MOVE_MOD.get(precip_key, 1.0)
+    wind_mod     = _WIND_MOVE_MOD.get(wind_key, 1.0)
+    move_mod     = round(precip_mod * wind_mod, 2)
+
+    visibility   = _PRECIP_VISIBILITY.get(precip_key, 5.0)
+
+    # Extreme cold check (below 10°F)
+    survival_required = temperature <= 10 and season == "winter"
+
+    # Build conditions list
+    conditions: list[str] = [precip_key]
+    if wind_key not in ("calm", "light"):
+        conditions.append(wind_key)
+    if temperature <= 0:
+        conditions.append("extreme_cold")
+    elif temperature <= 10:
+        conditions.append("bitter_cold")
+
+    # Temp description
+    if temperature <= 0:
+        temp_desc = "Extreme Cold"
+    elif temperature <= 15:
+        temp_desc = "Bitter Cold"
+    elif temperature <= 32:
+        temp_desc = "Freezing"
+    elif temperature <= 45:
+        temp_desc = "Cold"
+    elif temperature <= 60:
+        temp_desc = "Cool"
+    elif temperature <= 75:
+        temp_desc = "Mild"
+    elif temperature <= 85:
+        temp_desc = "Warm"
+    else:
+        temp_desc = "Hot"
+
+    return {
+        "date":                date_str or "unknown",
+        "season":              season,
+        "region":              "vesve_frontier",
+        "temperature_f":       temperature,
+        "temperature_desc":    temp_desc,
+        "precipitation":       precip_key,
+        "precipitation_label": _PRECIP_LABEL.get(precip_key, precip_key),
+        "wind":                wind_key,
+        "wind_label":          _WIND_LABEL.get(wind_key, wind_key),
+        "visibility_miles":    visibility,
+        "movement_modifier":   move_mod,
+        "conditions":          conditions,
+        "survival_check_required": survival_required,
+        "halts_travel":        move_mod == 0.0,
+        "conditions_summary": (
+            f"{_PRECIP_LABEL.get(precip_key, precip_key)}, "
+            f"{_WIND_LABEL.get(wind_key, wind_key)}, "
+            f"{temperature}°F ({temp_desc})"
+        ),
+    }
+
+
+def _resolve_lost(terrain: str, conditions: list[str]) -> dict:
+    """
+    Resolve a getting-lost event: direction, hexes off course, time to reorient.
+    """
+    directions = ["North", "NE", "East", "SE", "South", "SW", "West", "NW"]
+    direction   = directions[random.randint(0, 7)]
+
+    # Hexes off course (6-mile hexes): 1d3
+    hexes_off   = random.randint(1, 3)
+    miles_off   = hexes_off * 6
+
+    # Time to reorient (hours)
+    reorient_roll = random.randint(1, 6)
+    if reorient_roll <= 2:
+        hours_lost  = 2
+        extra_days  = 0
+    elif reorient_roll <= 4:
+        hours_lost  = 4
+        extra_days  = 0
+    else:
+        hours_lost  = 8
+        extra_days  = 1   # full day lost
+
+    return {
+        "direction_off_course": direction,
+        "hexes_off_course":     hexes_off,
+        "miles_off_course":     miles_off,
+        "hours_to_reorient":    hours_lost,
+        "extra_days_lost":      extra_days,
+        "description": (
+            f"Party drifts {hexes_off} hex(es) {direction} of course. "
+            f"Takes {hours_lost} hours to reorient."
+        ),
+    }
+
+
+def _roll_outdoor_encounter(terrain: str) -> dict:
+    """Roll one outdoor encounter for the given terrain. Returns encounter dict."""
+    table  = _OUTDOOR_ENCOUNTERS.get(terrain, _OUTDOOR_ENCOUNTERS["plains"])
+    d20    = random.randint(1, 20)
+
+    for (lo, hi, monster_name, na_text) in table:
+        if lo <= d20 <= hi:
+            count = _roll_number_appearing(na_text) if na_text else 1
+            stats = lookup_monster(monster_name)
+            return {
+                "d20_roll":     d20,
+                "monster_name": monster_name,
+                "count":        count,
+                "terrain":      terrain,
+                "monster_stats": stats or {},
+                "next_steps": (
+                    f"Encounter: {count}x {monster_name} in {terrain}. "
+                    "Check for surprise (1-2 on d6), then call start_combat() "
+                    "or describe how the party avoids/reacts."
+                ),
+            }
+
+    # Fallback
+    return {
+        "d20_roll": d20, "monster_name": "Wolf", "count": 1,
+        "terrain": terrain, "monster_stats": lookup_monster("Wolf") or {},
+        "next_steps": "Lone wolf spotted.",
+    }
+
+
+# ---------------------------------------------------------------------------
+# World-facts persistence helpers
+# ---------------------------------------------------------------------------
+
+def _get_world_fact_json(category: str) -> dict | list | None:
+    """Read a JSON world_fact by category. Returns parsed object or None."""
+    with _get_conn(read_only=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT fact_text FROM world_facts "
+            "WHERE campaign_id = ? AND category = ? LIMIT 1",
+            (_CAMPAIGN_ID, category),
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
+    try:
+        return json.loads(row["fact_text"])
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def _set_world_fact_json(category: str, data: dict | list, source_note: str = "travel_system") -> None:
+    """Upsert a JSON world_fact."""
+    with _get_conn() as conn:
+        conn.execute(
+            "DELETE FROM world_facts WHERE campaign_id = ? AND category = ?",
+            (_CAMPAIGN_ID, category),
+        )
+        conn.execute(
+            "INSERT INTO world_facts (campaign_id, category, fact_text, source_note) "
+            "VALUES (?, ?, ?, ?)",
+            (_CAMPAIGN_ID, category, json.dumps(data), source_note),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def db_generate_weather(season: str, date_str: str = "") -> dict:
+    """
+    Generate today's weather and a 3-day forecast for the Vesve frontier region.
+    Stores both in world_facts. Returns the current day's weather.
+    """
+    today    = _build_weather_dict(season, date_str)
+    forecast = [_build_weather_dict(season, f"day+{i+1}") for i in range(3)]
+
+    # Simplify forecast entries (strip heavy detail)
+    simple_forecast = []
+    for f in forecast:
+        simple_forecast.append({
+            "date":             f["date"],
+            "precipitation_label": f["precipitation_label"],
+            "wind_label":       f["wind_label"],
+            "temperature_f":    f["temperature_f"],
+            "temperature_desc": f["temperature_desc"],
+            "movement_modifier": f["movement_modifier"],
+            "conditions_summary": f["conditions_summary"],
+        })
+
+    _set_world_fact_json("current_weather", today,    "weather_system")
+    _set_world_fact_json("weather_forecast", simple_forecast, "weather_system")
+
+    today["forecast_3_days"] = simple_forecast
+    return today
+
+
+def db_get_current_weather() -> dict:
+    """Return the stored current weather. Generates fresh if none exists."""
+    data = _get_world_fact_json("current_weather")
+    if data and isinstance(data, dict):
+        forecast = _get_world_fact_json("weather_forecast") or []
+        data["forecast_3_days"] = forecast
+        return data
+    # No weather stored yet — return a neutral placeholder
+    return {
+        "error": "No weather generated yet.",
+        "hint":  "Call generate_weather(season='summer') to set today's conditions.",
+    }
+
+
+def db_start_travel(
+    origin:         str,
+    destination:    str,
+    terrain_path:   str,
+    mount_type:     str,
+    total_miles:    int,
+    notes:          str = "",
+) -> dict:
+    """
+    Initialise a new journey and store it in world_facts ('travel_state').
+    Returns the full travel plan.
+    """
+    mount_type = mount_type.lower().replace(" ", "_").replace("-", "_")
+    if mount_type not in _BASE_MOVE_MPD:
+        mount_type = "foot"
+
+    segments = _parse_terrain_path(terrain_path, total_miles)
+
+    # Recalculate total_miles from segments if they have explicit values
+    seg_total = sum(s["miles"] for s in segments)
+    if seg_total > 0:
+        total_miles = seg_total
+
+    # Estimate days per segment
+    total_days_est = 0.0
+    days_breakdown: list[dict] = []
+    for seg in segments:
+        mph = _BASE_MOVE_MPD[mount_type].get(seg["terrain"], 18)
+        days = seg["miles"] / max(mph, 1)
+        total_days_est += days
+        days_breakdown.append({
+            "terrain": seg["terrain"],
+            "miles":   seg["miles"],
+            "miles_per_day": mph,
+            "days_est": round(days, 1),
+        })
+
+    total_days_int = max(1, int(total_days_est + 0.99))  # ceiling
+
+    # Food/water per person
+    food_days_needed  = total_days_int
+    water_pints_day   = 2   # per person per day (AD&D standard)
+
+    # Hex count (6-mile hexes)
+    hexes = round(total_miles / 6, 1)
+
+    state: dict = {
+        "active":               True,
+        "origin":               origin,
+        "destination":          destination,
+        "mount_type":           mount_type,
+        "terrain_segments":     [
+            {**s, "miles_remaining": s["miles"]} for s in segments
+        ],
+        "total_miles":          total_miles,
+        "miles_traveled":       0,
+        "days_elapsed":         0,
+        "total_days_estimate":  total_days_int,
+        "food_days_needed":     food_days_needed,
+        "food_days_consumed":   0,
+        "water_pints_per_day_per_person": water_pints_day,
+        "encounters_log":       [],
+        "weather_delays_days":  0,
+        "lost_extra_days":      0,
+        "notes":                notes,
+    }
+
+    _set_world_fact_json("travel_state", state, "travel_system")
+
+    # Update scene location
+    with _get_conn() as conn:
+        conn.execute(
+            "UPDATE current_scene_state SET updated_at = datetime('now') WHERE id = 1"
+        )
+
+    return {
+        "journey_started":    True,
+        "origin":             origin,
+        "destination":        destination,
+        "mount_type":         mount_type,
+        "total_miles":        total_miles,
+        "total_hexes_6mi":    hexes,
+        "total_days_estimate": total_days_int,
+        "days_breakdown":     days_breakdown,
+        "food_per_person":    f"{food_days_needed} days' rations",
+        "water_per_person":   f"{water_pints_day * total_days_int} pints ({total_days_int} days × {water_pints_day}/day)",
+        "horse_fodder":       f"~{total_days_int * 20} lbs grain per horse" if mount_type != "foot" else None,
+        "notes":              notes,
+        "next_step":          "Call travel_turn() once per day of travel to resolve each day.",
+    }
+
+
+def db_travel_turn() -> dict:
+    """
+    Resolve one day of travel. Updates and persists the travel state.
+
+    1. Reads current weather (generates default if absent).
+    2. Determines today's terrain from the leading segment.
+    3. Calculates actual miles: base × weather_modifier.
+    4. Checks for getting lost (terrain-based chance, doubled in bad weather).
+    5. Rolls for random encounter.
+    6. Consumes resources (1 food-day per person).
+    7. Advances terrain segments; detects journey completion.
+    Returns a full day-report dict.
+    """
+    state = _get_world_fact_json("travel_state")
+    if not state or not state.get("active"):
+        return {"error": "No active journey. Call start_travel() first."}
+
+    segments = state.get("terrain_segments", [])
+    if not segments:
+        state["active"] = False
+        _set_world_fact_json("travel_state", state, "travel_system")
+        return {
+            "journey_complete": True,
+            "day":              state.get("days_elapsed", 0),
+            "destination":      state.get("destination", "unknown"),
+            "total_days":       state.get("days_elapsed", 0),
+            "total_miles":      state.get("miles_traveled", 0),
+        }
+
+    current_terrain = segments[0]["terrain"]
+    mount_type      = state.get("mount_type", "foot")
+
+    # ── Weather ───────────────────────────────────────────────────────────────
+    weather = _get_world_fact_json("current_weather")
+    if not weather or not isinstance(weather, dict):
+        weather = _build_weather_dict("summer")   # silent default
+
+    weather_mod    = weather.get("movement_modifier", 1.0)
+    halted         = weather_mod == 0.0
+    base_move      = _BASE_MOVE_MPD.get(mount_type, _BASE_MOVE_MPD["foot"]).get(current_terrain, 18)
+    actual_move    = round(base_move * weather_mod, 1) if not halted else 0
+
+    # ── Getting Lost ──────────────────────────────────────────────────────────
+    got_lost   = False
+    lost_result: dict = {}
+    if not halted and current_terrain != "road":
+        base_chance = _TERRAIN_LOST_CHANCE_PCT.get(current_terrain, 5)
+        # Double chance in heavy precip or very low visibility
+        if weather_mod <= 0.5:
+            base_chance = min(90, base_chance * 2)
+        if base_chance > 0 and random.randint(1, 100) <= base_chance:
+            got_lost    = True
+            lost_result = _resolve_lost(current_terrain, weather.get("conditions", []))
+            state["lost_extra_days"] = state.get("lost_extra_days", 0) + lost_result.get("extra_days_lost", 0)
+            if lost_result.get("extra_days_lost", 0):
+                state["weather_delays_days"] = state.get("weather_delays_days", 0) + lost_result["extra_days_lost"]
+
+    if halted:
+        state["weather_delays_days"] = state.get("weather_delays_days", 0) + 1
+
+    # ── Consume miles from segments ───────────────────────────────────────────
+    miles_consumed       = 0.0
+    terrains_crossed     = []
+
+    if not halted and not got_lost:
+        miles_left = actual_move
+        while miles_left > 0 and segments:
+            seg = segments[0]
+            take = min(miles_left, seg["miles_remaining"])
+            seg["miles_remaining"] -= take
+            miles_left    -= take
+            miles_consumed += take
+            if seg["terrain"] not in terrains_crossed:
+                terrains_crossed.append(seg["terrain"])
+            if seg["miles_remaining"] <= 0:
+                segments.pop(0)
+
+    state["miles_traveled"]   = state.get("miles_traveled", 0) + miles_consumed
+    state["days_elapsed"]     = state.get("days_elapsed", 0) + 1
+    state["terrain_segments"] = segments
+
+    # ── Random Encounter ──────────────────────────────────────────────────────
+    encounter: dict = {}
+    if not halted and actual_move > 0:
+        chance_num, chance_den = _TERRAIN_ENCOUNTER_CHANCE.get(current_terrain, (1, 6))
+        if random.randint(1, chance_den) <= chance_num:
+            encounter = _roll_outdoor_encounter(current_terrain)
+            state.setdefault("encounters_log", []).append({
+                "day":     state["days_elapsed"],
+                "terrain": current_terrain,
+                "monster": encounter.get("monster_name", ""),
+                "count":   encounter.get("count", 1),
+            })
+
+    # ── Resources ────────────────────────────────────────────────────────────
+    state["food_days_consumed"] = state.get("food_days_consumed", 0) + 1
+    food_remaining = state["food_days_needed"] - state["food_days_consumed"]
+
+    # ── Journey completion ────────────────────────────────────────────────────
+    miles_remaining  = sum(s["miles_remaining"] for s in segments)
+    journey_complete = (miles_remaining <= 0 and not halted)
+
+    if journey_complete:
+        state["active"]                = False
+        state["current_location_desc"] = state.get("destination", "destination")
+
+    _set_world_fact_json("travel_state", state, "travel_system")
+
+    # ── Estimate days remaining ───────────────────────────────────────────────
+    days_remaining_est = 0
+    if miles_remaining > 0 and base_move > 0:
+        days_remaining_est = max(1, int(miles_remaining / base_move + 0.99))
+
+    result: dict = {
+        "day":                    state["days_elapsed"],
+        "terrain":                current_terrain,
+        "terrains_crossed":       terrains_crossed or [current_terrain],
+        "weather_summary":        weather.get("conditions_summary", "Unknown"),
+        "weather_modifier":       weather_mod,
+        "halted_by_weather":      halted,
+        "base_miles_per_day":     base_move,
+        "actual_miles_today":     miles_consumed,
+        "total_miles_traveled":   state["miles_traveled"],
+        "miles_remaining":        miles_remaining,
+        "days_elapsed":           state["days_elapsed"],
+        "days_remaining_estimate": days_remaining_est,
+        "food_days_remaining":    food_remaining,
+        "got_lost":               got_lost,
+        "encounter":              encounter or None,
+        "journey_complete":       journey_complete,
+        "survival_check_required": weather.get("survival_check_required", False),
+    }
+
+    if got_lost:
+        result["lost_result"] = lost_result
+
+    if journey_complete:
+        result["destination_reached"] = state.get("destination", "destination")
+        result["note"] = (
+            f"Journey complete! Arrived at {state.get('destination', 'destination')} "
+            f"after {state['days_elapsed']} days ({state['miles_traveled']:.0f} miles)."
+        )
+    elif halted:
+        result["note"] = (
+            "Severe weather halts travel. The party must shelter for the day. "
+            "Call generate_weather() tomorrow for new conditions, then travel_turn() again."
+        )
+
+    return result
+
+
+def db_get_lost(terrain: str, weather_condition: str = "") -> dict:
+    """
+    Resolve a getting-lost event for the given terrain and weather condition.
+    Returns direction, hexes off course, and time to reorient.
+    Does NOT require an active journey — can be called standalone.
+    """
+    terrain   = terrain.lower().strip()
+    conditions = [weather_condition] if weather_condition else []
+    result    = _resolve_lost(terrain, conditions)
+
+    # Add lost chance context for the narrative
+    base_chance = _TERRAIN_LOST_CHANCE_PCT.get(terrain, 10)
+    result["terrain"]             = terrain
+    result["base_lost_chance_pct"] = base_chance
+    result["instructions"] = (
+        "Update the party's current position in the travel state by noting "
+        "the deviation. Call travel_turn() to resume once reoriented — the "
+        "extra_days_lost will be accounted for automatically."
+    )
+    return result

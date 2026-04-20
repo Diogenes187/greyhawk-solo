@@ -188,7 +188,7 @@ rolls, then call `create_character` to commit the final choices to a new databas
 
 ## MCP Tools
 
-Claude has access to 36 tools automatically:
+Claude has access to 42 tools automatically:
 
 ### Session
 | Tool | What it does |
@@ -253,6 +253,16 @@ Claude has access to 36 tools automatically:
 | `pay_upkeep` | Deduct troop upkeep for N months from the primary treasury; returns per-group breakdown |
 | `realm_event` | Roll on the d20 realm events table (harvests, raids, trade windfalls, plague, diplomacy, etc.); returns the event and instructions for applying its mechanical effect |
 
+### Travel & Weather
+| Tool | What it does |
+|---|---|
+| `start_travel` | Begin a journey between two locations; specify origin, destination, terrain path, and mount type; returns travel plan with estimated days and food/water requirements |
+| `travel_turn` | Resolve one day of travel: apply weather movement modifier, roll terrain encounter check, update miles traveled and resources consumed |
+| `get_travel_state` | Current journey status: miles remaining, days elapsed, current terrain, estimated days to destination |
+| `get_lost` | Trigger a lost event: roll direction error and wander distance; returns reorientation time and recovery instructions |
+| `generate_weather` | Roll daily weather for the given season and region: precipitation, wind, temperature, visibility, movement modifier, survival check flag |
+| `get_current_weather` | Return today's weather and 3-day forecast |
+
 ### Character Setup
 | Tool | What it does |
 |---|---|
@@ -313,7 +323,7 @@ greyhawk-solo/
 │   ├── ddl.sql               # DDL only — used internally for fast new-DB creation
 │   └── new_character_template.sql  # Manual fill-in-the-blanks alternative
 ├── server/
-│   └── mcp_server.py         # FastMCP server; 36 tools; connects to Claude Desktop
+│   └── mcp_server.py         # FastMCP server; 42 tools; connects to Claude Desktop
 ├── saves/                    # Your campaign DB goes here (git-ignored)
 │   └── .gitkeep
 ├── create_character.py       # Interactive character creation CLI
@@ -359,7 +369,7 @@ echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":
 {"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' | python server/mcp_server.py
 ```
 
-You should see 36 tools listed in the response.
+You should see 42 tools listed in the response.
 
 ---
 

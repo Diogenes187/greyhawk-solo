@@ -78,7 +78,7 @@ greyhawk-solo/
 │   ├── ddl.sql               # DDL only — used by create_character_db() for fast DB init
 │   └── new_character_template.sql  # Manual fill-in-the-blanks PC setup
 ├── server/
-│   └── mcp_server.py         # FastMCP server; 36 tools
+│   └── mcp_server.py         # FastMCP server; 42 tools
 ├── saves/                    # git-ignored — campaign DBs live here
 │   └── .gitkeep
 ├── create_character.py       # Interactive character creation CLI
@@ -170,6 +170,17 @@ greyhawk-solo/
 | `update_world_fact` | Upsert a campaign fact (quests, weather, rulings) |
 | `update_npc` | Update NPC notes, type, alignment |
 | `add_npc` | Add a newly encountered NPC |
+
+### Travel & Weather tools
+
+| Tool | Description |
+|---|---|
+| `start_travel` | Begin a journey: origin, destination, terrain path, mount type; returns full travel plan with estimated days, food/water requirements |
+| `travel_turn` | Resolve one day of travel: apply weather movement modifier, roll terrain encounter, track miles/resources, return day report |
+| `get_travel_state` | Current journey status: miles remaining, days elapsed, current terrain, estimated days to destination |
+| `get_lost` | Trigger a lost event: roll direction error and wander distance, return reorientation time and instructions |
+| `generate_weather` | Roll a full daily weather result for the given season and region: precipitation, wind, temperature, visibility, movement modifier, survival check flag |
+| `get_current_weather` | Return today's weather and the 3-day forecast stored in world_facts |
 
 ### Character setup
 
@@ -296,3 +307,4 @@ Roll 1d20; meet or beat the listed number to save.
 | Phase 2 — Combat & Spells | **Complete** | Combat tracker, initiative, THAC0 attack matrix, morale, XP; spell memorization, casting, long/short rest |
 | Phase 3 — Dungeon | **Complete** | Random encounter tables (d20→table, d100→monster), wandering monster check with turn counter, full treasure generation A–Z |
 | Phase 4 — Domain | **Complete** | Seasonal turns, per-holding income rolls, troop upkeep, construction queue with automatic week-tracking, d20 realm events table (36 tools total) |
+| Phase 5A — Travel & Weather | **Complete** | Hex-crawl travel with terrain movement rates, mount types, get_lost; daily weather by season with precipitation/wind/visibility/movement modifiers; world_facts JSON persistence (42 tools total) |

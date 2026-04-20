@@ -43,6 +43,27 @@ Tools exposed:
   cast_spell           -- Expend a memorized slot, return spell description
   rest                 -- Long rest: restore spell slots, recover HP, advance calendar
 
+  DUNGEON
+  check_wandering_monster -- Roll 1-in-6 wandering monster check (one dungeon turn)
+  random_encounter        -- Roll random encounter for given dungeon level
+  generate_treasure       -- Roll complete treasure haul for type A-Z
+
+  DOMAIN
+  get_domain_state        -- Full realm snapshot: holdings, troops, treasury, projects
+  domain_turn             -- Advance one season: income, upkeep, construction, event
+  add_construction_project -- Queue a new building with cost and completion weeks
+  collect_income          -- Roll income for all active holdings for N months
+  pay_upkeep              -- Deduct troop upkeep for N months from treasury
+  realm_event             -- Roll on the d20 realm events table
+
+  TRAVEL & WEATHER
+  start_travel            -- Begin a journey: origin, destination, terrain path, mount
+  travel_turn             -- Resolve one day of travel with weather and encounter checks
+  get_travel_state        -- Current journey status: miles, days, terrain, estimate
+  get_lost                -- Trigger lost event: direction error, wander distance, recovery
+  generate_weather        -- Roll daily weather for season and region
+  get_current_weather     -- Return today's weather and 3-day forecast
+
 Architecture:
   - FastMCP (mcp 1.27.0) runs over stdio; Claude Desktop connects as a client.
   - All DB access goes through engine/db.py — this file contains zero SQL.
@@ -98,6 +119,10 @@ from engine.db import (
     # Phase 3 — dungeon
     get_random_dungeon_encounter, roll_treasure_by_type,
     get_dungeon_turn_count, increment_dungeon_turn,
+    # Phase 5A — travel & weather
+    db_start_travel, db_travel_turn, db_get_lost,
+    db_generate_weather, db_get_current_weather,
+    _get_world_fact_json, _BASE_MOVE_MPD,
     # Phase 4 — domain
     get_full_domain_state,
     db_add_construction_project,
@@ -2806,6 +2831,242 @@ def domain_turn(
         report["summary"] += f" Realm event: {report['realm_event']['title']}."
 
     return report
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PHASE 5A — TRAVEL & WEATHER SYSTEM
+# Hex-crawl travel · Daily resolution · Weather generation · Getting lost
+# ══════════════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def generate_weather(
+    season: Annotated[
+        str,
+        "Current Greyhawk season: 'winter', 'spring', 'summer', or 'autumn'. "
+        "Winter = Sunsebb/Fireseek, Spring = Readying/Coldeven, "
+        "Summer = Wealsun/Reaping/Goodmonth, Autumn = Harvester/Patchwall.",
+    ],
+    date_str: Annotated[
+        str,
+        "In-game date for context, e.g. 'Fireseek 12, 576 CY'. "
+        "Stored with the weather record but does not affect rolls.",
+    ] = "",
+) -> dict:
+    """
+    Roll today's weather and a 3-day forecast for the Vesve frontier region.
+
+    Generates temperature, precipitation, wind, visibility, movement modifier,
+    and survival check flag for the Vesve Forest frontier near Whyestil Lake
+    (cold temperate, lake-effect, northern Flanaess).
+
+    Weather affects travel: movement_modifier multiplies daily mileage.
+      1.0 = full movement  0.75 = light rain/fog  0.5 = heavy rain or snow
+      0.25 = thunderstorm or blizzard conditions  0.0 = storm halts travel
+
+    Conditions that require survival checks (extreme cold below 10°F in winter)
+    are flagged. The party must succeed on a CON check or suffer fatigue penalties.
+
+    Stores today's weather as world_facts 'current_weather' and the 3-day
+    forecast as 'weather_forecast'. Calling this again replaces both.
+    """
+    return db_generate_weather(season=season, date_str=date_str)
+
+
+@mcp.tool()
+def get_current_weather() -> dict:
+    """
+    Return today's stored weather conditions and the 3-day forecast.
+
+    If no weather has been generated yet, returns an error with a hint.
+    Call generate_weather() first to set today's conditions.
+
+    Returns:
+      - temperature_f, temperature_desc
+      - precipitation_label, wind_label
+      - visibility_miles
+      - movement_modifier (multiply base daily miles by this)
+      - halts_travel (True = severe storm, party cannot move)
+      - survival_check_required (True = extreme cold, CON check needed)
+      - conditions_summary (single-line human-readable)
+      - forecast_3_days: list of simplified next-3-day conditions
+    """
+    return db_get_current_weather()
+
+
+@mcp.tool()
+def start_travel(
+    origin: Annotated[
+        str,
+        "Name or description of the starting location, e.g. 'Quasquetan'.",
+    ],
+    destination: Annotated[
+        str,
+        "Name or description of the destination, e.g. 'Rillford'.",
+    ],
+    total_miles: Annotated[
+        int,
+        "Total journey distance in miles. Use the Greyhawk map or known distances. "
+        "Typical: Quasquetan–Rillford ~12 mi, cross-country hex ~6 mi per hex.",
+    ],
+    terrain_path: Annotated[
+        str,
+        "Terrain type(s) for the journey. Single type: 'forest'. "
+        "Multiple segments: 'road:8,forest:20,hills:12' (terrain:miles pairs). "
+        "Valid types: road, plains, hills, forest, mountains, swamp, marsh.",
+    ] = "plains",
+    mount_type: Annotated[
+        str,
+        "Travel mode: 'foot', 'light_horse', or 'heavy_horse'. "
+        "Determines base movement rate per terrain.",
+    ] = "foot",
+    notes: Annotated[
+        str,
+        "Optional notes about this journey (purpose, party size, special conditions).",
+    ] = "",
+) -> dict:
+    """
+    Begin a new overland journey and return the full travel plan.
+
+    Calculates for each terrain segment:
+      - Miles per day (base movement rate by terrain and mount type)
+      - Days required (ceiling of miles ÷ daily rate)
+      - Hexes crossed (at 6 miles per hex)
+
+    Summarises total food (days' rations per person) and water (pints per person)
+    needed for the journey. Horse fodder is noted for mounted parties.
+
+    Movement rates (miles/day):
+      Foot:        Road 24 · Plains 18 · Hills/Forest 12 · Mountains/Swamp 6
+      Light Horse: Road 48 · Plains 36 · Hills 18 · Forest 12 · Mountains/Swamp 4–6
+      Heavy Horse: Road 36 · Plains 27 · Hills 15 · Forest 12 · Mountains/Swamp 3–6
+
+    Stores the travel state in world_facts. Call travel_turn() once per day
+    to resolve each day's movement, weather effects, encounters, and getting lost.
+
+    Only one journey can be active at a time. Starting a new journey overwrites
+    any existing travel state.
+    """
+    return db_start_travel(
+        origin       = origin,
+        destination  = destination,
+        terrain_path = terrain_path,
+        mount_type   = mount_type,
+        total_miles  = total_miles,
+        notes        = notes,
+    )
+
+
+@mcp.tool()
+def travel_turn() -> dict:
+    """
+    Resolve one day of overland travel.
+
+    Performs all daily travel steps:
+    1. Reads current weather — applies movement_modifier to base daily miles.
+       movement_modifier=0 (blizzard/storm) halts travel entirely.
+    2. Determines today's terrain from the leading journey segment.
+    3. Rolls for getting lost (terrain-based chance, doubled in severe weather).
+       Forest 30%, Mountains 25%, Swamp 40%, Hills 15%, Plains 5%, Road 0%.
+    4. Rolls for random encounter (terrain-based chance per day).
+       Road 1-in-12 · Plains/Hills/Mountains 1-in-6 · Forest/Swamp 2-in-6.
+    5. Advances the journey by actual miles traveled. Detects segment transitions.
+    6. Consumes 1 food-day per person.
+    7. Marks the journey complete when all terrain segments are exhausted.
+
+    Returns:
+      - actual_miles_today, total_miles_traveled, miles_remaining
+      - days_elapsed, days_remaining_estimate
+      - got_lost (bool) + lost_result (direction, hexes off, reorient hours)
+      - encounter (monster name, count, stats) if triggered
+      - halted_by_weather (bool)
+      - survival_check_required (bool)
+      - journey_complete (bool) — update current scene location when True
+
+    Call this once per in-game day. Call generate_weather() each morning
+    before travel_turn() to roll fresh conditions for the day.
+    """
+    return db_travel_turn()
+
+
+@mcp.tool()
+def get_travel_state() -> dict:
+    """
+    Return the current journey status without advancing any state.
+
+    Shows:
+      - origin / destination
+      - mount_type
+      - terrain_segments remaining (with miles_remaining each)
+      - total_miles, miles_traveled, miles_remaining
+      - days_elapsed, total_days_estimate
+      - food_days_needed / food_days_consumed / food_days_remaining
+      - encounters_log (all encounters this trip)
+      - weather_delays_days and lost_extra_days accumulated
+      - active (False means journey is complete or not started)
+
+    Returns an error if no travel state exists. Call start_travel() first.
+    """
+    state = _get_world_fact_json("travel_state")
+    if not state:
+        return {
+            "error":  "No travel state found.",
+            "hint":   "Call start_travel() to begin a journey.",
+            "active": False,
+        }
+
+    # Compute derived fields
+    miles_remaining = sum(
+        s.get("miles_remaining", 0) for s in state.get("terrain_segments", [])
+    )
+    mount_type = state.get("mount_type", "foot")
+    # Estimate current terrain
+    segs = state.get("terrain_segments", [])
+    current_terrain = segs[0]["terrain"] if segs else "unknown"
+    base_move = _BASE_MOVE_MPD.get(mount_type, _BASE_MOVE_MPD["foot"]).get(current_terrain, 18)
+    days_rem  = max(0, int(miles_remaining / base_move + 0.99)) if miles_remaining > 0 else 0
+
+    state["miles_remaining"]        = miles_remaining
+    state["days_remaining_estimate"] = days_rem
+    state["food_days_remaining"]    = (
+        state.get("food_days_needed", 0) - state.get("food_days_consumed", 0)
+    )
+    return state
+
+
+@mcp.tool()
+def get_lost(
+    terrain: Annotated[
+        str,
+        "Current terrain type where the party got lost: "
+        "road, plains, hills, forest, mountains, swamp, or marsh.",
+    ],
+    weather_condition: Annotated[
+        str,
+        "Active weather condition that contributed, e.g. 'heavy_snow', 'fog', "
+        "'heavy_rain'. Leave blank for clear conditions.",
+    ] = "",
+) -> dict:
+    """
+    Resolve a getting-lost event.
+
+    Rolls to determine:
+      - Direction the party has drifted (d8 compass rose: N, NE, E, SE, S, SW, W, NW)
+      - Hexes off course (1–3 hexes, each 6 miles)
+      - Hours required to reorient (2–8 hours; 8 hours = full day lost)
+
+    Getting-lost base chances by terrain (% per day without a ranger/good map):
+      Forest 30% · Swamp 40% · Marsh 35% · Mountains 25% · Hills 15% · Plains 5%
+    Severe weather (movement_modifier ≤ 0.5) doubles the chance.
+
+    Use this tool whenever:
+      - travel_turn() returns got_lost=True (to get the specific direction/extent)
+      - The DM decides the party is lost due to narrative circumstances
+      - A navigation roll fails during hex travel
+
+    Returns direction, hexes off course, miles off course, hours to reorient,
+    extra days lost (0 or 1), and a description for narration.
+    """
+    return db_get_lost(terrain=terrain, weather_condition=weather_condition)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
