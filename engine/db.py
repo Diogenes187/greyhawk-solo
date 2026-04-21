@@ -6,8 +6,12 @@ Database access layer for the active campaign database.
 The active database is determined by config.json in the project root:
     { "active_campaign_db": "saves/my_campaign.db" }
 
-Use switch_character.py to change the active database. If config.json is
-absent or has no entry, falls back to saves/theron.db.
+config.json is re-read on EVERY connection (see _get_conn), so any
+change to the active_campaign_db value — whether written by the
+switch_campaign MCP tool, switch_character.py, or a manual edit — takes
+effect on the very next tool call with no server restart required. If
+config.json is absent or malformed, the resolver falls back to
+saves/theron.db.
 
 READ functions: load character state, realm state, recent AI turns.
 WRITE functions: write a new AI turn, update current scene state.
@@ -30,7 +34,11 @@ _ROOT = Path(__file__).parent.parent
 def _resolve_db_path() -> Path:
     """
     Read the active campaign database path from config.json.
-    Falls back to saves/theron.db if config.json is missing or malformed.
+
+    Called fresh on every _get_conn() invocation so that a switch_campaign
+    (or any external edit of config.json) takes effect on the very next
+    tool call — no process restart required. Falls back to
+    saves/theron.db if config.json is missing or malformed.
     """
     config_path = _ROOT / "config.json"
     if config_path.exists():
@@ -44,8 +52,6 @@ def _resolve_db_path() -> Path:
     return _ROOT / "saves" / "theron.db"
 
 
-_DB_PATH = _resolve_db_path()
-
 # Campaign and PC IDs — standard for all campaigns created with new_character_template.sql
 _CAMPAIGN_ID = 1
 _PC_CHARACTER_ID = 1
@@ -54,14 +60,21 @@ _PC_CHARACTER_ID = 1
 @contextmanager
 def _get_conn(read_only: bool = False):
     """
-    Yield an open SQLite connection. Use read_only=True for SELECT-only paths.
-    WAL mode is enabled for safe concurrent reads while the game loop writes.
+    Yield an open SQLite connection targeting the currently-active
+    campaign DB. The path is resolved fresh from config.json on every
+    call (see _resolve_db_path), so switching the active campaign is a
+    hot operation — the next tool call picks up the change automatically.
+
+    Use read_only=True for SELECT-only paths. WAL mode is enabled on
+    writable connections for safe concurrent reads while the game loop
+    writes.
     """
+    db_path = _resolve_db_path()
     if read_only:
-        uri = f"file:{_DB_PATH}?mode=ro"
+        uri = f"file:{db_path}?mode=ro"
         conn = sqlite3.connect(uri, uri=True)
     else:
-        conn = sqlite3.connect(_DB_PATH)
+        conn = sqlite3.connect(db_path)
         conn.execute("PRAGMA journal_mode=WAL")
     conn.row_factory = sqlite3.Row
     try:

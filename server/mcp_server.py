@@ -4158,15 +4158,16 @@ def switch_campaign(
     """
     Point config.json at a different campaign database.
 
-    The MCP server reads config.json once at startup, so after this tool
-    succeeds the player must fully quit and relaunch Claude Desktop for the
-    change to take effect. The databases themselves are not modified.
+    The engine re-reads config.json on every connection, so the switch is
+    hot — the very next tool call (e.g. get_character_state) will target
+    the new database with no Claude Desktop restart required. The
+    databases themselves are not modified.
 
     Returns on success:
       character -- PC name from the newly-selected DB
       classes   -- Class levels string (e.g. "Fighter 7 / Magic-User 7")
       database  -- Relative DB path now stored in config.json
-      note      -- Reminder to restart Claude Desktop
+      note      -- Confirmation that the change is already live
 
     Returns an error dict if no matching DB is found, the identifier is
     ambiguous, or the selected DB cannot be read.
@@ -4243,9 +4244,9 @@ def switch_campaign(
         "classes":   info.get("classes"),
         "database":  rel,
         "note":      (
-            "config.json updated. Fully quit and relaunch Claude Desktop "
-            "to activate the new campaign — the MCP server reads config.json "
-            "once at startup."
+            "config.json updated — the switch is already live. The next "
+            "tool call will target the new database; no Claude Desktop "
+            "restart is needed."
         ),
     }
 
