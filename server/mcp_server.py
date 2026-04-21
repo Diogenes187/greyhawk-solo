@@ -4488,6 +4488,550 @@ def get_world_facts(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# DIRECT-EDIT HELPERS (shared by update_class_level / update_inventory_item /
+# remove_inventory_item / update_npc_class / direct_db_edit)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _active_db_path() -> Path | None:
+    """Return the absolute Path of the active campaign DB, or None."""
+    rel = _active_campaign_rel()
+    if not rel:
+        return None
+    p = (_ROOT / rel).resolve()
+    return p if p.exists() else None
+
+
+def _open_writable_active() -> sqlite3.Connection:
+    """Open a writable connection to the active campaign DB. Raises on failure."""
+    p = _active_db_path()
+    if not p:
+        raise RuntimeError("No active campaign DB resolvable from config.json.")
+    conn = sqlite3.connect(p)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> list[dict]:
+    """Return PRAGMA table_info rows as dicts. Empty list if table unknown."""
+    try:
+        return [dict(r) for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+    except sqlite3.Error:
+        return []
+
+
+def _log_edit(
+    conn: sqlite3.Connection,
+    tool_name: str,
+    table: str,
+    row_id,
+    changes: list[dict],
+    note: str = "",
+) -> None:
+    """
+    Append an edit-log entry to world_facts (category='edit_log').
+
+    `changes` is a list of {"field": str, "old": jsonable, "new": jsonable}.
+    Caller must be inside an open transaction — this does not commit.
+    """
+    ts = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    parts = [f"{c['field']}: {c['old']!r} -> {c['new']!r}" for c in changes]
+    summary = f"[{ts}] {tool_name} on {table}#{row_id}: " + "; ".join(parts)
+    if note:
+        summary += f" (note: {note})"
+    payload = json.dumps({
+        "timestamp": ts,
+        "tool":      tool_name,
+        "table":     table,
+        "row_id":    row_id,
+        "changes":   changes,
+        "note":      note,
+    }, default=str)
+    conn.execute(
+        "INSERT INTO world_facts (campaign_id, category, fact_text, source_note) "
+        "VALUES (1, 'edit_log', ?, ?)",
+        (summary, payload),
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TOOL: update_class_level
+# ══════════════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def update_class_level(
+    character_id: Annotated[
+        int,
+        "The character_id whose class row is being edited. PC is 1; NPCs "
+        "have their own character_id values.",
+    ],
+    class_name: Annotated[
+        str,
+        "Existing class_name to target (e.g. 'Fighter', 'Magic-User'). Must "
+        "match an existing row for this character_id.",
+    ],
+    new_level: Annotated[
+        int,
+        "New level. Pass -1 to leave unchanged.",
+    ] = -1,
+    new_xp: Annotated[
+        int,
+        "New XP value. Pass -1 to leave unchanged.",
+    ] = -1,
+    rename_to: Annotated[
+        str,
+        "If non-empty, rename the class (e.g. dual-class correction). "
+        "Leave blank to keep the current class_name.",
+    ] = "",
+    reason: Annotated[
+        str,
+        "Short reason for the edit, written to the edit_log.",
+    ] = "",
+) -> dict:
+    """
+    Directly correct a row in class_levels (level / xp / class name).
+
+    Use for data-correction or canon overrides when the regular game loop
+    would not naturally produce the needed state. Every change is recorded
+    in world_facts under category 'edit_log'.
+    """
+    try:
+        conn = _open_writable_active()
+    except RuntimeError as e:
+        return {"error": str(e)}
+
+    try:
+        row = conn.execute(
+            "SELECT class_level_id, class_name, level, xp FROM class_levels "
+            "WHERE character_id = ? AND class_name = ?",
+            (character_id, class_name),
+        ).fetchone()
+        if not row:
+            return {
+                "error": (
+                    f"No class_levels row for character_id={character_id} "
+                    f"with class_name={class_name!r}."
+                ),
+            }
+
+        updates: list[tuple[str, object]] = []
+        changes:  list[dict]              = []
+        if new_level >= 0 and new_level != row["level"]:
+            updates.append(("level", new_level))
+            changes.append({"field": "level", "old": row["level"], "new": new_level})
+        if new_xp >= 0 and new_xp != row["xp"]:
+            updates.append(("xp", new_xp))
+            changes.append({"field": "xp", "old": row["xp"], "new": new_xp})
+        if rename_to and rename_to != row["class_name"]:
+            updates.append(("class_name", rename_to))
+            changes.append({"field": "class_name", "old": row["class_name"], "new": rename_to})
+
+        if not updates:
+            return {"ok": True, "unchanged": True, "row_id": row["class_level_id"]}
+
+        set_clause = ", ".join(f"{k} = ?" for k, _ in updates)
+        params     = [v for _, v in updates] + [row["class_level_id"]]
+        with conn:
+            conn.execute(
+                f"UPDATE class_levels SET {set_clause} WHERE class_level_id = ?",
+                params,
+            )
+            _log_edit(conn, "update_class_level", "class_levels",
+                      row["class_level_id"], changes, reason)
+        return {"ok": True, "row_id": row["class_level_id"], "changes": changes}
+    finally:
+        conn.close()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TOOL: update_inventory_item
+# ══════════════════════════════════════════════════════════════════════════════
+
+_INVENTORY_EDITABLE = {
+    "quantity", "equipped_flag", "notes",
+    "character_id", "location_id", "treasury_id", "item_id",
+}
+
+
+@mcp.tool()
+def update_inventory_item(
+    inventory_id: Annotated[
+        int,
+        "inventory_id (primary key) of the record to update.",
+    ],
+    field: Annotated[
+        str,
+        "Column to update. One of: quantity, equipped_flag, notes, "
+        "character_id, location_id, treasury_id, item_id.",
+    ],
+    new_value: Annotated[
+        str,
+        "New value as a string. Numeric fields (quantity, equipped_flag, "
+        "*_id) are parsed as ints; for NULL pass the literal string 'null'. "
+        "For booleans, use '1' / '0' in equipped_flag.",
+    ],
+    reason: Annotated[
+        str,
+        "Short reason for the edit, written to the edit_log.",
+    ] = "",
+) -> dict:
+    """
+    Update one field on a single inventory row.
+
+    To change multiple fields, call this tool once per field. The
+    companion tool remove_inventory_item deletes a row entirely. Every
+    edit is recorded in world_facts under category 'edit_log'.
+    """
+    if field not in _INVENTORY_EDITABLE:
+        return {
+            "error":   f"Field {field!r} is not editable via this tool.",
+            "allowed": sorted(_INVENTORY_EDITABLE),
+        }
+
+    # Coerce the value
+    parsed: object
+    if new_value.strip().lower() == "null":
+        parsed = None
+    elif field in {"quantity", "equipped_flag",
+                   "character_id", "location_id", "treasury_id", "item_id"}:
+        try:
+            parsed = int(new_value)
+        except ValueError:
+            return {"error": f"{field} requires an integer, got {new_value!r}."}
+    else:
+        parsed = new_value
+
+    try:
+        conn = _open_writable_active()
+    except RuntimeError as e:
+        return {"error": str(e)}
+
+    try:
+        row = conn.execute(
+            "SELECT * FROM inventory WHERE inventory_id = ?",
+            (inventory_id,),
+        ).fetchone()
+        if not row:
+            return {"error": f"No inventory row with inventory_id={inventory_id}."}
+
+        old = row[field]
+        if old == parsed:
+            return {"ok": True, "unchanged": True, "inventory_id": inventory_id}
+
+        with conn:
+            conn.execute(
+                f"UPDATE inventory SET {field} = ? WHERE inventory_id = ?",
+                (parsed, inventory_id),
+            )
+            _log_edit(conn, "update_inventory_item", "inventory",
+                      inventory_id,
+                      [{"field": field, "old": old, "new": parsed}],
+                      reason)
+        return {
+            "ok":           True,
+            "inventory_id": inventory_id,
+            "field":        field,
+            "old":          old,
+            "new":          parsed,
+        }
+    finally:
+        conn.close()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TOOL: remove_inventory_item
+# ══════════════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def remove_inventory_item(
+    inventory_id: Annotated[
+        int,
+        "inventory_id of the record to delete.",
+    ],
+    reason: Annotated[
+        str,
+        "Why the record is being removed (written to edit_log). Strongly "
+        "recommended so the deletion can be audited later.",
+    ] = "",
+) -> dict:
+    """
+    Delete a single inventory row entirely.
+
+    Intended for fixing duplicates or spurious entries. The referenced
+    items row in `items` is left intact so other inventory rows or loot
+    records pointing at it keep working. The deleted row's prior
+    contents are captured in the edit_log so it can be reconstructed.
+    """
+    try:
+        conn = _open_writable_active()
+    except RuntimeError as e:
+        return {"error": str(e)}
+
+    try:
+        row = conn.execute(
+            "SELECT * FROM inventory WHERE inventory_id = ?",
+            (inventory_id,),
+        ).fetchone()
+        if not row:
+            return {"error": f"No inventory row with inventory_id={inventory_id}."}
+
+        snapshot = dict(row)
+        changes  = [{"field": "__row__", "old": snapshot, "new": None}]
+        with conn:
+            conn.execute("DELETE FROM inventory WHERE inventory_id = ?", (inventory_id,))
+            _log_edit(conn, "remove_inventory_item", "inventory",
+                      inventory_id, changes, reason)
+        return {"ok": True, "inventory_id": inventory_id, "deleted_row": snapshot}
+    finally:
+        conn.close()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TOOL: update_npc_class
+# ══════════════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def update_npc_class(
+    npc_character_id: Annotated[
+        int,
+        "character_id of the NPC (from the characters table, where "
+        "character_type = 'npc'). Rejects PC entries (character_type='pc').",
+    ],
+    new_class: Annotated[
+        str,
+        "New class_name. If the NPC has no class_levels row, one is inserted. "
+        "Leave blank to leave class unchanged.",
+    ] = "",
+    new_level: Annotated[
+        int,
+        "New level. Pass -1 to leave unchanged (or let an inserted row use 1).",
+    ] = -1,
+    new_notes: Annotated[
+        str,
+        "Replacement value for characters.notes. Leave blank to leave unchanged. "
+        "Pass the literal string 'null' to clear the field.",
+    ] = "",
+    reason: Annotated[
+        str,
+        "Short reason for the edit, written to the edit_log.",
+    ] = "",
+) -> dict:
+    """
+    Directly correct an NPC's class, level, or notes.
+
+    Operates on a single class_levels row per NPC. If the NPC has
+    multiple class rows (rare), the first (lowest class_level_id) is
+    edited. Every change is recorded in world_facts under category
+    'edit_log'.
+    """
+    try:
+        conn = _open_writable_active()
+    except RuntimeError as e:
+        return {"error": str(e)}
+
+    try:
+        pc_row = conn.execute(
+            "SELECT character_id, character_type, notes, name "
+            "FROM characters WHERE character_id = ?",
+            (npc_character_id,),
+        ).fetchone()
+        if not pc_row:
+            return {"error": f"No characters row with character_id={npc_character_id}."}
+        if (pc_row["character_type"] or "").lower() == "pc":
+            return {"error": "Refusing to edit a PC via update_npc_class. Use update_class_level instead."}
+
+        changes: list[dict] = []
+
+        # ── class / level ────────────────────────────────────────────────
+        class_row = conn.execute(
+            "SELECT class_level_id, class_name, level FROM class_levels "
+            "WHERE character_id = ? ORDER BY class_level_id LIMIT 1",
+            (npc_character_id,),
+        ).fetchone()
+
+        with conn:
+            if new_class or new_level >= 0:
+                if class_row:
+                    cls_updates: list[tuple[str, object]] = []
+                    if new_class and new_class != class_row["class_name"]:
+                        cls_updates.append(("class_name", new_class))
+                        changes.append({"field": "class_levels.class_name",
+                                        "old": class_row["class_name"], "new": new_class})
+                    if new_level >= 0 and new_level != class_row["level"]:
+                        cls_updates.append(("level", new_level))
+                        changes.append({"field": "class_levels.level",
+                                        "old": class_row["level"], "new": new_level})
+                    if cls_updates:
+                        set_clause = ", ".join(f"{k} = ?" for k, _ in cls_updates)
+                        params     = [v for _, v in cls_updates] + [class_row["class_level_id"]]
+                        conn.execute(
+                            f"UPDATE class_levels SET {set_clause} WHERE class_level_id = ?",
+                            params,
+                        )
+                elif new_class:
+                    lvl = new_level if new_level >= 0 else 1
+                    cur = conn.execute(
+                        "INSERT INTO class_levels (character_id, class_name, level, xp) "
+                        "VALUES (?, ?, ?, 0)",
+                        (npc_character_id, new_class, lvl),
+                    )
+                    changes.append({"field": "class_levels (inserted)",
+                                    "old": None,
+                                    "new": {"class_name": new_class, "level": lvl,
+                                            "class_level_id": cur.lastrowid}})
+
+            # ── notes ────────────────────────────────────────────────────
+            if new_notes:
+                want = None if new_notes.strip().lower() == "null" else new_notes
+                if want != pc_row["notes"]:
+                    conn.execute(
+                        "UPDATE characters SET notes = ? WHERE character_id = ?",
+                        (want, npc_character_id),
+                    )
+                    changes.append({"field": "characters.notes",
+                                    "old": pc_row["notes"], "new": want})
+
+            if not changes:
+                return {"ok": True, "unchanged": True, "npc_character_id": npc_character_id}
+
+            _log_edit(conn, "update_npc_class", "characters+class_levels",
+                      npc_character_id, changes, reason)
+
+        return {"ok": True, "npc_character_id": npc_character_id,
+                "name": pc_row["name"], "changes": changes}
+    finally:
+        conn.close()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TOOL: direct_db_edit
+# ══════════════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def direct_db_edit(
+    table: Annotated[
+        str,
+        "Target table name. Must be a real table in the active DB; system "
+        "tables (sqlite_*) are rejected.",
+    ],
+    id_field: Annotated[
+        str,
+        "Primary-key column name for the target table (e.g. 'character_id', "
+        "'item_id', 'class_level_id'). Must be a real column.",
+    ],
+    id_value: Annotated[
+        int,
+        "Value of id_field identifying the exact row to update.",
+    ],
+    updates_json: Annotated[
+        str,
+        "JSON-encoded object mapping column names to new values "
+        "(e.g. '{\"level\": 8, \"xp\": 95000}'). String/int/float/null "
+        "supported. Every key must be a real column. The primary-key "
+        "column itself may not be changed.",
+    ],
+    reason: Annotated[
+        str,
+        "Short reason for the edit, written to the edit_log. Strongly "
+        "recommended for any canon override.",
+    ] = "",
+) -> dict:
+    """
+    Override any single row in the active campaign DB.
+
+    Swiss-army tool for data correction when no specific tool fits. All
+    validation is done before the write:
+
+      1. Table exists and is not a system table.
+      2. id_field is a column of that table.
+      3. Every key in updates_json is a column of that table.
+      4. The primary-key column is not among the keys (no row-renumbering).
+      5. A single row with id_field = id_value exists.
+
+    The update is wrapped in a transaction together with the edit_log
+    insert, so partial writes cannot occur. Every old/new value pair is
+    recorded in world_facts under category 'edit_log'.
+    """
+    # Parse updates first (cheapest failure).
+    try:
+        updates = json.loads(updates_json)
+    except Exception as e:
+        return {"error": f"updates_json is not valid JSON: {e}"}
+    if not isinstance(updates, dict) or not updates:
+        return {"error": "updates_json must decode to a non-empty object."}
+
+    if not table or table.startswith("sqlite_"):
+        return {"error": f"Refusing to edit table {table!r}."}
+
+    try:
+        conn = _open_writable_active()
+    except RuntimeError as e:
+        return {"error": str(e)}
+
+    try:
+        # ── Validate table exists ────────────────────────────────────────
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?",
+            (table,),
+        ).fetchone()
+        if not exists:
+            return {"error": f"Table {table!r} does not exist."}
+
+        # ── Validate columns and primary key ─────────────────────────────
+        cols_info = _table_columns(conn, table)
+        col_names = {c["name"] for c in cols_info}
+        pk_cols   = {c["name"] for c in cols_info if c["pk"]}
+        if id_field not in col_names:
+            return {"error": f"{id_field!r} is not a column of {table!r}.",
+                    "columns": sorted(col_names)}
+        unknown = [k for k in updates if k not in col_names]
+        if unknown:
+            return {"error": f"Unknown column(s) for {table!r}: {unknown}",
+                    "columns": sorted(col_names)}
+        forbidden = [k for k in updates if k in pk_cols]
+        if forbidden:
+            return {"error": f"Primary-key columns cannot be updated: {forbidden}."}
+
+        # ── Load existing row ────────────────────────────────────────────
+        row = conn.execute(
+            f"SELECT * FROM {table} WHERE {id_field} = ?",
+            (id_value,),
+        ).fetchone()
+        if not row:
+            return {"error": f"No row in {table} with {id_field}={id_value}."}
+
+        changes = []
+        applied = {}
+        for k, v in updates.items():
+            old = row[k]
+            if old != v:
+                changes.append({"field": k, "old": old, "new": v})
+                applied[k] = v
+
+        if not applied:
+            return {"ok": True, "unchanged": True, "table": table, "id": id_value}
+
+        set_clause = ", ".join(f"{k} = ?" for k in applied)
+        params     = list(applied.values()) + [id_value]
+        with conn:
+            conn.execute(
+                f"UPDATE {table} SET {set_clause} WHERE {id_field} = ?",
+                params,
+            )
+            _log_edit(conn, "direct_db_edit", table, id_value, changes, reason)
+
+        return {
+            "ok":       True,
+            "table":    table,
+            "id_field": id_field,
+            "id":       id_value,
+            "changes":  changes,
+        }
+    finally:
+        conn.close()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
 
