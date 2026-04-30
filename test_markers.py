@@ -148,6 +148,53 @@ class TestNormalizeMarkers(unittest.TestCase):
             ["cast:X", "hp:1>0"],
         )
 
+    def test_apostrophes_in_list(self):
+        """The reported bug case: apostrophes must survive a list pass-through."""
+        markers = ["location_changed:Worker's tunnel", "cast:Invisibility"]
+        self.assertEqual(self.normalize(markers), markers)
+
+    def test_apostrophes_in_json_string(self):
+        """A JSON-array string with apostrophes inside string values."""
+        s = '["location_changed:Worker\'s tunnel", "cast:Invisibility"]'
+        self.assertEqual(
+            self.normalize(s),
+            ["location_changed:Worker's tunnel", "cast:Invisibility"],
+        )
+
+    def test_apostrophes_in_python_repr(self):
+        """A Python list-repr string (single-quoted, escaped apostrophes)."""
+        # Real Python repr: ['location_changed:Worker\\'s tunnel', 'cast:Invisibility']
+        s = "['location_changed:Worker\\'s tunnel', 'cast:Invisibility']"
+        self.assertEqual(
+            self.normalize(s),
+            ["location_changed:Worker's tunnel", "cast:Invisibility"],
+        )
+
+    def test_comma_split_preserves_apostrophes_inside_value(self):
+        """Conservative comma split must NOT shred 'Worker's tunnel, west cellar'."""
+        # The whole string is one marker whose value happens to contain a comma.
+        # Because "west cellar" doesn't start with a known prefix, we keep it whole.
+        s = "location_changed:Worker's tunnel, west cellar"
+        self.assertEqual(self.normalize(s), [s])
+
+    def test_double_wrapped_string_unwraps(self):
+        """An accidentally double-quoted single marker still works."""
+        self.assertEqual(self.normalize('"cast:Invisibility"'), ["cast:Invisibility"])
+
+    def test_unrecognizable_input_raises(self):
+        """A dict / int / etc. must NOT silently drop to []."""
+        with self.assertRaises(ValueError):
+            self.normalize({"cast": "X"})
+        with self.assertRaises(ValueError):
+            self.normalize(42)
+
+    def test_list_with_one_comma_separated_element_flattens(self):
+        """If the AI sends ['cast:X, hp:1>0'] by accident, we split it."""
+        self.assertEqual(
+            self.normalize(["cast:X, hp:1>0"]),
+            ["cast:X", "hp:1>0"],
+        )
+
 
 class TestSaveAndVerifyRoundTrip(unittest.TestCase):
     """End-to-end: a marker list passed in must come back via verify_turn."""
@@ -239,6 +286,22 @@ class TestSaveAndVerifyRoundTrip(unittest.TestCase):
         self.assertEqual(result.get("marker_count", 0), 0)
         # Debug should still surface what was (not) found.
         self.assertEqual(result["debug"]["markers_in_db_type"], "missing")
+
+    def test_apostrophe_markers_roundtrip_through_db(self):
+        """The exact case the user asked about — apostrophes in a list must
+        round-trip cleanly through structured_response_json."""
+        markers = ["location_changed:Worker's tunnel", "cast:Invisibility"]
+        _turn_id, result = self._save_turn_with_markers(markers)
+        self.assertEqual(result.get("marker_count"), 2)
+        self.assertEqual(
+            result["debug"]["markers_in_db_raw"],
+            ["location_changed:Worker's tunnel", "cast:Invisibility"],
+            "Apostrophes must survive JSON serialization through the DB.",
+        )
+        # location_changed should resolve as unverified (scene_location was
+        # not passed) and cast:Invisibility should confirm.
+        self.assertEqual(len(result.get("confirmed", [])), 1)
+        self.assertEqual(result["confirmed"][0]["type"], "cast")
 
 
 if __name__ == "__main__":

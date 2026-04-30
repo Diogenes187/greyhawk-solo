@@ -91,6 +91,7 @@ Run standalone for testing:
     python server/mcp_server.py
 """
 
+import ast
 import json
 import random
 import re
@@ -100,80 +101,169 @@ from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any
 
+from pydantic import BeforeValidator, Field
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # MARKERS INPUT NORMALIZATION
 # ──────────────────────────────────────────────────────────────────────────────
 #
-# The save_turn `markers` parameter is documented as list[str], but in
-# practice MCP clients sometimes serialize the argument as a string — either
-# a JSON-array literal ('["cast:Invisibility", "hp:41>38"]'), a single
-# marker string ('cast:Invisibility'), or a newline/comma-separated batch.
-# This helper accepts every shape and returns a clean list[str].
+# The save_turn `markers` parameter is exposed to MCP clients as a strict
+# `array of string` schema. But because some clients (and some models) still
+# serialize array arguments as Python repr, JSON-string literals, or single
+# concatenated strings, a Pydantic BeforeValidator coerces every plausible
+# input shape into a clean list[str] before validation runs. That keeps the
+# schema simple and authoritative while remaining tolerant to the messy
+# reality of model output.
 # ──────────────────────────────────────────────────────────────────────────────
 
+_MARKER_PREFIXES = {
+    "cast", "item_added", "item_used", "hp",
+    "spent", "gained", "npc_added", "location_changed", "troop_change",
+}
+
 CANONICAL_MARKER_FORMAT_HELP = (
-    "Markers must be a JSON array of strings, one per state change. "
-    "Each string uses one of these exact prefixes:\n"
-    '  "cast:[spell name]"\n'
-    '  "item_added:[name]"   "item_used:[name]"\n'
-    '  "hp:[old]>[new]"\n'
-    '  "spent:[amount]gp"    "gained:[amount]gp"\n'
-    '  "npc_added:[name]"\n'
-    '  "location_changed:[name]"\n'
-    '  "troop_change:[group]:[old]>[new]"\n'
-    "Example correct call:\n"
-    '  save_turn(player_action="...", dm_narrative="...",\n'
-    '            markers=["cast:Invisibility", "hp:41>38"])'
+    'markers MUST be a JSON array of strings (e.g. ["cast:Invisibility", '
+    '"hp:41>38"]). One marker per state change. Apostrophes and other '
+    "special characters are safe inside the strings — pass them raw, no "
+    "escaping needed. Use one of these prefixes per marker:\n"
+    "  cast:[spell name]\n"
+    "  item_added:[name]      item_used:[name]\n"
+    "  hp:[old]>[new]\n"
+    "  spent:[amount]gp       gained:[amount]gp\n"
+    "  npc_added:[name]\n"
+    "  location_changed:[name]\n"
+    "  troop_change:[group]:[old]>[new]"
 )
+
+
+def _looks_like_marker(s: str) -> bool:
+    """Quick heuristic: does this string start with a known marker prefix?"""
+    if not s or ":" not in s:
+        return False
+    return s.split(":", 1)[0].strip().lower() in _MARKER_PREFIXES
+
+
+def _split_string_into_markers(s: str) -> list[str]:
+    """
+    Turn ONE string into a list of marker strings, applying fallbacks in
+    order: JSON array → Python repr (ast.literal_eval) → newline split →
+    conservative comma split → single-element wrap.
+
+    The comma split only fires when every comma-separated piece looks like a
+    valid marker prefix — so values that legitimately contain commas
+    (e.g. "Worker's tunnel, west cellar") aren't shredded.
+    """
+    if not isinstance(s, str):
+        return []
+    s = s.strip()
+    if not s:
+        return []
+
+    # Strip an outer pair of matched wrapping quotes that some clients add
+    # when they over-serialize a string argument (e.g. '"cast:X"').
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ('"', "'"):
+        inner = s[1:-1]
+        if s[0] not in inner:  # only strip if no quote is interior
+            s = inner.strip()
+            if not s:
+                return []
+
+    # 1. JSON array literal — apostrophes are safe inside JSON strings.
+    if s.startswith("[") and s.endswith("]"):
+        try:
+            parsed = json.loads(s)
+            if isinstance(parsed, list):
+                cleaned = [str(m).strip() for m in parsed
+                           if isinstance(m, str) and str(m).strip()]
+                if cleaned:
+                    return cleaned
+        except (json.JSONDecodeError, TypeError):
+            pass
+        # 2. Python repr fallback — handles single-quoted lists like
+        #    "['cast:X', 'hp:1>0']" and Python-escaped apostrophes such as
+        #    "['Worker\\'s tunnel']" that are invalid as JSON.
+        try:
+            parsed = ast.literal_eval(s)
+            if isinstance(parsed, list):
+                cleaned = [str(m).strip() for m in parsed
+                           if isinstance(m, str) and str(m).strip()]
+                if cleaned:
+                    return cleaned
+        except (ValueError, SyntaxError):
+            pass
+
+    # 3. Newline split — apostrophes inside a marker value never include
+    #    newlines, so this is always safe.
+    if "\n" in s:
+        parts = [p.strip() for p in s.replace("\r", "").split("\n") if p.strip()]
+        if parts:
+            return parts
+
+    # 4. Conservative comma split — fires only when EVERY piece looks like a
+    #    real marker. "location_changed:Worker's tunnel, west cellar" stays
+    #    intact because "west cellar" has no marker prefix.
+    if "," in s:
+        pieces = [p.strip() for p in s.split(",") if p.strip()]
+        if pieces and all(_looks_like_marker(p) for p in pieces):
+            return pieces
+
+    # 5. Single marker — wrap as a one-element list. Never returns [] for a
+    #    non-empty input string.
+    return [s]
 
 
 def _normalize_markers(raw: Any) -> list[str]:
     """
-    Coerce whatever the MCP client sent into a clean list of marker strings.
+    Coerce any plausible MCP input into list[str].
 
-    Accepts:
-      - list[str]                     → cleaned in place
-      - JSON-array string             → json.loads first
-      - newline-separated string      → split on \\n
-      - comma-separated string        → split on , (only if no newlines)
-      - single marker string          → wrapped in a 1-element list
-      - None / empty / whitespace     → []
+    Used as a Pydantic BeforeValidator on the save_turn markers parameter,
+    and exposed for direct tests.
 
-    Whitespace is stripped from every entry; empties are dropped.
+    Acceptance order:
+      None / ""              → []
+      list                   → recursively flatten each element
+      str                    → _split_string_into_markers (5-step fallback)
+      anything else          → ValueError (surfaces to the AI as a
+                                Pydantic validation error — never silent)
     """
     if raw is None:
         return []
-
     if isinstance(raw, list):
-        return [str(m).strip() for m in raw
-                if isinstance(m, str) and str(m).strip()]
-
+        result: list[str] = []
+        for item in raw:
+            if isinstance(item, str):
+                result.extend(_split_string_into_markers(item))
+            # silently drop non-strings inside a list — schema validation
+            # will already have flagged the type elsewhere.
+        return result
     if isinstance(raw, str):
-        s = raw.strip()
-        if not s:
-            return []
-        # JSON array literal? Try that first.
-        if s.startswith("[") and s.endswith("]"):
-            try:
-                parsed = json.loads(s)
-                if isinstance(parsed, list):
-                    return [str(m).strip() for m in parsed
-                            if isinstance(m, str) and str(m).strip()]
-            except (json.JSONDecodeError, TypeError):
-                pass
-        # Newline-separated takes precedence over commas (commas appear inside
-        # marker values like "Quasquetan, north wall"; newlines never do).
-        if "\n" in s:
-            parts = [p.strip() for p in s.replace("\r", "").split("\n")]
-        elif "," in s:
-            parts = [p.strip() for p in s.split(",")]
-        else:
-            parts = [s]
-        return [p for p in parts if p]
+        return _split_string_into_markers(raw)
+    raise ValueError(
+        f"markers must be a JSON array of strings (or a string). "
+        f"Received {type(raw).__name__}: {raw!r}. "
+        + CANONICAL_MARKER_FORMAT_HELP
+    )
 
-    # Fall through for anything else (dict, int, etc) — treat as no markers.
-    return []
+
+# Pydantic-friendly Annotated type alias used by save_turn. Schema is
+# {"type":"array","items":{"type":"string"}} — single, unambiguous, with
+# the description visible to the model.
+MarkersField = Annotated[
+    list[str],
+    BeforeValidator(_normalize_markers),
+    Field(description=(
+        "Array of structured state-change markers — one string per change. "
+        'Example: ["cast:Invisibility", "hp:41>38", '
+        '"location_changed:Worker\'s tunnel"]. Apostrophes and other special '
+        "characters are safe inside the strings (no escaping needed). "
+        "Prefixes: cast:[spell], item_added:[name], item_used:[name], "
+        "hp:[old]>[new], spent:[N]gp, gained:[N]gp, npc_added:[name], "
+        "location_changed:[name], troop_change:[group]:[old]>[new]. "
+        "Pass [] (or omit) only when nothing changed; a turn with no "
+        "markers returns verdict='no_claims'."
+    )),
+]
 
 # Allow imports from project root (works whether run from root or server/)
 _ROOT = Path(__file__).parent.parent
@@ -532,18 +622,7 @@ def save_turn(
         "history log only). Verification does NOT parse this — use the markers "
         "parameter for state changes.",
     ] = "",
-    markers: Annotated[
-        list[str] | str | None,
-        "Structured state-change markers — REQUIRED for any turn that mutates "
-        "game state. PREFERRED: a JSON array of strings, e.g. "
-        '["cast:Invisibility", "hp:41>38"]. ALSO ACCEPTED: a single marker '
-        'string ("cast:Invisibility"), a newline-separated batch '
-        '("cast:Invisibility\\nhp:41>38"), or a JSON-array literal as a string. '
-        "All forms normalize to a list internally. Each marker uses one of "
-        "the prefixes shown in the docstring. Pass [] (or omit) ONLY when "
-        "nothing changed (pure dialogue / OOC) — a turn with no markers cannot "
-        "be verified and will return verdict='no_claims'.",
-    ] = None,
+    markers: MarkersField = [],
     model_name: Annotated[
         str,
         "Model that generated this turn. Default 'claude'.",
@@ -619,15 +698,15 @@ def save_turn(
     is the *write*. verify_turn checks the claim against the write.
     ════════════════════════════════════════════════════════════════════════
     """
-    # ── Normalize markers ─────────────────────────────────────────────────────
-    # Accept list, JSON-array string, newline/comma-separated string, or None.
-    # Track the raw input shape so the AI can debug serialization mismatches.
-    markers_raw_repr = (
-        f"{type(markers).__name__}: {markers!r}"
-        if markers is not None
-        else "None"
-    )
-    clean_markers = _normalize_markers(markers)
+    # ── Markers normalization ─────────────────────────────────────────────────
+    # The Pydantic BeforeValidator on MarkersField has already coerced any
+    # input shape (JSON-array string, single marker, etc.) into list[str].
+    # By the time we get here, `markers` is always a clean list. We still
+    # filter out any whitespace-only entries that may have slipped through.
+    clean_markers = [
+        m.strip() for m in (markers or [])
+        if isinstance(m, str) and m.strip()
+    ]
 
     structured: dict = {}
     if scene_location:
@@ -661,8 +740,8 @@ def save_turn(
         "location":     scene_location or "(unchanged)",
         "notes_stored": bool(scene_notes),
         "verification": verification,
-        "markers_received_raw_type": markers_raw_repr,
-        "markers_normalized":        clean_markers,
+        "markers_received_count": len(markers or []),
+        "markers_normalized":     clean_markers,
         "world_fact_reminder": (
             "Check this turn for anything that should be written to the database "
             "immediately — do not let it live only in chat history. Call "
@@ -673,12 +752,10 @@ def save_turn(
         ),
     }
 
-    # If verdict came back as no_claims and the caller did pass *something* in
-    # markers, surface the format help so the AI can self-correct on the next
-    # turn instead of repeating the same mistake.
-    if (verification.get("verdict") == "no_claims"
-            and markers is not None
-            and not clean_markers):
+    # If markers came in non-empty but normalized to nothing, the input shape
+    # was unrecognizable — surface the canonical format help so the AI knows
+    # how to retry without burning another turn.
+    if markers and not clean_markers:
         result["markers_format_help"] = CANONICAL_MARKER_FORMAT_HELP
 
     # Surface conflicts prominently so the DM sees them immediately
