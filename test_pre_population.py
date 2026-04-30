@@ -486,5 +486,151 @@ class TestPopulateNpc(_BaseFixture):
         self.assertIn("not found", result["error"])
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Smart class-aware ability assignment (4d6 drop lowest)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestSmartAbilityAssignment(_BaseFixture):
+    """Highest rolled score must always land on the prime requisite for
+    each class. Second highest must land on CON for survivability (except
+    Monk, where Wisdom is the explicit secondary)."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        # Seed three additional NPC base rows: a fighter, a cleric, a mage.
+        c = sqlite3.connect(cls.db_path)
+        c.executemany(
+            "INSERT INTO characters "
+            "(character_id, campaign_id, name, character_type, race) "
+            "VALUES (?, ?, ?, 'npc', 'Human')",
+            [
+                (10, 1, "Sword Sergeant"),
+                (11, 1, "Brother Hadrian"),
+                (12, 1, "Magus Veil"),
+                (13, 1, "Shadow Pell"),
+                (14, 1, "Brother Monk"),
+                (15, 1, "Twin Path"),
+            ],
+        )
+        c.commit()
+        c.close()
+
+    async def asyncSetUp(self):
+        # Wipe rolled stats but keep our seeded base rows.
+        await super().asyncSetUp()
+
+    def _max_keys(self, abilities: dict) -> set:
+        m = max(abilities.values())
+        return {k for k, v in abilities.items() if v == m}
+
+    def _second_max(self, abilities: dict) -> int:
+        return sorted(abilities.values(), reverse=True)[1]
+
+    async def test_fighter_prime_is_strength(self):
+        result = await self._call("populate_npc", {
+            "npc_name": "Sword Sergeant", "level": 5, "class_name": "Fighter",
+        })
+        self.assertEqual(result["roll_method"], "4d6_drop_lowest")
+        self.assertEqual(result["ability_priority"][0], "strength")
+        ab = result["abilities"]
+        self.assertEqual(ab["strength"], max(ab.values()),
+                         f"Fighter prime must be STR; got {ab}")
+        # Second-highest goes to CON for survivability.
+        self.assertEqual(ab["constitution"], self._second_max(ab),
+                         f"Fighter 2nd priority must be CON; got {ab}")
+
+    async def test_cleric_prime_is_wisdom(self):
+        result = await self._call("populate_npc", {
+            "npc_name": "Brother Hadrian", "level": 5, "class_name": "Cleric",
+        })
+        ab = result["abilities"]
+        self.assertEqual(ab["wisdom"], max(ab.values()),
+                         f"Cleric prime must be WIS; got {ab}")
+        self.assertEqual(ab["constitution"], self._second_max(ab),
+                         f"Cleric 2nd priority must be CON; got {ab}")
+
+    async def test_magic_user_prime_is_intelligence(self):
+        result = await self._call("populate_npc", {
+            "npc_name": "Magus Veil", "level": 5, "class_name": "Magic-User",
+        })
+        ab = result["abilities"]
+        self.assertEqual(ab["intelligence"], max(ab.values()),
+                         f"Magic-User prime must be INT; got {ab}")
+        self.assertEqual(ab["constitution"], self._second_max(ab),
+                         f"Magic-User 2nd priority must be CON; got {ab}")
+
+    async def test_thief_prime_is_dexterity(self):
+        result = await self._call("populate_npc", {
+            "npc_name": "Shadow Pell", "level": 5, "class_name": "Thief",
+        })
+        ab = result["abilities"]
+        self.assertEqual(ab["dexterity"], max(ab.values()),
+                         f"Thief prime must be DEX; got {ab}")
+        self.assertEqual(ab["constitution"], self._second_max(ab),
+                         f"Thief 2nd priority must be CON; got {ab}")
+
+    async def test_monk_secondary_is_wisdom(self):
+        """Per spec: Monk → highest STR, second highest WIS (not CON)."""
+        result = await self._call("populate_npc", {
+            "npc_name": "Brother Monk", "level": 5, "class_name": "Monk",
+        })
+        ab = result["abilities"]
+        self.assertEqual(ab["strength"], max(ab.values()),
+                         f"Monk prime must be STR; got {ab}")
+        self.assertEqual(ab["wisdom"], self._second_max(ab),
+                         f"Monk 2nd priority must be WIS; got {ab}")
+
+    async def test_multi_class_splits_top_scores(self):
+        """Fighter/Magic-User → highest STR, 2nd INT (both primes)."""
+        result = await self._call("populate_npc", {
+            "npc_name": "Twin Path", "level": 4,
+            "class_name": "Fighter/Magic-User",
+        })
+        ab = result["abilities"]
+        self.assertEqual(ab["strength"], max(ab.values()),
+                         f"Fighter/MU 1st prime must be STR; got {ab}")
+        self.assertEqual(ab["intelligence"], self._second_max(ab),
+                         f"Fighter/MU 2nd prime must be INT; got {ab}")
+
+    async def test_4d6_drop_lowest_distribution_skews_higher_than_3d6(self):
+        """4d6-drop-lowest yields ~12.24 mean vs 3d6's 10.5. Across a few
+        rolls the highest should rarely fall below 14, and the lowest
+        rarely below 6 — this isn't deterministic but catches a regression
+        to plain 3d6 most of the time."""
+        # Roll 50 NPC stat blocks; collect every score.
+        from engine.db import _roll_4d6_drop_lowest
+        scores = [_roll_4d6_drop_lowest() for _ in range(300)]
+        # 4d6-drop-lowest mean ≈ 12.24; allow generous slack.
+        mean = sum(scores) / len(scores)
+        self.assertGreater(mean, 11.0,
+                           f"4d6-drop-lowest mean too low ({mean:.2f}); "
+                           "regression to 3d6?")
+        # Range bounds
+        self.assertGreaterEqual(min(scores), 3)
+        self.assertLessEqual(max(scores), 18)
+
+    async def test_mixed_group_each_class_gets_its_prime(self):
+        """The user's exact ask: populate fighter/cleric/mage NPCs in one
+        group and confirm each stat array looks right."""
+        f = await self._call("populate_npc", {
+            "npc_name": "Sword Sergeant", "level": 4, "class_name": "Fighter",
+        })
+        c = await self._call("populate_npc", {
+            "npc_name": "Brother Hadrian", "level": 4, "class_name": "Cleric",
+        })
+        m = await self._call("populate_npc", {
+            "npc_name": "Magus Veil", "level": 4, "class_name": "Magic-User",
+        })
+
+        self.assertEqual(f["abilities"]["strength"],     max(f["abilities"].values()))
+        self.assertEqual(c["abilities"]["wisdom"],       max(c["abilities"].values()))
+        self.assertEqual(m["abilities"]["intelligence"], max(m["abilities"].values()))
+
+        # All three should be using the new method.
+        for npc in (f, c, m):
+            self.assertEqual(npc["roll_method"], "4d6_drop_lowest")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -7296,24 +7296,124 @@ def _npc_thac0(class_name: str, level: int) -> int:
     return max(6, 20 - max(0, level - 1) // 3)
 
 
+_CLASS_ABILITY_PRIORITY: dict[str, list[str]] = {
+    # Order: highest score → first ability, etc. Prime requisite first,
+    # then survivability/utility per AD&D 1e class concerns.
+    "fighter":     ["strength", "constitution", "dexterity", "wisdom", "charisma", "intelligence"],
+    "paladin":     ["strength", "constitution", "wisdom", "charisma", "dexterity", "intelligence"],
+    "ranger":      ["strength", "constitution", "dexterity", "wisdom", "intelligence", "charisma"],
+    "cleric":      ["wisdom", "constitution", "strength", "charisma", "dexterity", "intelligence"],
+    "druid":       ["wisdom", "constitution", "charisma", "strength", "dexterity", "intelligence"],
+    "magicuser":   ["intelligence", "constitution", "dexterity", "wisdom", "charisma", "strength"],
+    "mage":        ["intelligence", "constitution", "dexterity", "wisdom", "charisma", "strength"],
+    "illusionist": ["intelligence", "constitution", "dexterity", "wisdom", "charisma", "strength"],
+    "thief":       ["dexterity", "constitution", "strength", "charisma", "intelligence", "wisdom"],
+    "assassin":    ["dexterity", "constitution", "strength", "intelligence", "wisdom", "charisma"],
+    "monk":        ["strength", "wisdom", "dexterity", "constitution", "charisma", "intelligence"],
+    "bard":        ["charisma", "dexterity", "intelligence", "constitution", "strength", "wisdom"],
+}
+
+_ARCHETYPE_PRIORITY: dict[str, list[str]] = {
+    # For monsters / generic NPCs without a real class. Pick by description.
+    "combat":  ["strength", "constitution", "dexterity", "wisdom", "charisma", "intelligence"],
+    "arcane":  ["intelligence", "constitution", "dexterity", "wisdom", "charisma", "strength"],
+    "divine":  ["wisdom", "constitution", "strength", "charisma", "dexterity", "intelligence"],
+    "stealth": ["dexterity", "constitution", "strength", "intelligence", "charisma", "wisdom"],
+}
+
+
+def _normalize_class_token(s: str) -> str:
+    return (s or "").strip().lower().replace("-", "").replace(" ", "")
+
+
+def _ability_priority(class_name: str) -> list[str]:
+    """
+    Return the ability list in priority order for assignment (highest score
+    → first ability, etc.). Handles single class, multi-class (split with /
+    or |), known archetypes ('combat'/'arcane'/'divine'/'stealth'), and
+    unknown class names (falls back to combat priority).
+
+    For multi-class, primes from each class are stacked in declared order,
+    then CON for survivability, then the rest.
+    """
+    raw = (class_name or "").strip()
+    if not raw:
+        return list(_ARCHETYPE_PRIORITY["combat"])
+
+    # Archetype shortcut for monsters / generic NPCs
+    arch = _ARCHETYPE_PRIORITY.get(_normalize_class_token(raw))
+    if arch:
+        return list(arch)
+
+    parts = [p for p in re.split(r"[/|]", raw) if p.strip()]
+
+    primes: list[str] = []
+    for p in parts:
+        cl = _normalize_class_token(p)
+        cls_prio = _CLASS_ABILITY_PRIORITY.get(cl)
+        if cls_prio and cls_prio[0] not in primes:
+            primes.append(cls_prio[0])
+
+    # Special case: monk — explicitly STR primary, WIS secondary.
+    if len(parts) == 1 and _normalize_class_token(parts[0]) == "monk":
+        return list(_CLASS_ABILITY_PRIORITY["monk"])
+
+    if not primes:
+        # Unrecognized class name — default to combat priority.
+        return list(_ARCHETYPE_PRIORITY["combat"])
+
+    result: list[str] = list(primes)
+    if "constitution" not in result:
+        result.append("constitution")
+
+    fillers = ["dexterity", "wisdom", "charisma", "intelligence",
+               "strength", "constitution"]
+    for ab in fillers:
+        if ab not in result:
+            result.append(ab)
+    return result[:6]
+
+
+def _roll_4d6_drop_lowest() -> int:
+    """Roll 4d6 and drop the lowest die. Returns int 3..18."""
+    rolls = [random.randint(1, 6) for _ in range(4)]
+    rolls.sort()
+    return sum(rolls[1:])  # drop rolls[0] (the lowest)
+
+
+def _roll_and_assign_abilities(class_name: str) -> dict:
+    """
+    Roll six 4d6-drop-lowest scores, sort descending, and assign them to
+    abilities in the priority order for the given class. Returns a dict
+    keyed by ability name (lowercase). The highest score always lands on
+    the prime requisite — never random.
+    """
+    scores = sorted(
+        [_roll_4d6_drop_lowest() for _ in range(6)], reverse=True
+    )
+    priority = _ability_priority(class_name)
+    return {ability: int(scores[i]) for i, ability in enumerate(priority)}
+
+
 def _roll_npc_stats(class_name: str, level: int = 1) -> dict:
     """
-    Roll AD&D 1e NPC stats: 6 abilities (3d6 in order), HP, AC, THAC0,
-    starting equipment, carried gold, and a small chance of a personal
-    magic item. Pure rolling — no DB writes.
+    Roll AD&D 1e NPC stats: 6 abilities via 4d6-drop-lowest with smart
+    class-aware assignment, HP, AC, THAC0, starting equipment, carried
+    gold, and a small chance of a personal magic item. Pure rolling — no
+    DB writes.
+
+    Ability assignment puts the highest rolled score on the class's prime
+    requisite (e.g. STR for Fighter, INT for Magic-User, WIS for Cleric,
+    DEX for Thief). Second-highest goes to CON for survivability across
+    most classes, except Monk where it goes to WIS per class design.
+    Multi-class names like 'Fighter/Magic-User' split the top scores
+    between both prime requisites in declared order.
     """
-    cl = (class_name or "fighter").strip().lower().replace("-", "").replace(" ", "")
+    cl = _normalize_class_token(class_name) or "fighter"
     hd  = _NPC_HIT_DIE.get(cl, 8)
     base_ac = _NPC_DEFAULT_AC.get(cl, 9)
 
-    abilities = {
-        "strength":     sum(random.randint(1, 6) for _ in range(3)),
-        "intelligence": sum(random.randint(1, 6) for _ in range(3)),
-        "wisdom":       sum(random.randint(1, 6) for _ in range(3)),
-        "dexterity":    sum(random.randint(1, 6) for _ in range(3)),
-        "constitution": sum(random.randint(1, 6) for _ in range(3)),
-        "charisma":     sum(random.randint(1, 6) for _ in range(3)),
-    }
+    abilities = _roll_and_assign_abilities(class_name)
 
     fighter_class = cl in ("fighter", "paladin", "ranger")
     con_bonus = _con_hp_bonus(abilities["constitution"], fighter_class)
@@ -7337,19 +7437,21 @@ def _roll_npc_stats(class_name: str, level: int = 1) -> dict:
             magic_items = []
 
     return {
-        "class":        class_name,
-        "level":        level,
-        "hit_die":      f"d{hd}",
-        "abilities":    abilities,
-        "hp_max":       hp_max,
-        "hp_rolls":     hp_rolls,
-        "con_hp_bonus": con_bonus,
-        "ac":           ac,
-        "dex_ac_bonus": dex_ac,
-        "thac0":        thac0,
-        "equipment":    equipment,
-        "carried_gp":   carried_gp,
-        "magic_items":  magic_items,
+        "class":             class_name,
+        "level":             level,
+        "hit_die":           f"d{hd}",
+        "abilities":         abilities,
+        "ability_priority":  _ability_priority(class_name),
+        "roll_method":       "4d6_drop_lowest",
+        "hp_max":            hp_max,
+        "hp_rolls":          hp_rolls,
+        "con_hp_bonus":      con_bonus,
+        "ac":                ac,
+        "dex_ac_bonus":      dex_ac,
+        "thac0":             thac0,
+        "equipment":         equipment,
+        "carried_gp":        carried_gp,
+        "magic_items":       magic_items,
     }
 
 
@@ -7479,16 +7581,19 @@ def db_populate_npc(
                 (char_id, stats["hp_max"], stats["hp_max"], stats["ac"]),
             )
 
-        # Stash equipment + carried gold + thac0 + magic items in a
-        # category='npc_stats' world_facts row keyed to this character.
+        # Stash equipment + carried gold + thac0 + magic items + roll
+        # provenance in a category='npc_stats' world_facts row keyed to
+        # this character.
         wf_payload = {
-            "character_id": char_id,
-            "name":         npc_row["name"],
-            "thac0":        stats["thac0"],
-            "hit_die":      stats["hit_die"],
-            "equipment":    stats["equipment"],
-            "carried_gp":   stats["carried_gp"],
-            "magic_items":  stats["magic_items"],
+            "character_id":      char_id,
+            "name":              npc_row["name"],
+            "thac0":             stats["thac0"],
+            "hit_die":           stats["hit_die"],
+            "equipment":         stats["equipment"],
+            "carried_gp":        stats["carried_gp"],
+            "magic_items":       stats["magic_items"],
+            "roll_method":       stats.get("roll_method"),
+            "ability_priority":  stats.get("ability_priority"),
         }
         # Replace any prior npc_stats for this char.
         conn.execute(
@@ -7559,4 +7664,6 @@ def _read_npc_full_stats(character_id: int, already_populated: bool) -> dict:
         "equipment":         extra.get("equipment", []),
         "carried_gp":        extra.get("carried_gp"),
         "magic_items":       extra.get("magic_items", []),
+        "roll_method":       extra.get("roll_method", "4d6_drop_lowest"),
+        "ability_priority":  extra.get("ability_priority", []),
     }
