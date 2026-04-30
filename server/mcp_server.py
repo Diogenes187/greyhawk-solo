@@ -740,8 +740,14 @@ def save_turn(
         "location":     scene_location or "(unchanged)",
         "notes_stored": bool(scene_notes),
         "verification": verification,
-        "markers_received_count": len(markers or []),
-        "markers_normalized":     clean_markers,
+        # Debug fields the AI can read to confirm markers actually arrived.
+        # After the Pydantic BeforeValidator runs, `markers` is always a
+        # list — so seeing `markers_received_raw_type == "list"` proves the
+        # schema/coercion path delivered the data. A None here would mean
+        # the parameter was dropped before reaching the handler.
+        "markers_received_raw_type":  type(markers).__name__,
+        "markers_received_count":     len(markers or []),
+        "markers_normalized":         clean_markers,
         "world_fact_reminder": (
             "Check this turn for anything that should be written to the database "
             "immediately — do not let it live only in chat history. Call "

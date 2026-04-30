@@ -304,5 +304,97 @@ class TestSaveAndVerifyRoundTrip(unittest.TestCase):
         self.assertEqual(result["confirmed"][0]["type"], "cast")
 
 
+class TestSchemaAndLiveDispatch(unittest.IsolatedAsyncioTestCase):
+    """
+    End-to-end against the actual @mcp.tool() registration. Proves:
+      1. The markers parameter IS in the schema (not just the docstring).
+      2. Schema declares array of string with default [] and a description.
+      3. A live tool dispatch with markers=["test:value"] reports
+         markers_received_raw_type='list' (proving the parameter survived
+         the JSON-RPC boundary and Pydantic validation).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmpdir  = Path(tempfile.mkdtemp(prefix="greyhawk_test_live_"))
+        cls.db_path = cls.tmpdir / "test.db"
+        _build_test_db(cls.db_path)
+        from engine import db as engine_db
+        cls._patcher = patch.object(
+            engine_db, "_resolve_db_path", return_value=cls.db_path
+        )
+        cls._patcher.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._patcher.stop()
+        shutil.rmtree(cls.tmpdir, ignore_errors=True)
+
+    async def test_markers_is_registered_in_input_schema(self):
+        """save_turn's input schema must include markers as array of string
+        with default [] and a non-empty description."""
+        from server.mcp_server import mcp
+        tools = await mcp.list_tools()
+        save_turn = next(t for t in tools if t.name == "save_turn")
+
+        self.assertIn("markers", save_turn.inputSchema["properties"],
+                      "markers parameter is missing from the registered schema")
+
+        m = save_turn.inputSchema["properties"]["markers"]
+        self.assertEqual(m.get("type"), "array",
+                         f"markers schema is not array; got {m}")
+        self.assertEqual(m.get("items", {}).get("type"), "string",
+                         f"markers items not string; got {m}")
+        self.assertEqual(m.get("default"), [],
+                         f"markers default is not []; got {m}")
+        self.assertTrue(m.get("description", "").strip(),
+                        "markers schema is missing a description")
+        # markers MUST be optional, not required
+        self.assertNotIn("markers", save_turn.inputSchema.get("required", []))
+
+    async def test_minimal_call_markers_arrive_as_list(self):
+        """The minimal save_turn call: just the two required params plus
+        markers. markers_received_raw_type MUST be 'list', NOT 'NoneType'."""
+        import json as _json
+        from server.mcp_server import mcp
+
+        result = await mcp.call_tool("save_turn", {
+            "player_action": "test",
+            "dm_narrative":  "test",
+            "markers":       ["test:value"],
+        })
+        text = result[0].text if hasattr(result[0], "text") else str(result[0])
+        payload = _json.loads(text)
+
+        self.assertEqual(
+            payload.get("markers_received_raw_type"), "list",
+            f"markers were dropped before reaching the function. Full payload:\n"
+            f"{_json.dumps(payload, indent=2)}",
+        )
+        self.assertEqual(payload.get("markers_received_count"), 1)
+        self.assertEqual(payload.get("markers_normalized"), ["test:value"])
+
+    async def test_minimal_call_with_apostrophes_arrives_intact(self):
+        """The user's specific apostrophe case via the live tool dispatch."""
+        import json as _json
+        from server.mcp_server import mcp
+
+        result = await mcp.call_tool("save_turn", {
+            "player_action": "test",
+            "dm_narrative":  "test",
+            "markers":       ["location_changed:Worker's tunnel",
+                              "cast:Invisibility"],
+        })
+        text = result[0].text if hasattr(result[0], "text") else str(result[0])
+        payload = _json.loads(text)
+
+        self.assertEqual(payload["markers_received_raw_type"], "list")
+        self.assertEqual(payload["markers_received_count"], 2)
+        self.assertEqual(
+            payload["markers_normalized"],
+            ["location_changed:Worker's tunnel", "cast:Invisibility"],
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
