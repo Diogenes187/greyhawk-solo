@@ -976,6 +976,35 @@ CREATE TABLE world_facts (
 );
 
 -- ============================================================
+-- AREA PRE-POPULATION (Phase 7)
+-- One row per pre-rolled encounter group (room) inside a location.
+-- HP is stored per-individual so the same fight plays the same way
+-- if the player retreats and returns. Treasure is rolled at populate
+-- time so room contents are consistent across visits.
+-- ============================================================
+CREATE TABLE area_instances (
+    area_instance_id    INTEGER PRIMARY KEY,
+    campaign_id         INTEGER NOT NULL,
+    location_id         INTEGER,
+    location_name       TEXT NOT NULL,
+    room_label          TEXT,
+    dungeon_level       INTEGER NOT NULL DEFAULT 1,
+    monster_type        TEXT,
+    monster_count       INTEGER NOT NULL DEFAULT 0,
+    individual_hp_json  TEXT,
+    monster_status_json TEXT,
+    treasure_json       TEXT,
+    treasure_status     TEXT NOT NULL DEFAULT 'intact',
+    encounter_status    TEXT NOT NULL DEFAULT 'pending',
+    created_date        TEXT NOT NULL,
+    notes               TEXT,
+    FOREIGN KEY (campaign_id) REFERENCES campaigns(campaign_id),
+    FOREIGN KEY (location_id) REFERENCES locations(location_id)
+);
+CREATE INDEX IF NOT EXISTS idx_area_instances_location_name
+    ON area_instances(location_name);
+
+-- ============================================================
 -- SCHEMA: VIEWS
 -- ============================================================
 

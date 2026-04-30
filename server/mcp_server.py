@@ -334,6 +334,13 @@ from engine.db import (
     # Phase 6 — turn verification
     db_verify_turn,
     db_update_turn_verification,
+    # Phase 7 — area pre-population
+    db_populate_area,
+    db_get_area_encounters,
+    db_get_monster_instance,
+    db_update_monster_instance,
+    db_find_pre_rolled_for_combat,
+    db_populate_npc,
     # Phase 4 — domain
     get_full_domain_state,
     db_add_construction_project,
@@ -1559,10 +1566,50 @@ def start_combat(
             "morale_broken":  False,
         }
 
+        # ── Phase 7: consult pre-rolled area_instances ────────────────────────
+        # Two ways to get pre-rolled HP into this group, in priority order:
+        #   (a) `individual_hp`: an explicit list passed by the caller
+        #       (typically by start_combat_from_area, see below).
+        #   (b) Auto-lookup by (location, monster name) when the location
+        #       has a pending pre-rolled instance.
+        prerolled_hp:           list[int] | None = None
+        prerolled_instance_id:  int        | None = None
+        if isinstance(grp.get("individual_hp"), list) and grp["individual_hp"]:
+            prerolled_hp = [int(h) for h in grp["individual_hp"]]
+        elif grp.get("area_instance_id"):
+            try:
+                inst = db_get_monster_instance(int(grp["area_instance_id"]), 0)
+                if not inst.get("error"):
+                    encounters = db_get_area_encounters(
+                        location, auto_populate=False
+                    )
+                    for room in encounters.get("rooms", []):
+                        if room["area_instance_id"] == int(grp["area_instance_id"]):
+                            prerolled_hp = list(room.get("individual_hp") or [])
+                            prerolled_instance_id = room["area_instance_id"]
+                            break
+            except Exception:
+                prerolled_hp = None
+        elif location:
+            inst = db_find_pre_rolled_for_combat(
+                location_name=location, monster_type=disp_name,
+            )
+            if inst:
+                try:
+                    hp_list = json.loads(inst.get("individual_hp_json") or "[]")
+                except (json.JSONDecodeError, TypeError):
+                    hp_list = []
+                if hp_list and len(hp_list) >= count:
+                    prerolled_hp = [int(h) for h in hp_list[:count]]
+                    prerolled_instance_id = inst.get("area_instance_id")
+
         for i in range(1, count + 1):
             cid = f"{disp_name}_{i}"
             hp_roll, eff_hd = _roll_monster_hp(hd_text)
-            hp  = int(grp.get("hp_override", hp_roll))
+            if prerolled_hp is not None and i - 1 < len(prerolled_hp):
+                hp = int(prerolled_hp[i - 1])
+            else:
+                hp = int(grp.get("hp_override", hp_roll))
             ac  = int(grp.get("ac_override", base_ac))
             xp  = _xp_for_hd(eff_hd)
 
@@ -1581,6 +1628,10 @@ def start_combat(
                 "is_pc":       False,
                 "status":      "active",
                 "group":       group_key,
+                # Tracks back to the pre-rolled row so attacks can update it.
+                "area_instance_id":      prerolled_instance_id,
+                "monster_index":         (i - 1) if prerolled_instance_id else None,
+                "from_pre_rolled":       prerolled_hp is not None,
             }
 
     # ── Sort initiative order (highest first, PC wins ties) ───────────────────
@@ -5391,6 +5442,241 @@ def direct_db_edit(
 # ══════════════════════════════════════════════════════════════════════════════
 # ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════════════
+# AREA PRE-POPULATION  (Phase 7)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# The world exists before the player encounters it. Every encounter and
+# every treasure haul for a given location is rolled once at populate time
+# and persisted in area_instances. Subsequent visits return the same
+# monsters (same individual HP) and the same treasure, so retreating and
+# returning is consistent. Once treasure is looted it does not respawn.
+#
+# Tools:
+#   populate_area          — pre-roll all encounters + treasure for a location
+#   get_area_encounters    — return everything pre-rolled (auto-populates if absent)
+#   get_monster_instance   — fetch one monster's stats
+#   update_monster_instance — write back HP / status / treasure_status
+#   populate_npc           — roll full stat block for a named NPC
+#
+# start_combat already consults area_instances automatically: when called
+# with a `location` that has a pending pre-rolled encounter for the same
+# monster type, the pre-rolled HP values are used in place of fresh rolls.
+# Combatants from a pre-rolled instance carry area_instance_id and
+# monster_index so subsequent damage can be written back via
+# update_monster_instance.
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@mcp.tool()
+def populate_area(
+    location_name: Annotated[
+        str,
+        "Name of the location to populate, e.g. 'Worker's Tunnel', "
+        "'Quasquetan dungeon level 1'. Looked up against the locations table "
+        "case-insensitively; if no row matches, the name is still recorded "
+        "and the encounters are stored under that label.",
+    ],
+    dungeon_level: Annotated[
+        int,
+        "Dungeon level for the random encounter table (1-10).",
+    ] = 1,
+    num_rooms: Annotated[
+        int,
+        "How many rooms to auto-generate. Pass 0 to use the default of 4-6.",
+    ] = 0,
+    notes: Annotated[
+        str,
+        "Free-text notes about the area (theme, history, why it's being populated).",
+    ] = "",
+) -> dict:
+    """
+    Pre-roll every encounter and treasure haul for an area. Each room gets
+    its own row in area_instances with individual HP per monster and a
+    fully resolved treasure haul (coins by denomination, gems typed, jewelry
+    valued, magic items resolved through the standard subtable pipeline).
+
+    Idempotent: if the location already has rows, returns the existing
+    encounters unchanged so calling this multiple times is safe. To force a
+    fresh population, delete the existing rows first via direct_db_edit.
+
+    Call this once per dungeon/area at session start (or whenever the player
+    becomes aware of an area they may visit). Combat will auto-consult the
+    pre-rolled HP via start_combat — no extra wiring needed.
+    """
+    try:
+        return db_populate_area(
+            location_name=location_name,
+            dungeon_level=int(dungeon_level),
+            num_rooms=int(num_rooms) if num_rooms else None,
+            notes=notes or None,
+        )
+    except Exception as e:
+        return {"error": str(e), "tool": "populate_area"}
+
+
+@mcp.tool()
+def get_area_encounters(
+    location_name: Annotated[
+        str,
+        "Name of the location to fetch pre-rolled encounters for.",
+    ],
+    auto_populate: Annotated[
+        bool,
+        "If true (default) and the location has no pre-rolled rows yet, "
+        "populate_area is called automatically with dungeon_level. If false, "
+        "returns an empty rooms list when nothing is populated.",
+    ] = True,
+    dungeon_level: Annotated[
+        int,
+        "Dungeon level used by auto-populate. Ignored if auto_populate is false.",
+    ] = 1,
+) -> dict:
+    """
+    Return every pre-rolled room for a location: monster type, count,
+    individual HP per monster, current alive/dead status per monster,
+    treasure_status (intact / partially_looted / looted), and the full
+    treasure haul (coins, gems, jewelry, magic items).
+
+    Call this BEFORE narrating the area — the AI should know what's actually
+    in each room, not improvise.
+    """
+    try:
+        return db_get_area_encounters(
+            location_name=location_name,
+            auto_populate=bool(auto_populate),
+            dungeon_level=int(dungeon_level),
+        )
+    except Exception as e:
+        return {"error": str(e), "tool": "get_area_encounters"}
+
+
+@mcp.tool()
+def get_monster_instance(
+    area_instance_id: Annotated[
+        int,
+        "area_instance_id of the encounter group (from get_area_encounters).",
+    ],
+    monster_index: Annotated[
+        int,
+        "0-based index of the specific monster within the group.",
+    ] = 0,
+) -> dict:
+    """
+    Return one specific pre-rolled monster's stats: current HP, alive/dead
+    status, full monster reference data (HD, AC, attacks, damage, special
+    abilities), and the room's shared treasure haul.
+    """
+    try:
+        return db_get_monster_instance(
+            area_instance_id=int(area_instance_id),
+            monster_index=int(monster_index),
+        )
+    except Exception as e:
+        return {"error": str(e), "tool": "get_monster_instance"}
+
+
+@mcp.tool()
+def update_monster_instance(
+    area_instance_id: Annotated[
+        int,
+        "area_instance_id of the encounter group.",
+    ],
+    monster_index: Annotated[
+        int,
+        "0-based index of the monster to update. Pass -1 to update only "
+        "room-level fields (treasure_status / encounter_status).",
+    ] = -1,
+    hp_current: Annotated[
+        int,
+        "New current HP for this monster. Pass -1 to leave HP unchanged. "
+        "When HP drops to 0 the monster's status auto-flips to 'dead'.",
+    ] = -1,
+    status: Annotated[
+        str,
+        "Status: 'alive', 'dead', 'fled', 'fleeing'. Leave blank to leave unchanged.",
+    ] = "",
+    treasure_status: Annotated[
+        str,
+        "Treasure state: 'intact', 'partially_looted', 'looted'. Leave blank "
+        "to leave unchanged. Once 'looted' the room treasure does NOT respawn.",
+    ] = "",
+    encounter_status: Annotated[
+        str,
+        "Encounter state: 'pending', 'engaged', 'cleared'. Auto-progresses to "
+        "'cleared' when every monster is dead or fled. Leave blank to leave "
+        "unchanged.",
+    ] = "",
+) -> dict:
+    """
+    Update a monster's HP / status, or the room's treasure_status /
+    encounter_status, on a pre-rolled instance. Call this after combat damage
+    or after the party loots the room so future visits reflect what happened.
+    """
+    try:
+        return db_update_monster_instance(
+            area_instance_id=int(area_instance_id),
+            monster_index=int(monster_index) if int(monster_index) >= 0 else None,
+            hp_current=int(hp_current) if int(hp_current) >= 0 else None,
+            status=status or None,
+            treasure_status=treasure_status or None,
+            encounter_status=encounter_status or None,
+        )
+    except Exception as e:
+        return {"error": str(e), "tool": "update_monster_instance"}
+
+
+@mcp.tool()
+def populate_npc(
+    npc_name: Annotated[
+        str,
+        "Full name (or unique prefix) of the NPC. Must already exist in the "
+        "characters table — call add_npc first if needed.",
+    ],
+    level: Annotated[
+        int,
+        "NPC level (1-20). Used to roll HP, set THAC0, and gate magic-item chance.",
+    ] = 1,
+    class_name: Annotated[
+        str,
+        "AD&D 1e class: Fighter, Cleric, Magic-User, Thief, Ranger, Paladin, "
+        "Druid, Assassin, Monk, Bard. Defaults to Fighter.",
+    ] = "Fighter",
+    race: Annotated[
+        str,
+        "Race override. Defaults to whatever's already on the characters row.",
+    ] = "",
+) -> dict:
+    """
+    Pre-roll a complete stat block for a named NPC and persist it across the
+    standard tables (class_levels, character_abilities, character_status)
+    plus a world_facts row carrying THAC0, equipment, carried gold, and any
+    personal magic items.
+
+    Idempotent: if the NPC already has class_levels and character_abilities
+    rows the existing stats are returned unchanged. To deliberately reroll,
+    delete the rows via direct_db_edit first.
+
+    Stats rolled:
+      - 6 abilities (3d6 in order, AD&D 1e classic)
+      - HP (per-class hit die × level + CON bonus)
+      - AC (class default minus DEX bonus)
+      - THAC0 (per-class progression)
+      - Equipment list appropriate to class
+      - Carried gold (level-scaled)
+      - ~5%/level chance of a personal magic item (capped at 40%)
+    """
+    try:
+        return db_populate_npc(
+            npc_name=npc_name,
+            level=int(level),
+            class_name=class_name,
+            race=race or None,
+        )
+    except Exception as e:
+        return {"error": str(e), "tool": "populate_npc"}
+
 
 if __name__ == "__main__":
     mcp.run()

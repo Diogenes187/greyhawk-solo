@@ -6776,3 +6776,787 @@ def db_update_turn_verification(turn_id: int, verification_json: str) -> None:
             "UPDATE ai_turns SET validation_errors_json = ? WHERE turn_id = ?",
             (verification_json, turn_id),
         )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# AREA PRE-POPULATION  (Phase 7)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# The world exists before the player encounters it. populate_area pre-rolls all
+# encounters and treasure for a location at populate time and stores them in
+# area_instances. Subsequent visits return the same monsters with the same HP
+# and the same treasure, so retreating and returning is consistent.
+#
+# Schema lives in schema/ddl.sql; _ensure_area_instances_table runs a
+# CREATE TABLE IF NOT EXISTS at the top of every public function so existing
+# campaign DBs auto-migrate on first use without any manual step.
+# ══════════════════════════════════════════════════════════════════════════════
+
+_AREA_INSTANCES_DDL = """
+CREATE TABLE IF NOT EXISTS area_instances (
+    area_instance_id    INTEGER PRIMARY KEY,
+    campaign_id         INTEGER NOT NULL,
+    location_id         INTEGER,
+    location_name       TEXT NOT NULL,
+    room_label          TEXT,
+    dungeon_level       INTEGER NOT NULL DEFAULT 1,
+    monster_type        TEXT,
+    monster_count       INTEGER NOT NULL DEFAULT 0,
+    individual_hp_json  TEXT,
+    monster_status_json TEXT,
+    treasure_json       TEXT,
+    treasure_status     TEXT NOT NULL DEFAULT 'intact',
+    encounter_status    TEXT NOT NULL DEFAULT 'pending',
+    created_date        TEXT NOT NULL,
+    notes               TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_area_instances_location_name
+    ON area_instances(location_name);
+"""
+
+
+def _ensure_area_instances_table(conn) -> None:
+    """Idempotent runtime migration. Only runs on writable connections."""
+    conn.executescript(_AREA_INSTANCES_DDL)
+
+
+def _area_instances_table_exists(conn) -> bool:
+    """Check if the area_instances table exists. Safe on read-only connections."""
+    row = conn.execute(
+        "SELECT name FROM sqlite_master "
+        "WHERE type='table' AND name='area_instances' LIMIT 1"
+    ).fetchone()
+    return row is not None
+
+
+def _resolve_location_id(conn, location_name: str) -> int | None:
+    """Best-effort lookup of a location_id by name. Returns None if no match."""
+    row = conn.execute(
+        "SELECT location_id FROM locations "
+        "WHERE LOWER(name) = LOWER(?) AND campaign_id = ? LIMIT 1",
+        (location_name, _CAMPAIGN_ID),
+    ).fetchone()
+    return row["location_id"] if row else None
+
+
+def _roll_individual_hp(hd_text: str, count: int) -> tuple[list[int], float]:
+    """Roll HP for `count` monsters of the given HD. Returns (hp_list, eff_hd)."""
+    hp_list: list[int] = []
+    eff_hd = 1.0
+    for _ in range(max(1, int(count))):
+        hp, eff_hd = _roll_monster_hp(hd_text)
+        hp_list.append(int(hp))
+    return hp_list, eff_hd
+
+
+# ── populate_area ─────────────────────────────────────────────────────────────
+
+def db_populate_area(
+    location_name: str,
+    dungeon_level: int = 1,
+    num_rooms: int | None = None,
+    room_specs: list[dict] | None = None,
+    notes: str | None = None,
+) -> dict:
+    """
+    Pre-roll every encounter and treasure haul for a location.
+
+    Two modes:
+      - Auto: pass `num_rooms` (or leave default 4–6) and the function rolls
+        random encounters via get_random_dungeon_encounter for each room.
+      - Explicit: pass `room_specs` — a list of dicts like
+            {"room_label": "Guard post", "monster_name": "Goblin", "count": 4,
+             "treasure_type": "L"}
+        Either field may be omitted; missing fields are auto-rolled.
+
+    Idempotent on location_name: if any rows already exist for this location
+    and no force flag is set, returns the existing summary unchanged.
+    """
+    import datetime
+    now = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    with _get_conn() as conn:
+        _ensure_area_instances_table(conn)
+
+        existing = conn.execute(
+            "SELECT COUNT(*) AS n FROM area_instances WHERE location_name = ?",
+            (location_name,),
+        ).fetchone()
+        if existing and existing["n"] > 0:
+            return db_get_area_encounters(
+                location_name=location_name,
+                auto_populate=False,
+            )
+
+        location_id = _resolve_location_id(conn, location_name)
+
+        # ── Build the room plan ───────────────────────────────────────────────
+        rooms: list[dict] = []
+        if room_specs:
+            for spec in room_specs:
+                rooms.append({
+                    "room_label":    spec.get("room_label") or f"Room {len(rooms)+1}",
+                    "monster_name":  spec.get("monster_name"),
+                    "count":         spec.get("count"),
+                    "treasure_type": spec.get("treasure_type"),
+                })
+        else:
+            n = num_rooms if (num_rooms is not None and num_rooms > 0) else random.randint(4, 6)
+            for i in range(n):
+                rooms.append({
+                    "room_label":    f"Room {i+1}",
+                    "monster_name":  None,
+                    "count":         None,
+                    "treasure_type": None,
+                })
+
+        # ── Roll each room ────────────────────────────────────────────────────
+        created_rows: list[dict] = []
+
+        for room in rooms:
+            mname = room["monster_name"]
+            count = room["count"]
+            ttype = room["treasure_type"]
+
+            if not mname or not count:
+                rolled = get_random_dungeon_encounter(dungeon_level)
+                mname = mname or rolled.get("monster_name") or "Skeleton"
+                count = count or max(1, rolled.get("count", 1))
+                if not ttype:
+                    mstats = rolled.get("monster_stats") or {}
+                    ttype = (mstats.get("treasure_type") or "").strip() or None
+
+            mstats = lookup_monster(mname) if mname else {}
+            hd_text = (mstats.get("hit_dice") or "1") if mstats else "1"
+            if not ttype and mstats:
+                ttype = (mstats.get("treasure_type") or "").strip() or None
+
+            hp_list, _eff_hd = _roll_individual_hp(hd_text, int(count))
+            statuses = ["alive"] * len(hp_list)
+
+            # Treasure — only roll for valid letters; otherwise empty.
+            treasure: dict = {}
+            ttype_letter = (ttype or "").strip().upper()
+            if (len(ttype_letter) == 1
+                    and ttype_letter.isalpha()
+                    and ttype_letter != "NIL"):
+                try:
+                    treasure = roll_treasure_by_type(ttype_letter)
+                except Exception as exc:
+                    treasure = {"error": str(exc), "treasure_type": ttype_letter}
+
+            cur = conn.execute(
+                """
+                INSERT INTO area_instances (
+                    campaign_id, location_id, location_name, room_label,
+                    dungeon_level, monster_type, monster_count,
+                    individual_hp_json, monster_status_json,
+                    treasure_json, treasure_status, encounter_status,
+                    created_date, notes
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'intact', 'pending', ?, ?)
+                """,
+                (
+                    _CAMPAIGN_ID, location_id, location_name, room["room_label"],
+                    int(dungeon_level), mname, len(hp_list),
+                    json.dumps(hp_list), json.dumps(statuses),
+                    json.dumps(treasure) if treasure else None,
+                    now, notes,
+                ),
+            )
+            created_rows.append({
+                "area_instance_id": cur.lastrowid,
+                "room_label":       room["room_label"],
+                "monster_type":     mname,
+                "monster_count":    len(hp_list),
+                "individual_hp":    hp_list,
+                "treasure_summary": _summarize_treasure(treasure),
+            })
+
+    return {
+        "populated":     True,
+        "location_name": location_name,
+        "dungeon_level": dungeon_level,
+        "rooms":         created_rows,
+        "room_count":    len(created_rows),
+    }
+
+
+def _summarize_treasure(t: dict) -> dict:
+    """Compact treasure summary for return values (full detail is in DB)."""
+    if not t:
+        return {}
+    return {
+        "treasure_type":   t.get("treasure_type"),
+        "total_gp_value":  t.get("total_gp_value", 0),
+        "coin_keys":       sorted([k for k, v in (t.get("coins") or {}).items() if v]),
+        "gem_count":       len(t.get("gems") or []),
+        "jewelry_count":   len(t.get("jewelry") or []),
+        "magic_item_count": len(t.get("magic_items") or []),
+    }
+
+
+# ── get_area_encounters ───────────────────────────────────────────────────────
+
+def db_get_area_encounters(
+    location_name: str,
+    auto_populate: bool = True,
+    dungeon_level: int = 1,
+) -> dict:
+    """
+    Return every pre-rolled room for a location, plus the treasure each
+    room contains. If nothing exists and auto_populate is true, populate
+    first with the given dungeon_level.
+    """
+    with _get_conn() as conn:
+        _ensure_area_instances_table(conn)
+        rows = conn.execute(
+            "SELECT * FROM area_instances "
+            "WHERE location_name = ? "
+            "ORDER BY area_instance_id ASC",
+            (location_name,),
+        ).fetchall()
+    # The first connection (writable) ensures the table exists, so subsequent
+    # reads in this function can safely query it.
+
+    if not rows:
+        if auto_populate:
+            return db_populate_area(
+                location_name=location_name,
+                dungeon_level=dungeon_level,
+            )
+        return {
+            "populated":     False,
+            "location_name": location_name,
+            "rooms":         [],
+            "room_count":    0,
+        }
+
+    rooms: list[dict] = []
+    for r in rows:
+        try:
+            hp_list = json.loads(r["individual_hp_json"] or "[]")
+        except (json.JSONDecodeError, TypeError):
+            hp_list = []
+        try:
+            status_list = json.loads(r["monster_status_json"] or "[]")
+        except (json.JSONDecodeError, TypeError):
+            status_list = []
+        try:
+            treasure = json.loads(r["treasure_json"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            treasure = {}
+
+        rooms.append({
+            "area_instance_id": r["area_instance_id"],
+            "room_label":       r["room_label"],
+            "monster_type":     r["monster_type"],
+            "monster_count":    r["monster_count"],
+            "individual_hp":    hp_list,
+            "monster_status":   status_list,
+            "encounter_status": r["encounter_status"],
+            "treasure":         treasure,
+            "treasure_status":  r["treasure_status"],
+            "dungeon_level":    r["dungeon_level"],
+        })
+
+    return {
+        "populated":     True,
+        "location_name": location_name,
+        "rooms":         rooms,
+        "room_count":    len(rooms),
+    }
+
+
+# ── get / update monster instance ─────────────────────────────────────────────
+
+def db_get_monster_instance(area_instance_id: int, monster_index: int = 0) -> dict:
+    """
+    Return one monster's stats from a pre-rolled instance.
+    monster_index is 0-based.
+    """
+    with _get_conn(read_only=True) as conn:
+        if not _area_instances_table_exists(conn):
+            return {"error": f"area_instance_id={area_instance_id} not found"}
+        row = conn.execute(
+            "SELECT * FROM area_instances WHERE area_instance_id = ?",
+            (area_instance_id,),
+        ).fetchone()
+
+    if not row:
+        return {"error": f"area_instance_id={area_instance_id} not found"}
+
+    try:
+        hp_list = json.loads(row["individual_hp_json"] or "[]")
+    except (json.JSONDecodeError, TypeError):
+        hp_list = []
+    try:
+        statuses = json.loads(row["monster_status_json"] or "[]")
+    except (json.JSONDecodeError, TypeError):
+        statuses = []
+    try:
+        treasure = json.loads(row["treasure_json"] or "{}")
+    except (json.JSONDecodeError, TypeError):
+        treasure = {}
+
+    if not (0 <= monster_index < len(hp_list)):
+        return {"error": f"monster_index {monster_index} out of range "
+                         f"(0..{len(hp_list)-1})"}
+
+    mstats = lookup_monster(row["monster_type"]) or {}
+
+    return {
+        "area_instance_id": area_instance_id,
+        "room_label":       row["room_label"],
+        "monster_type":     row["monster_type"],
+        "monster_index":    monster_index,
+        "hp_current":       hp_list[monster_index],
+        "status":           statuses[monster_index] if monster_index < len(statuses) else "alive",
+        "stats":            mstats,
+        "shared_treasure":  treasure,
+        "treasure_status":  row["treasure_status"],
+    }
+
+
+def db_update_monster_instance(
+    area_instance_id: int,
+    monster_index: int | None = None,
+    hp_current: int | None = None,
+    status: str | None = None,
+    treasure_status: str | None = None,
+    encounter_status: str | None = None,
+) -> dict:
+    """
+    Update a single monster's HP/status, or the room's
+    treasure_status / encounter_status. Pass monster_index to target
+    a specific monster; leave None to update only room-level fields.
+    """
+    with _get_conn() as conn:
+        _ensure_area_instances_table(conn)
+        row = conn.execute(
+            "SELECT * FROM area_instances WHERE area_instance_id = ?",
+            (area_instance_id,),
+        ).fetchone()
+        if not row:
+            return {"error": f"area_instance_id={area_instance_id} not found"}
+
+        try:
+            hp_list = json.loads(row["individual_hp_json"] or "[]")
+        except (json.JSONDecodeError, TypeError):
+            hp_list = []
+        try:
+            statuses = json.loads(row["monster_status_json"] or "[]")
+        except (json.JSONDecodeError, TypeError):
+            statuses = []
+
+        changed: list[str] = []
+
+        if monster_index is not None:
+            if not (0 <= monster_index < len(hp_list)):
+                return {"error": f"monster_index {monster_index} out of range"}
+            if hp_current is not None:
+                hp_list[monster_index] = max(0, int(hp_current))
+                changed.append(f"hp[{monster_index}]={hp_list[monster_index]}")
+                # Auto-mark dead when HP hits 0 unless caller overrode status.
+                if hp_list[monster_index] <= 0 and status is None:
+                    while len(statuses) <= monster_index:
+                        statuses.append("alive")
+                    statuses[monster_index] = "dead"
+                    changed.append(f"status[{monster_index}]=dead")
+            if status is not None:
+                while len(statuses) <= monster_index:
+                    statuses.append("alive")
+                statuses[monster_index] = status
+                changed.append(f"status[{monster_index}]={status}")
+
+        new_treasure_status = treasure_status or row["treasure_status"]
+        new_encounter_status = encounter_status or row["encounter_status"]
+
+        # Auto-progress encounter_status if every monster is dead.
+        if statuses and all(s in ("dead", "fled") for s in statuses):
+            if new_encounter_status == "pending":
+                new_encounter_status = "cleared"
+                changed.append("encounter_status=cleared (all monsters dead/fled)")
+
+        conn.execute(
+            "UPDATE area_instances "
+            "SET individual_hp_json = ?, monster_status_json = ?, "
+            "    treasure_status = ?, encounter_status = ? "
+            "WHERE area_instance_id = ?",
+            (json.dumps(hp_list), json.dumps(statuses),
+             new_treasure_status, new_encounter_status, area_instance_id),
+        )
+
+    return {
+        "updated":          True,
+        "area_instance_id": area_instance_id,
+        "individual_hp":    hp_list,
+        "monster_status":   statuses,
+        "treasure_status":  new_treasure_status,
+        "encounter_status": new_encounter_status,
+        "changed":          changed,
+    }
+
+
+def db_find_pre_rolled_for_combat(
+    location_name: str,
+    monster_type: str | None = None,
+) -> dict | None:
+    """
+    Look up the next pending pre-rolled encounter at this location.
+    Used by start_combat to consult pre-rolled HP before rolling fresh.
+
+    Returns the matching area_instances row as a dict, or None.
+    """
+    if not location_name:
+        return None
+    with _get_conn(read_only=True) as conn:
+        if not _area_instances_table_exists(conn):
+            return None
+        if monster_type:
+            row = conn.execute(
+                "SELECT * FROM area_instances "
+                "WHERE LOWER(location_name) = LOWER(?) "
+                "  AND LOWER(monster_type) = LOWER(?) "
+                "  AND encounter_status = 'pending' "
+                "ORDER BY area_instance_id ASC LIMIT 1",
+                (location_name, monster_type),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT * FROM area_instances "
+                "WHERE LOWER(location_name) = LOWER(?) "
+                "  AND encounter_status = 'pending' "
+                "ORDER BY area_instance_id ASC LIMIT 1",
+                (location_name,),
+            ).fetchone()
+    return _row_to_dict(row) if row else None
+
+
+# ── populate_npc ──────────────────────────────────────────────────────────────
+#
+# Minimal AD&D 1e NPC stat roller. Aim is consistency, not full simulation —
+# we want every named NPC to have a deterministic, persisted stat block so
+# repeat encounters behave the same way.
+
+_NPC_HIT_DIE = {
+    "fighter":     8,   # use d10 ideally, but d8 keeps NPCs leaner
+    "paladin":     10,
+    "ranger":      8,
+    "cleric":      8,
+    "druid":       8,
+    "magic-user":  4,
+    "magicuser":   4,
+    "mage":        4,
+    "thief":       6,
+    "assassin":    6,
+    "monk":        4,
+    "bard":        6,
+}
+
+_NPC_DEFAULT_AC = {
+    "fighter": 4, "paladin": 3, "ranger": 5,
+    "cleric":  4, "druid":   6,
+    "magic-user": 10, "magicuser": 10, "mage": 10,
+    "thief":   7, "assassin": 7, "monk": 9, "bard": 8,
+}
+
+
+def _con_hp_bonus(con: int, fighter_class: bool) -> int:
+    if con <= 6:    return -2 if con <= 3 else -1
+    if con <= 14:   return 0
+    if con == 15:   return 1
+    if con == 16:   return 2
+    # 17+ — fighters get more
+    if con == 17:   return 3 if fighter_class else 2
+    return 4 if fighter_class else 2  # 18
+
+
+def _dex_ac_bonus(dex: int) -> int:
+    if dex <= 6:    return -2 if dex <= 3 else -1
+    if dex >= 18:   return 4
+    if dex == 17:   return 3
+    if dex == 16:   return 2
+    if dex == 15:   return 1
+    return 0
+
+
+def _npc_thac0(class_name: str, level: int) -> int:
+    """Approximate AD&D 1e THAC0 by class and level."""
+    cl = (class_name or "").strip().lower().replace("-", "").replace(" ", "")
+    if cl in ("fighter", "paladin", "ranger"):
+        # 20 at L1, -1/level, capped at 6 (L15).
+        return max(6, 20 - max(0, level - 1))
+    if cl in ("cleric", "druid"):
+        # 20 at L1, -1 every 3 levels
+        return max(6, 20 - ((level - 1) // 3) * 1)
+    if cl in ("thief", "assassin", "monk", "bard"):
+        return max(6, 20 - ((level - 1) // 4) * 1)
+    if cl in ("magicuser", "mage"):
+        return max(6, 20 - ((level - 1) // 5) * 1)
+    return max(6, 20 - max(0, level - 1) // 3)
+
+
+def _roll_npc_stats(class_name: str, level: int = 1) -> dict:
+    """
+    Roll AD&D 1e NPC stats: 6 abilities (3d6 in order), HP, AC, THAC0,
+    starting equipment, carried gold, and a small chance of a personal
+    magic item. Pure rolling — no DB writes.
+    """
+    cl = (class_name or "fighter").strip().lower().replace("-", "").replace(" ", "")
+    hd  = _NPC_HIT_DIE.get(cl, 8)
+    base_ac = _NPC_DEFAULT_AC.get(cl, 9)
+
+    abilities = {
+        "strength":     sum(random.randint(1, 6) for _ in range(3)),
+        "intelligence": sum(random.randint(1, 6) for _ in range(3)),
+        "wisdom":       sum(random.randint(1, 6) for _ in range(3)),
+        "dexterity":    sum(random.randint(1, 6) for _ in range(3)),
+        "constitution": sum(random.randint(1, 6) for _ in range(3)),
+        "charisma":     sum(random.randint(1, 6) for _ in range(3)),
+    }
+
+    fighter_class = cl in ("fighter", "paladin", "ranger")
+    con_bonus = _con_hp_bonus(abilities["constitution"], fighter_class)
+    hp_rolls = [random.randint(1, hd) for _ in range(max(1, level))]
+    hp_max   = max(1, sum(hp_rolls) + con_bonus * level)
+
+    dex_ac = _dex_ac_bonus(abilities["dexterity"])
+    ac     = base_ac - dex_ac
+
+    thac0 = _npc_thac0(class_name, level)
+
+    equipment = _npc_equipment(cl, level)
+    carried_gp = random.randint(level, level * 50) + random.randint(0, 50)
+    magic_items: list = []
+    # ~5% per level chance for one personal magic item, capped at L20.
+    if random.randint(1, 100) <= min(40, 5 * level):
+        try:
+            haul = roll_treasure_by_type("M")
+            magic_items = haul.get("magic_items") or []
+        except Exception:
+            magic_items = []
+
+    return {
+        "class":        class_name,
+        "level":        level,
+        "hit_die":      f"d{hd}",
+        "abilities":    abilities,
+        "hp_max":       hp_max,
+        "hp_rolls":     hp_rolls,
+        "con_hp_bonus": con_bonus,
+        "ac":           ac,
+        "dex_ac_bonus": dex_ac,
+        "thac0":        thac0,
+        "equipment":    equipment,
+        "carried_gp":   carried_gp,
+        "magic_items":  magic_items,
+    }
+
+
+def _npc_equipment(cl: str, level: int) -> list[str]:
+    """Class-appropriate starting equipment, lightly scaled by level."""
+    eq: list[str] = []
+    if cl in ("fighter", "paladin", "ranger"):
+        eq += ["long sword", "chain mail", "shield"]
+        if level >= 3: eq.append("composite long bow + 20 arrows")
+    elif cl in ("cleric", "druid"):
+        eq += ["mace", "chain mail", "shield", "holy symbol"]
+    elif cl in ("magicuser", "mage"):
+        eq += ["dagger", "staff", "spell book"]
+    elif cl in ("thief", "assassin"):
+        eq += ["short sword", "dagger", "leather armor", "thieves' tools"]
+    elif cl == "monk":
+        eq += ["bo stick", "robes"]
+    elif cl == "bard":
+        eq += ["short sword", "leather armor", "lute"]
+    else:
+        eq += ["club", "leather armor"]
+    eq += ["backpack", "rations (1 week)", "waterskin", "torch x2"]
+    return eq
+
+
+def db_populate_npc(
+    npc_name: str,
+    level: int = 1,
+    class_name: str = "Fighter",
+    race: str | None = None,
+    force_reroll: bool = False,
+) -> dict:
+    """
+    Pre-roll full stats for a named NPC and persist them to the existing
+    characters/character_abilities/character_status/class_levels tables.
+
+    Idempotent: if the NPC already has a class_levels row AND an abilities
+    row, returns the existing stats unchanged. Pass force_reroll=True to
+    overwrite (used for testing).
+
+    The NPC must already exist in the characters table (created via
+    add_npc). This function does NOT create a new character row — it
+    enriches an existing one.
+    """
+    with _get_conn(read_only=True) as conn:
+        npc_row = conn.execute(
+            "SELECT character_id, name, character_type, race "
+            "FROM characters WHERE LOWER(name) LIKE LOWER(?) "
+            "  AND campaign_id = ? LIMIT 1",
+            (f"{npc_name}%", _CAMPAIGN_ID),
+        ).fetchone()
+
+    if not npc_row:
+        return {"error": f"NPC '{npc_name}' not found in characters table. "
+                         "Call add_npc first."}
+
+    char_id  = npc_row["character_id"]
+    npc_race = race or npc_row["race"] or "Human"
+
+    with _get_conn(read_only=True) as conn:
+        has_class = conn.execute(
+            "SELECT 1 FROM class_levels WHERE character_id = ? LIMIT 1",
+            (char_id,),
+        ).fetchone()
+        has_abilities = conn.execute(
+            "SELECT 1 FROM character_abilities WHERE character_id = ? LIMIT 1",
+            (char_id,),
+        ).fetchone()
+
+    if has_class and has_abilities and not force_reroll:
+        return _read_npc_full_stats(char_id, already_populated=True)
+
+    stats = _roll_npc_stats(class_name, level)
+    a = stats["abilities"]
+
+    with _get_conn() as conn:
+        # class_levels
+        existing_cl = conn.execute(
+            "SELECT class_level_id FROM class_levels WHERE character_id = ? LIMIT 1",
+            (char_id,),
+        ).fetchone()
+        if existing_cl:
+            conn.execute(
+                "UPDATE class_levels SET class_name = ?, level = ?, xp = ? "
+                "WHERE class_level_id = ?",
+                (class_name, level, 0, existing_cl["class_level_id"]),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO class_levels (character_id, class_name, level, xp) "
+                "VALUES (?, ?, ?, 0)",
+                (char_id, class_name, level),
+            )
+
+        # character_abilities (PK is character_id, so upsert)
+        conn.execute(
+            "INSERT INTO character_abilities "
+            "(character_id, strength, intelligence, wisdom, dexterity, "
+            " constitution, charisma) VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(character_id) DO UPDATE SET "
+            "  strength = excluded.strength, "
+            "  intelligence = excluded.intelligence, "
+            "  wisdom = excluded.wisdom, "
+            "  dexterity = excluded.dexterity, "
+            "  constitution = excluded.constitution, "
+            "  charisma = excluded.charisma",
+            (char_id, a["strength"], a["intelligence"], a["wisdom"],
+             a["dexterity"], a["constitution"], a["charisma"]),
+        )
+
+        # character_status — upsert by character_id
+        existing_status = conn.execute(
+            "SELECT status_id FROM character_status WHERE character_id = ? LIMIT 1",
+            (char_id,),
+        ).fetchone()
+        if existing_status:
+            conn.execute(
+                "UPDATE character_status "
+                "SET hp_current = ?, hp_max = ?, ac = ? "
+                "WHERE character_id = ?",
+                (stats["hp_max"], stats["hp_max"], stats["ac"], char_id),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO character_status "
+                "(character_id, hp_current, hp_max, ac) VALUES (?, ?, ?, ?)",
+                (char_id, stats["hp_max"], stats["hp_max"], stats["ac"]),
+            )
+
+        # Stash equipment + carried gold + thac0 + magic items in a
+        # category='npc_stats' world_facts row keyed to this character.
+        wf_payload = {
+            "character_id": char_id,
+            "name":         npc_row["name"],
+            "thac0":        stats["thac0"],
+            "hit_die":      stats["hit_die"],
+            "equipment":    stats["equipment"],
+            "carried_gp":   stats["carried_gp"],
+            "magic_items":  stats["magic_items"],
+        }
+        # Replace any prior npc_stats for this char.
+        conn.execute(
+            "DELETE FROM world_facts "
+            "WHERE category = 'npc_stats' AND fact_text LIKE ?",
+            (f'%"character_id": {char_id},%',),
+        )
+        conn.execute(
+            "INSERT INTO world_facts (campaign_id, category, fact_text, source_note) "
+            "VALUES (?, 'npc_stats', ?, ?)",
+            (_CAMPAIGN_ID, json.dumps(wf_payload),
+             f"populate_npc(name={npc_row['name']!r}, level={level}, class={class_name!r})"),
+        )
+
+    return _read_npc_full_stats(char_id, already_populated=False)
+
+
+def _read_npc_full_stats(character_id: int, already_populated: bool) -> dict:
+    """Read and assemble the full NPC stat block from all related tables."""
+    with _get_conn(read_only=True) as conn:
+        char = conn.execute(
+            "SELECT character_id, name, character_type, race, alignment, notes "
+            "FROM characters WHERE character_id = ?",
+            (character_id,),
+        ).fetchone()
+        cls = conn.execute(
+            "SELECT class_name, level, xp FROM class_levels "
+            "WHERE character_id = ? LIMIT 1",
+            (character_id,),
+        ).fetchone()
+        ab = conn.execute(
+            "SELECT strength, intelligence, wisdom, dexterity, constitution, charisma "
+            "FROM character_abilities WHERE character_id = ?",
+            (character_id,),
+        ).fetchone()
+        st = conn.execute(
+            "SELECT hp_current, hp_max, ac FROM character_status "
+            "WHERE character_id = ? LIMIT 1",
+            (character_id,),
+        ).fetchone()
+        wf = conn.execute(
+            "SELECT fact_text FROM world_facts "
+            "WHERE category = 'npc_stats' AND fact_text LIKE ? LIMIT 1",
+            (f'%"character_id": {character_id},%',),
+        ).fetchone()
+
+    extra: dict = {}
+    if wf and wf["fact_text"]:
+        try:
+            extra = json.loads(wf["fact_text"])
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    return {
+        "populated":         True,
+        "already_populated": already_populated,
+        "character_id":      character_id,
+        "name":              char["name"] if char else None,
+        "race":              char["race"] if char else None,
+        "class":             cls["class_name"] if cls else None,
+        "level":             cls["level"] if cls else None,
+        "abilities":         _row_to_dict(ab) if ab else {},
+        "hp_current":        st["hp_current"] if st else None,
+        "hp_max":            st["hp_max"] if st else None,
+        "ac":                st["ac"] if st else None,
+        "thac0":             extra.get("thac0"),
+        "hit_die":           extra.get("hit_die"),
+        "equipment":         extra.get("equipment", []),
+        "carried_gp":        extra.get("carried_gp"),
+        "magic_items":       extra.get("magic_items", []),
+    }
