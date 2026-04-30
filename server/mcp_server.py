@@ -453,9 +453,20 @@ def save_turn(
     ] = "",
     scene_notes: Annotated[
         str,
-        "Any important state changes this turn: HP changes, items gained/lost, "
-        "NPCs encountered, combat outcomes. Free text, will be stored as scene notes.",
+        "Free-text prose summary of what happened this turn (for the human-readable "
+        "history log only). Verification does NOT parse this — use the markers "
+        "parameter for state changes.",
     ] = "",
+    markers: Annotated[
+        list[str] | None,
+        "Structured state-change markers — REQUIRED for any turn that mutates "
+        "game state. One string per change, exact prefixes. See docstring for the "
+        "complete catalogue. Examples: 'cast:Magic Missile', 'hp:31>23', "
+        "'spent:500gp', 'item_added:Potion of Healing', "
+        "'troop_change:Iron Watch:120>108'. Pass [] (or omit) only when nothing "
+        "changed (pure dialogue / OOC). A turn with no markers cannot be verified "
+        "and will return verdict='no_claims'.",
+    ] = None,
     model_name: Annotated[
         str,
         "Model that generated this turn. Default 'claude'.",
@@ -469,13 +480,77 @@ def save_turn(
     or rule clarifications that aren't part of the fiction.
 
     Writes to ai_turns (append) and updates current_scene_state (upsert).
-    Returns the new turn_id and confirmation.
+    Returns the new turn_id, verification result, and any unverified or
+    conflicting state changes that need follow-up tool calls.
+
+    ════════════════════════════════════════════════════════════════════════
+    MARKERS — STRUCTURED STATE CHANGES (REQUIRED FOR VERIFICATION)
+    ════════════════════════════════════════════════════════════════════════
+
+    Every turn that mutates game state MUST include a markers list. Prose in
+    scene_notes is NOT parsed — verify_turn reads only this list. A turn with
+    no markers returns verdict 'no_claims' (silence ≠ verified).
+
+    One marker per change. Use these exact prefixes:
+
+      cast:[spell name]
+          A spell was expended this turn.
+          Example: "cast:Magic Missile"
+
+      item_added:[item name]
+          PC gained / picked up / was awarded an item.
+          Example: "item_added:Potion of Healing"
+
+      item_used:[item name]
+          PC consumed / lost / dropped an item.
+          Example: "item_used:Torch"
+
+      hp:[old]>[new]
+          HP changed. Both values are integers, separated by a literal '>'.
+          Example: "hp:31>23"
+
+      spent:[amount]gp
+          Gold deducted from a treasury account. Integer amount, no commas.
+          Example: "spent:500gp"
+
+      gained:[amount]gp
+          Gold added to a treasury account. Integer amount, no commas.
+          Example: "gained:200gp"
+
+      npc_added:[name]
+          A new NPC appeared and should exist in the characters table.
+          Example: "npc_added:Merchant Grel"
+
+      location_changed:[name]
+          The party moved to a new location. Pass the same name to
+          scene_location so verify_turn can confirm the move.
+          Example: "location_changed:Quasquetan — north wall"
+
+      troop_change:[group]:[old]>[new]
+          A troop group's count changed. Both values are integers.
+          Example: "troop_change:Iron Watch:120>108"
+
+    Multiple changes in one turn? Pass multiple markers:
+        markers=[
+            "hp:31>23",
+            "cast:Sleep",
+            "item_used:Scroll of Sleep",
+        ]
+
+    Always pair markers with the underlying tool call (update_character_status,
+    cast_spell, update_treasury, etc.). The marker is a *claim*; the tool call
+    is the *write*. verify_turn checks the claim against the write.
+    ════════════════════════════════════════════════════════════════════════
     """
-    structured = {}
+    structured: dict = {}
     if scene_location:
         structured["location"] = scene_location
     if scene_notes:
         structured["state_changes"] = scene_notes
+    if markers:
+        clean_markers = [m.strip() for m in markers if isinstance(m, str) and m.strip()]
+        if clean_markers:
+            structured["markers"] = clean_markers
 
     turn_id = write_ai_turn(
         player_action=player_action,
@@ -3819,30 +3894,39 @@ def verify_turn(
     ] = 0,
 ) -> dict:
     """
-    Parse a saved turn for state-change claims and cross-check each one
-    against the actual current database state.
+    Cross-check the structured markers from a saved turn against current
+    database state.
 
     Called automatically by save_turn after every write — you only need to
-    call this directly when re-auditing an older turn.
+    invoke directly when re-auditing an older turn.
 
-    What it parses (from scene_notes / state_changes):
-    - HP changes: "HP now 23/31", "HP: 31 → 23"
-    - Gold: "spent 500gp", "+200 gold"
-    - Items acquired: "Item added: Potion of Healing"
-    - Items lost/used: "Item used: Torch"
-    - Spells cast: "Cast Sleep"
-    - NPCs added: "NPC added: Merchant Grel"
+    Reads the markers list that save_turn stored on the turn (NOT scene_notes
+    prose). For every marker, looks up the relevant table and reports whether
+    the DB matches.
 
-    Returns:
-    - confirmed: claim matches DB state
-    - unverified: claim found but no corresponding tool call evidence
-    - conflicts: claim directly contradicts DB (e.g. HP mismatch)
-    - suggested_call: the exact tool call to resolve each unverified/conflict
+    Marker formats it understands (see save_turn for the canonical reference):
+        cast:[spell name]
+        item_added:[name]               item_used:[name]
+        hp:[old]>[new]
+        spent:[amount]gp                gained:[amount]gp
+        npc_added:[name]
+        location_changed:[name]
+        troop_change:[group]:[old]>[new]
 
-    verdict: "clean" | "needs_attention" | "conflict"
+    Verdict values:
+        "no_claims"        — turn had zero markers; verification did not run.
+                             This is distinct from "clean" — silence is not
+                             the same as verified. Whenever state actually
+                             changed and you see this, you forgot the markers.
+        "clean"            — every marker matched DB state.
+        "needs_attention"  — at least one marker is unverified or malformed.
+        "conflict"         — at least one marker contradicts DB state. A tool
+                             call was missed; resolve before the next turn.
 
-    A "conflict" always means a tool call was missed and must be resolved
-    before the next turn to keep DB state accurate.
+    Returns: turn_id, verdict, marker_count, confirmed[], unverified[],
+    conflicts[], malformed[] (only if any markers failed to parse). Each
+    unverified/conflict entry includes a suggested_call: the exact tool
+    invocation to close the gap.
     """
     return db_verify_turn(turn_id=turn_id if turn_id else None)
 

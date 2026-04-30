@@ -6275,271 +6275,322 @@ def db_negotiate_surrender(
 # ══════════════════════════════════════════════════════════════════════════════
 # TURN VERIFICATION  (Phase 6 — self-auditing turns)
 # ══════════════════════════════════════════════════════════════════════════════
+#
+# Verification is driven by structured markers stored in
+# ai_turns.structured_response_json under the "markers" key. save_turn writes
+# the markers list; db_verify_turn parses each marker and cross-checks it
+# against current DB state.
+#
+# Marker formats (canonical, prefix-keyed strings):
+#     cast:[spell name]
+#     item_added:[item name]      / item_used:[item name]
+#     hp:[old]>[new]
+#     spent:[amount]gp            / gained:[amount]gp
+#     npc_added:[name]
+#     location_changed:[name]
+#     troop_change:[group]:[old]>[new]
+#
+# A turn with no markers returns verdict "no_claims" — silence is explicitly
+# distinguishable from "verified clean".
+# ══════════════════════════════════════════════════════════════════════════════
 
-# Compiled once at import time — keyed by claim type
-_VRY: dict[str, re.Pattern] = {
-    # HP: explicit final state
-    "hp_slash":   re.compile(r'\bHP\s*(?:now|is|:)\s*(\d+)\s*/\s*(\d+)', re.I),
-    "hp_slash2":  re.compile(r'\b(\d+)\s*/\s*(\d+)\s*HP\b', re.I),
-    "hp_arrow":   re.compile(r'\bHP\s*:?\s*\d+\s*[-=→>]+\s*(\d+)', re.I),
-    "hp_now":     re.compile(r'\bHP\s+(?:now|is)\s+(\d+)\b', re.I),
-    # Gold: deltas (can't verify final state without prior balance)
-    "gold_spend": re.compile(
-        r'(?:spent|paid|costs?\s+\w+)\s+(\d[\d,]*)\s*(?:gp|g\.p\.|gold(?:\s+pieces?)?)',
-        re.I,
-    ),
-    "gold_gain":  re.compile(
-        r'(?:received?|earned?|found|gained?|looted?|awarded?)\s+(\d[\d,]*)\s*'
-        r'(?:gp|g\.p\.|gold(?:\s+pieces?)?)',
-        re.I,
-    ),
-    "gold_sign":  re.compile(r'([+-])(\d[\d,]*)\s*(?:gp|gold)', re.I),
-    # Items
-    "item_add":   re.compile(
-        r'(?:item\s+added|added\s+item|item\s+acquired|acquired\s+item)'
-        r'[:\s]+([A-Za-z][^\n.,;!?]{3,60}?)(?:[.,;!?\n]|$)',
-        re.I,
-    ),
-    "item_add2":  re.compile(
-        r'(?:found|picked\s+up|looted?)\s+(?:a\s+|an\s+|the\s+)?'
-        r'([A-Za-z][^\n.,;!?]{3,60}?)\s+(?:in|from|at|on)\b',
-        re.I,
-    ),
-    "item_lose":  re.compile(
-        r'(?:item\s+(?:used|lost|removed|consumed)|used\s+item|consumed\s+item)'
-        r'[:\s]+([A-Za-z][^\n.,;!?]{3,60}?)(?:[.,;!?\n]|$)',
-        re.I,
-    ),
-    # Spells
-    "spell_cast": re.compile(
-        r'(?:(?:cast|casts?|casting)\s+(?:spell\s+)?|spell\s+cast[:\s]+)'
-        r'([A-Za-z][^\n(.,;!?]{2,35}?)(?:\s*\(|[.,;!?\n]|$)',
-        re.I,
-    ),
-    # NPCs
-    "npc_add":    re.compile(
-        r'(?:NPC\s+added|new\s+NPC|added\s+NPC)[:\s]+'
-        r'([A-Za-z][^\n.,;!?]{2,50}?)(?:[.,;!?\n]|$)',
-        re.I,
-    ),
-    # Locations
-    "loc_change": re.compile(
-        r'(?:location\s+(?:changed?|updated?|now)|moved?\s+to|arrived?\s+(?:at|in))[:\s]+'
-        r'([A-Za-z][^\n.,;!?]{3,60}?)(?:[.,;!?\n]|$)',
-        re.I,
-    ),
+_VRY_KNOWN_PREFIXES = {
+    "cast", "item_added", "item_used", "hp",
+    "spent", "gained", "npc_added", "location_changed", "troop_change",
 }
 
 
-def _vry_extract_text(turn_row) -> tuple[str, str]:
-    """Return (state_changes, dm_response) from a turn row."""
-    dm_response   = turn_row["dm_response"] or ""
-    state_changes = ""
-    if turn_row["structured_response_json"]:
+def _vry_parse_marker(marker: str) -> dict:
+    """
+    Parse one marker string into a typed dict. Returns
+    {"type": "<prefix>", ...args, "raw": <original>} on success, or
+    {"type": "malformed"|"unknown", "raw": ..., "reason": ...} on failure.
+    """
+    if not marker or not isinstance(marker, str):
+        return {"type": "malformed", "raw": str(marker), "reason": "empty marker"}
+
+    s = marker.strip()
+    if ":" not in s:
+        return {"type": "malformed", "raw": marker,
+                "reason": "missing ':' separator"}
+
+    prefix, _, rest = s.partition(":")
+    prefix = prefix.strip().lower()
+    rest   = rest.strip()
+
+    if prefix not in _VRY_KNOWN_PREFIXES:
+        return {"type": "unknown", "raw": marker,
+                "reason": f"unknown prefix '{prefix}'"}
+
+    if prefix == "cast":
+        if not rest:
+            return {"type": "malformed", "raw": marker,
+                    "reason": "expected cast:[spell name]"}
+        return {"type": "cast", "spell": rest, "raw": marker}
+
+    if prefix in ("item_added", "item_used"):
+        if not rest:
+            return {"type": "malformed", "raw": marker,
+                    "reason": f"expected {prefix}:[item name]"}
+        return {"type": prefix, "name": rest, "raw": marker}
+
+    if prefix == "hp":
+        if ">" not in rest:
+            return {"type": "malformed", "raw": marker,
+                    "reason": "expected hp:[old]>[new]"}
+        old_s, _, new_s = rest.partition(">")
         try:
-            sc = json.loads(turn_row["structured_response_json"])
-            state_changes = sc.get("state_changes", "") or ""
-        except (json.JSONDecodeError, TypeError):
-            pass
-    return state_changes, dm_response
+            return {
+                "type": "hp",
+                "old":  int(old_s.strip()),
+                "new":  int(new_s.strip()),
+                "raw":  marker,
+            }
+        except ValueError:
+            return {"type": "malformed", "raw": marker,
+                    "reason": "hp:[old]>[new] requires integers"}
+
+    if prefix in ("spent", "gained"):
+        amt = rest.lower().replace(",", "").strip()
+        if amt.endswith("gp"):
+            amt = amt[:-2].strip()
+        try:
+            return {"type": prefix, "amount": int(amt), "raw": marker}
+        except ValueError:
+            return {"type": "malformed", "raw": marker,
+                    "reason": f"expected {prefix}:[amount]gp with integer amount"}
+
+    if prefix == "npc_added":
+        if not rest:
+            return {"type": "malformed", "raw": marker,
+                    "reason": "expected npc_added:[name]"}
+        return {"type": "npc_added", "name": rest, "raw": marker}
+
+    if prefix == "location_changed":
+        if not rest:
+            return {"type": "malformed", "raw": marker,
+                    "reason": "expected location_changed:[name]"}
+        return {"type": "location_changed", "name": rest, "raw": marker}
+
+    if prefix == "troop_change":
+        # rest format: "[group]:[old]>[new]"
+        group, _, deltas = rest.rpartition(":")
+        group  = group.strip()
+        deltas = deltas.strip()
+        if not group or ">" not in deltas:
+            return {"type": "malformed", "raw": marker,
+                    "reason": "expected troop_change:[group]:[old]>[new]"}
+        old_s, _, new_s = deltas.partition(">")
+        try:
+            return {
+                "type":  "troop_change",
+                "group": group,
+                "old":   int(old_s.strip()),
+                "new":   int(new_s.strip()),
+                "raw":   marker,
+            }
+        except ValueError:
+            return {"type": "malformed", "raw": marker,
+                    "reason": "troop_change requires integer [old]>[new]"}
+
+    return {"type": "malformed", "raw": marker, "reason": "unhandled prefix"}
 
 
 def db_verify_turn(turn_id: int | None = None) -> dict:
     """
-    Parse the most recent (or specified) turn for state-change claims and
-    cross-check each one against the actual current database state.
+    Cross-check structured markers from a saved turn against the database.
 
-    Primary text parsed: scene_notes / state_changes (structured DM summary).
-    Secondary: dm_response narrative (spell-cast and NPC patterns only).
+    Reads the markers list from ai_turns.structured_response_json (set by
+    save_turn). A turn with no markers returns verdict "no_claims" — that is
+    distinct from "clean", which means markers were present and all matched
+    DB state.
 
-    Returns confirmed, unverified, and conflicts lists plus suggested tool
-    calls to resolve any outstanding issues.
+    Verdict values:
+        "no_claims"       — no markers; verification did not run
+        "clean"           — every marker matched DB state
+        "needs_attention" — at least one unverified or malformed marker
+        "conflict"        — at least one marker contradicts DB state
+
+    For unverified/conflict entries, suggested_call gives the exact tool
+    invocation to resolve the gap.
     """
     with _get_conn(read_only=True) as conn:
         if turn_id is None:
             row = conn.execute(
-                "SELECT turn_id, dm_response, structured_response_json "
+                "SELECT turn_id, structured_response_json "
                 "FROM ai_turns ORDER BY turn_id DESC LIMIT 1"
             ).fetchone()
         else:
             row = conn.execute(
-                "SELECT turn_id, dm_response, structured_response_json "
+                "SELECT turn_id, structured_response_json "
                 "FROM ai_turns WHERE turn_id = ?", (turn_id,)
             ).fetchone()
 
     if not row:
         return {"error": "No turn found."}
 
-    found_turn_id             = row["turn_id"]
-    state_changes, dm_response = _vry_extract_text(row)
+    found_turn_id = row["turn_id"]
 
-    # Primary parse target: state_changes (structured)
-    # Secondary: dm_response (only for spell/NPC which DMs often mention in narrative)
-    primary   = state_changes
-    secondary = dm_response
+    # ── Pull markers list out of structured_response_json ─────────────────────
+    markers: list[str] = []
+    if row["structured_response_json"]:
+        try:
+            sc = json.loads(row["structured_response_json"]) or {}
+            raw = sc.get("markers")
+            if isinstance(raw, list):
+                markers = [str(m) for m in raw if isinstance(m, str) and m.strip()]
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    if not markers:
+        return {
+            "turn_id":    found_turn_id,
+            "verdict":    "no_claims",
+            "confirmed":  [],
+            "unverified": [],
+            "conflicts":  [],
+            "warning": (
+                "No markers in this turn — state cannot be verified. "
+                "Pass markers=[...] to save_turn whenever game state changes. "
+                "Formats: cast:[spell], item_added:[name], item_used:[name], "
+                "hp:[old]>[new], spent:[N]gp, gained:[N]gp, npc_added:[name], "
+                "location_changed:[name], troop_change:[group]:[old]>[new]."
+            ),
+        }
+
+    parsed = [_vry_parse_marker(m) for m in markers]
 
     confirmed:  list[dict] = []
     unverified: list[dict] = []
     conflicts:  list[dict] = []
+    malformed:  list[dict] = []
 
     with _get_conn(read_only=True) as conn:
+        for marker in parsed:
+            mtype = marker["type"]
+            raw   = marker["raw"]
 
-        # ── 1. HP ──────────────────────────────────────────────────────────────
-        claimed_hp: int | None = None
-        claimed_max: int | None = None
+            if mtype in ("malformed", "unknown"):
+                malformed.append({
+                    "marker": raw,
+                    "reason": marker.get("reason", "could not parse"),
+                })
+                continue
 
-        for pat in ("hp_slash", "hp_slash2"):
-            m = _VRY[pat].search(primary)
-            if m:
-                claimed_hp  = int(m.group(1))
-                claimed_max = int(m.group(2))
-                break
-
-        if claimed_hp is None:
-            m = _VRY["hp_arrow"].search(primary)
-            if m:
-                claimed_hp = int(m.group(1))
-
-        if claimed_hp is None:
-            m = _VRY["hp_now"].search(primary)
-            if m:
-                claimed_hp = int(m.group(1))
-
-        if claimed_hp is not None:
-            cs = conn.execute(
-                "SELECT hp_current, hp_max FROM character_status WHERE character_id = ?",
-                (_PC_CHARACTER_ID,),
-            ).fetchone()
-            if cs:
-                actual = cs["hp_current"]
-                label  = f"HP {claimed_hp}" + (f"/{claimed_max}" if claimed_max else "")
-                if actual == claimed_hp:
+            # ── HP ─────────────────────────────────────────────────────────────
+            if mtype == "hp":
+                cs = conn.execute(
+                    "SELECT hp_current FROM character_status WHERE character_id = ?",
+                    (_PC_CHARACTER_ID,),
+                ).fetchone()
+                actual = cs["hp_current"] if cs else None
+                claim_label = f"HP {marker['old']} → {marker['new']}"
+                if actual == marker["new"]:
                     confirmed.append({
                         "type":   "hp",
-                        "claim":  label,
+                        "claim":  claim_label,
                         "actual": f"character_status.hp_current = {actual}  ✓",
                     })
                 else:
                     conflicts.append({
-                        "type":            "hp",
-                        "claim":           label,
-                        "actual_in_db":    actual,
-                        "suggested_call":  f"update_character_status(hp_current={claimed_hp})",
+                        "type":           "hp",
+                        "claim":          claim_label,
+                        "actual_in_db":   actual,
+                        "suggested_call": f"update_character_status(hp_current={marker['new']})",
                     })
-
-        # ── 2. Gold ────────────────────────────────────────────────────────────
-        gold_claims: list[dict] = []
-
-        for m in _VRY["gold_spend"].finditer(primary):
-            gold_claims.append({
-                "direction": "spend",
-                "amount":    int(m.group(1).replace(",", "")),
-                "text":      m.group(0),
-            })
-        for m in _VRY["gold_gain"].finditer(primary):
-            gold_claims.append({
-                "direction": "gain",
-                "amount":    int(m.group(1).replace(",", "")),
-                "text":      m.group(0),
-            })
-        for m in _VRY["gold_sign"].finditer(primary):
-            gold_claims.append({
-                "direction": "spend" if m.group(1) == "-" else "gain",
-                "amount":    int(m.group(2).replace(",", "")),
-                "text":      m.group(0),
-            })
-
-        for gc in gold_claims:
-            delta = -gc["amount"] if gc["direction"] == "spend" else gc["amount"]
-            unverified.append({
-                "type":           "gold",
-                "claim":          gc["text"],
-                "reason":         "Gold delta claimed — confirm update_treasury was called.",
-                "suggested_call": f"update_treasury(delta_gp={delta})",
-            })
-
-        # ── 3. Items acquired ──────────────────────────────────────────────────
-        item_add_matches: list[str] = []
-        for pat in ("item_add", "item_add2"):
-            for m in _VRY[pat].finditer(primary):
-                name = m.group(1).strip().rstrip(".,;!?")
-                if len(name) >= 3 and name not in item_add_matches:
-                    item_add_matches.append(name)
-
-        for name in item_add_matches:
-            inv = conn.execute(
-                """SELECT i.name FROM inventory inv
-                   JOIN items i ON inv.item_id = i.item_id
-                   WHERE inv.character_id = ?
-                     AND LOWER(i.name) LIKE ?
-                   LIMIT 1""",
-                (_PC_CHARACTER_ID, f"%{name.lower()[:18]}%"),
-            ).fetchone()
-            if inv:
-                confirmed.append({
-                    "type":   "item_add",
-                    "claim":  f"Acquired: {name}",
-                    "actual": f"In inventory: {inv['name']}  ✓",
-                })
-            else:
-                unverified.append({
-                    "type":           "item_add",
-                    "claim":          f"Acquired: {name}",
-                    "reason":         "Item not found in inventory.",
-                    "suggested_call": f'add_item(name="{name}", owner_type="character", owner_id=1)',
-                })
-
-        # ── 4. Items lost/used ─────────────────────────────────────────────────
-        for m in _VRY["item_lose"].finditer(primary):
-            name = m.group(1).strip().rstrip(".,;!?")
-            if len(name) < 3:
                 continue
-            inv = conn.execute(
-                """SELECT i.name FROM inventory inv
-                   JOIN items i ON inv.item_id = i.item_id
-                   WHERE inv.character_id = ?
-                     AND LOWER(i.name) LIKE ?
-                   LIMIT 1""",
-                (_PC_CHARACTER_ID, f"%{name.lower()[:18]}%"),
-            ).fetchone()
-            if inv:
-                # Still in inventory — tool call to remove was probably missed
+
+            # ── Spent / gained gold ───────────────────────────────────────────
+            if mtype == "spent":
                 unverified.append({
-                    "type":           "item_lose",
-                    "claim":          f"Lost/used: {name}",
-                    "reason":         f"'{inv['name']}' still in inventory.",
-                    "suggested_call": f'remove_inventory_item(name="{inv["name"]}")',
+                    "type":           "spent",
+                    "claim":          f"Spent {marker['amount']} gp",
+                    "reason":         "Gold delta — confirm update_treasury was called.",
+                    "suggested_call": (
+                        f'update_treasury(account_name="<account>", '
+                        f"gp_delta={-marker['amount']})"
+                    ),
                 })
-            else:
-                confirmed.append({
-                    "type":   "item_lose",
-                    "claim":  f"Lost/used: {name}",
-                    "actual": "Item not in inventory  ✓",
+                continue
+            if mtype == "gained":
+                unverified.append({
+                    "type":           "gained",
+                    "claim":          f"Gained {marker['amount']} gp",
+                    "reason":         "Gold delta — confirm update_treasury was called.",
+                    "suggested_call": (
+                        f'update_treasury(account_name="<account>", '
+                        f"gp_delta={marker['amount']})"
+                    ),
                 })
+                continue
 
-        # ── 5. Spells cast ─────────────────────────────────────────────────────
-        # Check both primary (state_changes) and secondary (dm_response narrative)
-        spell_names: list[str] = []
-        for text_src in (primary, secondary):
-            for m in _VRY["spell_cast"].finditer(text_src):
-                name = m.group(1).strip().rstrip(".,;!?")
-                if len(name) >= 3 and name.lower() not in [s.lower() for s in spell_names]:
-                    spell_names.append(name)
+            # ── Items ─────────────────────────────────────────────────────────
+            if mtype == "item_added":
+                name = marker["name"].strip()
+                inv = conn.execute(
+                    """SELECT i.name FROM inventory inv
+                       JOIN items i ON inv.item_id = i.item_id
+                       WHERE inv.character_id = ?
+                         AND LOWER(i.name) LIKE ?
+                       LIMIT 1""",
+                    (_PC_CHARACTER_ID, f"%{name.lower()[:18]}%"),
+                ).fetchone()
+                if inv:
+                    confirmed.append({
+                        "type":   "item_added",
+                        "claim":  f"Acquired: {name}",
+                        "actual": f"In inventory: {inv['name']}  ✓",
+                    })
+                else:
+                    unverified.append({
+                        "type":           "item_added",
+                        "claim":          f"Acquired: {name}",
+                        "reason":         "Item not found in inventory.",
+                        "suggested_call": f'add_item(name="{name}", owner_type="character", owner_id=1)',
+                    })
+                continue
 
-        if spell_names:
-            # Load spell memory from world_facts
-            wf = conn.execute(
-                "SELECT fact_text FROM world_facts "
-                "WHERE category = 'spell_memory' LIMIT 1"
-            ).fetchone()
-            spell_mem: dict = {}
-            if wf:
-                try:
-                    spell_mem = json.loads(wf["fact_text"]) or {}
-                except (json.JSONDecodeError, TypeError):
-                    spell_mem = {}
+            if mtype == "item_used":
+                name = marker["name"].strip()
+                inv = conn.execute(
+                    """SELECT inv.inventory_id, i.name FROM inventory inv
+                       JOIN items i ON inv.item_id = i.item_id
+                       WHERE inv.character_id = ?
+                         AND LOWER(i.name) LIKE ?
+                       LIMIT 1""",
+                    (_PC_CHARACTER_ID, f"%{name.lower()[:18]}%"),
+                ).fetchone()
+                if inv:
+                    unverified.append({
+                        "type":           "item_used",
+                        "claim":          f"Used/lost: {name}",
+                        "reason":         f"'{inv['name']}' still in inventory.",
+                        "suggested_call": (
+                            f'remove_inventory_item(inventory_id={inv["inventory_id"]}, '
+                            f'reason="{name} consumed/lost")'
+                        ),
+                    })
+                else:
+                    confirmed.append({
+                        "type":   "item_used",
+                        "claim":  f"Used/lost: {name}",
+                        "actual": "Item not in inventory  ✓",
+                    })
+                continue
 
-            for spell_name in spell_names:
+            # ── Spells cast ───────────────────────────────────────────────────
+            if mtype == "cast":
+                spell_name = marker["spell"].strip()
+                wf = conn.execute(
+                    "SELECT fact_text FROM world_facts "
+                    "WHERE category = 'spell_memory' LIMIT 1"
+                ).fetchone()
+                spell_mem: dict = {}
+                if wf:
+                    try:
+                        spell_mem = json.loads(wf["fact_text"]) or {}
+                    except (json.JSONDecodeError, TypeError):
+                        spell_mem = {}
                 found_expended = False
                 for _lvl, lvl_data in spell_mem.items():
                     for slot in (lvl_data.get("slots") or []):
@@ -6549,54 +6600,116 @@ def db_verify_turn(turn_id: int | None = None) -> dict:
                             break
                     if found_expended:
                         break
-
                 if found_expended:
                     confirmed.append({
-                        "type":   "spell_cast",
+                        "type":   "cast",
                         "claim":  f"Cast {spell_name}",
                         "actual": "Slot marked expended in spell memory  ✓",
                     })
                 else:
                     unverified.append({
-                        "type":           "spell_cast",
+                        "type":           "cast",
                         "claim":          f"Cast {spell_name}",
                         "reason":         "No expended slot found for this spell.",
                         "suggested_call": f'cast_spell(spell_name="{spell_name}")',
                     })
+                continue
 
-        # ── 6. NPCs added ──────────────────────────────────────────────────────
-        # Check both primary and secondary
-        npc_names: list[str] = []
-        for text_src in (primary, secondary):
-            for m in _VRY["npc_add"].finditer(text_src):
-                name = m.group(1).strip().rstrip(".,;!?")
-                if len(name) >= 2 and name not in npc_names:
-                    npc_names.append(name)
+            # ── NPCs ──────────────────────────────────────────────────────────
+            if mtype == "npc_added":
+                name = marker["name"].strip()
+                npc_row = conn.execute(
+                    "SELECT name FROM characters "
+                    "WHERE LOWER(name) LIKE ? AND character_id != ? LIMIT 1",
+                    (f"%{name.lower()[:18]}%", _PC_CHARACTER_ID),
+                ).fetchone()
+                if npc_row:
+                    confirmed.append({
+                        "type":   "npc_added",
+                        "claim":  f"NPC added: {name}",
+                        "actual": f"In characters table: {npc_row['name']}  ✓",
+                    })
+                else:
+                    unverified.append({
+                        "type":           "npc_added",
+                        "claim":          f"NPC added: {name}",
+                        "reason":         "NPC not found in characters table.",
+                        "suggested_call": f'add_npc(name="{name}")',
+                    })
+                continue
 
-        for name in npc_names:
-            npc_row = conn.execute(
-                "SELECT name FROM characters "
-                "WHERE LOWER(name) LIKE ? AND character_id != ? LIMIT 1",
-                (f"%{name.lower()[:18]}%", _PC_CHARACTER_ID),
-            ).fetchone()
-            if npc_row:
-                confirmed.append({
-                    "type":   "npc_add",
-                    "claim":  f"NPC added: {name}",
-                    "actual": f"In characters table: {npc_row['name']}  ✓",
-                })
-            else:
-                unverified.append({
-                    "type":           "npc_add",
-                    "claim":          f"NPC added: {name}",
-                    "reason":         "NPC not found in characters table.",
-                    "suggested_call": f'add_npc(name="{name}")',
-                })
+            # ── Location ──────────────────────────────────────────────────────
+            if mtype == "location_changed":
+                name = marker["name"].strip()
+                scene = conn.execute(
+                    "SELECT structured_state_json FROM current_scene_state WHERE id = 1"
+                ).fetchone()
+                scene_loc = ""
+                if scene and scene["structured_state_json"]:
+                    try:
+                        scene_loc = (json.loads(scene["structured_state_json"]) or {}).get(
+                            "location"
+                        ) or ""
+                    except (json.JSONDecodeError, TypeError):
+                        scene_loc = ""
+                if scene_loc and name.lower() in scene_loc.lower():
+                    confirmed.append({
+                        "type":   "location_changed",
+                        "claim":  f"Location: {name}",
+                        "actual": f"current_scene_state.location = '{scene_loc}'  ✓",
+                    })
+                else:
+                    unverified.append({
+                        "type":           "location_changed",
+                        "claim":          f"Location: {name}",
+                        "reason":         f"current_scene_state.location is '{scene_loc}'.",
+                        "suggested_call": f'save_turn(..., scene_location="{name}")',
+                    })
+                continue
+
+            # ── Troop count ───────────────────────────────────────────────────
+            if mtype == "troop_change":
+                group = marker["group"].strip()
+                trow = conn.execute(
+                    "SELECT group_name, count FROM troops "
+                    "WHERE LOWER(group_name) LIKE LOWER(?) AND campaign_id = ? LIMIT 1",
+                    (f"{group.lower()}%", _CAMPAIGN_ID),
+                ).fetchone()
+                claim_label = f"{group}: {marker['old']} → {marker['new']}"
+                if not trow:
+                    unverified.append({
+                        "type":           "troop_change",
+                        "claim":          claim_label,
+                        "reason":         f"Troop group '{group}' not found.",
+                        "suggested_call": (
+                            f'add_troop_group(group_name="{group}", '
+                            f"count={marker['new']})"
+                        ),
+                    })
+                    continue
+                actual = trow["count"]
+                if actual == marker["new"]:
+                    confirmed.append({
+                        "type":   "troop_change",
+                        "claim":  claim_label,
+                        "actual": f"troops.count = {actual}  ✓",
+                    })
+                else:
+                    conflicts.append({
+                        "type":           "troop_change",
+                        "claim":          claim_label,
+                        "actual_in_db":   actual,
+                        "suggested_call": (
+                            f'update_troop_count(group_name="{group}", '
+                            f"new_count={marker['new']})"
+                        ),
+                    })
+                continue
 
     # ── Verdict ────────────────────────────────────────────────────────────────
     if conflicts:
         verdict = "conflict"
-    elif unverified:
+    elif unverified or malformed:
         verdict = "needs_attention"
     else:
         verdict = "clean"
@@ -6607,16 +6720,10 @@ def db_verify_turn(turn_id: int | None = None) -> dict:
         "confirmed":  confirmed,
         "unverified": unverified,
         "conflicts":  conflicts,
+        "marker_count": len(markers),
     }
-
-    if not state_changes:
-        result["warning"] = (
-            "No state_changes text in this turn — nothing to parse. "
-            "Pass scene_notes to save_turn to enable verification."
-        )
-    else:
-        result["text_parsed"] = state_changes[:300]
-
+    if malformed:
+        result["malformed"] = malformed
     return result
 
 
