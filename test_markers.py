@@ -395,6 +395,100 @@ class TestSchemaAndLiveDispatch(unittest.IsolatedAsyncioTestCase):
             ["location_changed:Worker's tunnel", "cast:Invisibility"],
         )
 
+    async def test_markers_str_pipe_delimited_workaround(self):
+        """The exact workaround the user requested: pipe-delimited string
+        delivers two markers that the array path failed to deliver."""
+        import json as _json
+        from server.mcp_server import mcp
+
+        result = await mcp.call_tool("save_turn", {
+            "player_action": "test",
+            "dm_narrative":  "test",
+            "markers_str":   "cast:Charm Person|hp:41>38",
+        })
+        text = result[0].text if hasattr(result[0], "text") else str(result[0])
+        payload = _json.loads(text)
+
+        # The string ingress path arrives intact.
+        self.assertEqual(payload["markers_str_received_raw_type"], "str")
+        self.assertEqual(payload["markers_str_pieces_after_split"], 2)
+
+        # Both markers landed in clean_markers and were verified.
+        self.assertEqual(
+            payload["markers_normalized"],
+            ["cast:Charm Person", "hp:41>38"],
+        )
+        self.assertNotEqual(
+            payload["verification"]["verdict"], "no_claims",
+            "markers_str must produce a verifiable turn, not no_claims",
+        )
+        self.assertEqual(payload["verification"]["marker_count"], 2)
+
+    async def test_markers_str_with_apostrophe(self):
+        """Pipe-delimited string with an apostrophe inside one marker value."""
+        import json as _json
+        from server.mcp_server import mcp
+
+        result = await mcp.call_tool("save_turn", {
+            "player_action": "test",
+            "dm_narrative":  "test",
+            "markers_str":   "location_changed:Worker's tunnel|cast:Invisibility",
+        })
+        text = result[0].text if hasattr(result[0], "text") else str(result[0])
+        payload = _json.loads(text)
+        self.assertEqual(
+            payload["markers_normalized"],
+            ["location_changed:Worker's tunnel", "cast:Invisibility"],
+        )
+
+    async def test_markers_array_takes_precedence_when_both_passed(self):
+        """If both ingress paths have content, the array wins."""
+        import json as _json
+        from server.mcp_server import mcp
+
+        result = await mcp.call_tool("save_turn", {
+            "player_action": "test",
+            "dm_narrative":  "test",
+            "markers":       ["cast:FromArray"],
+            "markers_str":   "cast:FromString|hp:1>0",
+        })
+        text = result[0].text if hasattr(result[0], "text") else str(result[0])
+        payload = _json.loads(text)
+        self.assertEqual(payload["markers_normalized"], ["cast:FromArray"])
+
+    async def test_markers_str_falls_back_when_array_empty(self):
+        """Array empty + markers_str non-empty → markers_str is used.
+        Models the actual production scenario where the array drops out."""
+        import json as _json
+        from server.mcp_server import mcp
+
+        result = await mcp.call_tool("save_turn", {
+            "player_action": "test",
+            "dm_narrative":  "test",
+            "markers":       [],
+            "markers_str":   "cast:Charm Person|hp:41>38",
+        })
+        text = result[0].text if hasattr(result[0], "text") else str(result[0])
+        payload = _json.loads(text)
+        self.assertEqual(
+            payload["markers_normalized"],
+            ["cast:Charm Person", "hp:41>38"],
+        )
+
+    async def test_both_empty_yields_no_claims(self):
+        """No markers in either path → verdict no_claims."""
+        import json as _json
+        from server.mcp_server import mcp
+
+        result = await mcp.call_tool("save_turn", {
+            "player_action": "test",
+            "dm_narrative":  "test",
+        })
+        text = result[0].text if hasattr(result[0], "text") else str(result[0])
+        payload = _json.loads(text)
+        self.assertEqual(payload["verification"]["verdict"], "no_claims")
+        self.assertEqual(payload["markers_normalized"], [])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

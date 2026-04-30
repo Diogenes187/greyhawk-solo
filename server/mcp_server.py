@@ -623,6 +623,21 @@ def save_turn(
         "parameter for state changes.",
     ] = "",
     markers: MarkersField = [],
+    markers_str: Annotated[
+        str,
+        Field(description=(
+            "PREFERRED — pipe-delimited markers string. Use this instead of "
+            'the markers array, e.g. markers_str="cast:Charm Person|hp:41>38'
+            '|item_added:Bone token". Live testing shows non-empty arrays '
+            "passed via the markers parameter are dropped by the MCP "
+            "transport, while strings always arrive intact. Each piece "
+            "between pipes is one marker using one of the canonical "
+            "prefixes (cast:, item_added:, item_used:, hp:, spent:, gained:, "
+            "npc_added:, location_changed:, troop_change:). Apostrophes and "
+            "other special characters are safe inside the value. Pass an "
+            "empty string when nothing changed."
+        )),
+    ] = "",
     model_name: Annotated[
         str,
         "Model that generated this turn. Default 'claude'.",
@@ -640,58 +655,67 @@ def save_turn(
     conflicting state changes that need follow-up tool calls.
 
     ════════════════════════════════════════════════════════════════════════
-    MARKERS — STRUCTURED STATE CHANGES (REQUIRED FOR VERIFICATION)
+    STATE-CHANGE MARKERS  (REQUIRED FOR VERIFICATION)
     ════════════════════════════════════════════════════════════════════════
 
-    Every turn that mutates game state MUST include a markers list. Prose in
-    scene_notes is NOT parsed — verify_turn reads only this list. A turn with
-    no markers returns verdict 'no_claims' (silence ≠ verified).
+    Every turn that mutates game state MUST declare its changes via markers.
+    Prose in scene_notes is NOT parsed — verify_turn reads only the
+    structured markers. A turn with no markers returns verdict 'no_claims'
+    (silence ≠ verified).
 
-    One marker per change. Use these exact prefixes:
+    ┌──────────────────────────────────────────────────────────────────────┐
+    │ HOW TO PASS MARKERS — PRIMARY METHOD: markers_str                    │
+    ├──────────────────────────────────────────────────────────────────────┤
+    │ Pipe-delimited string. Pieces separated by | (literal pipe char).    │
+    │                                                                      │
+    │   markers_str="cast:Charm Person|hp:41>38|item_added:Bone token"     │
+    │                                                                      │
+    │ This is the recommended path. Live testing shows the markers ARRAY   │
+    │ parameter is sometimes dropped by the MCP transport on the wire      │
+    │ when non-empty; the string always arrives intact. Use markers_str    │
+    │ until the array bug is fixed upstream.                               │
+    └──────────────────────────────────────────────────────────────────────┘
 
-      cast:[spell name]
-          A spell was expended this turn.
-          Example: "cast:Magic Missile"
+    ┌──────────────────────────────────────────────────────────────────────┐
+    │ FALLBACK: markers (array of strings)                                 │
+    ├──────────────────────────────────────────────────────────────────────┤
+    │ If you know the array path works in your client, pass:               │
+    │                                                                      │
+    │   markers=["cast:Charm Person", "hp:41>38", "item_added:Bone token"] │
+    │                                                                      │
+    │ The handler accepts both and merges them — but if both are passed,   │
+    │ markers (the array) takes precedence when it has content.            │
+    └──────────────────────────────────────────────────────────────────────┘
 
-      item_added:[item name]
-          PC gained / picked up / was awarded an item.
-          Example: "item_added:Potion of Healing"
+    One marker per state change. Use these exact prefixes:
 
-      item_used:[item name]
-          PC consumed / lost / dropped an item.
-          Example: "item_used:Torch"
+      cast:[spell name]                A spell was expended this turn.
+                                       Example: "cast:Magic Missile"
 
-      hp:[old]>[new]
-          HP changed. Both values are integers, separated by a literal '>'.
-          Example: "hp:31>23"
+      item_added:[item name]           PC gained an item.
+                                       Example: "item_added:Potion of Healing"
 
-      spent:[amount]gp
-          Gold deducted from a treasury account. Integer amount, no commas.
-          Example: "spent:500gp"
+      item_used:[item name]            PC consumed / lost / dropped an item.
+                                       Example: "item_used:Torch"
 
-      gained:[amount]gp
-          Gold added to a treasury account. Integer amount, no commas.
-          Example: "gained:200gp"
+      hp:[old]>[new]                   HP changed. Both integers.
+                                       Example: "hp:31>23"
 
-      npc_added:[name]
-          A new NPC appeared and should exist in the characters table.
-          Example: "npc_added:Merchant Grel"
+      spent:[amount]gp                 Gold deducted. Integer, no commas.
+                                       Example: "spent:500gp"
 
-      location_changed:[name]
-          The party moved to a new location. Pass the same name to
-          scene_location so verify_turn can confirm the move.
-          Example: "location_changed:Quasquetan — north wall"
+      gained:[amount]gp                Gold added. Integer, no commas.
+                                       Example: "gained:200gp"
 
-      troop_change:[group]:[old]>[new]
-          A troop group's count changed. Both values are integers.
-          Example: "troop_change:Iron Watch:120>108"
+      npc_added:[name]                 New NPC appeared.
+                                       Example: "npc_added:Merchant Grel"
 
-    Multiple changes in one turn? Pass multiple markers:
-        markers=[
-            "hp:31>23",
-            "cast:Sleep",
-            "item_used:Scroll of Sleep",
-        ]
+      location_changed:[name]          Party moved. Also pass scene_location
+                                       so verify can confirm.
+                                       Example: "location_changed:north wall"
+
+      troop_change:[group]:[old]>[new] Troop count changed. Both integers.
+                                       Example: "troop_change:Iron Watch:120>108"
 
     Always pair markers with the underlying tool call (update_character_status,
     cast_spell, update_treasury, etc.). The marker is a *claim*; the tool call
@@ -699,14 +723,22 @@ def save_turn(
     ════════════════════════════════════════════════════════════════════════
     """
     # ── Markers normalization ─────────────────────────────────────────────────
-    # The Pydantic BeforeValidator on MarkersField has already coerced any
-    # input shape (JSON-array string, single marker, etc.) into list[str].
-    # By the time we get here, `markers` is always a clean list. We still
-    # filter out any whitespace-only entries that may have slipped through.
+    # Two ingress paths because non-empty markers arrays sometimes get
+    # dropped by the MCP transport before reaching the handler:
+    #   1. markers       — list[str] (works when the wire allows it)
+    #   2. markers_str   — pipe-delimited string fallback (always arrives)
+    #
+    # If the array has any content, prefer it. Otherwise fall back to the
+    # pipe-delimited string. Whatever ends up in clean_markers is what the
+    # turn is verified against.
     clean_markers = [
         m.strip() for m in (markers or [])
         if isinstance(m, str) and m.strip()
     ]
+    if not clean_markers and markers_str:
+        clean_markers = [
+            p.strip() for p in markers_str.split("|") if p.strip()
+        ]
 
     structured: dict = {}
     if scene_location:
@@ -741,13 +773,16 @@ def save_turn(
         "notes_stored": bool(scene_notes),
         "verification": verification,
         # Debug fields the AI can read to confirm markers actually arrived.
-        # After the Pydantic BeforeValidator runs, `markers` is always a
-        # list — so seeing `markers_received_raw_type == "list"` proves the
-        # schema/coercion path delivered the data. A None here would mean
-        # the parameter was dropped before reaching the handler.
-        "markers_received_raw_type":  type(markers).__name__,
-        "markers_received_count":     len(markers or []),
-        "markers_normalized":         clean_markers,
+        # The `*_raw_type` fields show what each ingress path produced:
+        # "list" / "str" — value reached the handler intact.
+        # "NoneType"     — parameter was dropped before the handler.
+        "markers_received_raw_type":     type(markers).__name__,
+        "markers_received_count":        len(markers or []),
+        "markers_str_received_raw_type": type(markers_str).__name__,
+        "markers_str_received_length":   len(markers_str or ""),
+        "markers_str_pieces_after_split":
+            len([p for p in (markers_str or "").split("|") if p.strip()]),
+        "markers_normalized":            clean_markers,
         "world_fact_reminder": (
             "Check this turn for anything that should be written to the database "
             "immediately — do not let it live only in chat history. Call "
@@ -758,10 +793,10 @@ def save_turn(
         ),
     }
 
-    # If markers came in non-empty but normalized to nothing, the input shape
-    # was unrecognizable — surface the canonical format help so the AI knows
-    # how to retry without burning another turn.
-    if markers and not clean_markers:
+    # If either ingress path had content but nothing landed in clean_markers,
+    # surface the canonical format help so the AI knows how to retry without
+    # burning another turn.
+    if (markers or markers_str) and not clean_markers:
         result["markers_format_help"] = CANONICAL_MARKER_FORMAT_HELP
 
     # Surface conflicts prominently so the DM sees them immediately
