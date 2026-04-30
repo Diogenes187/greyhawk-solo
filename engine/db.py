@@ -879,23 +879,38 @@ def update_npc(
 
 def add_npc(
     name: str,
-    race: str = "",
+    race: str | None = None,
     character_type: str = "NPC",
-    notes: str = "",
-    relationship_to_theron: str = "",
-    relationship_notes: str = "",
+    notes: str | None = None,
+    relationship_to_theron: str | None = None,
+    relationship_notes: str | None = None,
 ) -> dict:
     """
     Add a new NPC to the characters table. If relationship_to_theron is
     provided, also inserts a row in the relationships table linking this NPC
     to Theron (character_id=1). Returns the new character row.
+
+    Parameter binding is intentionally aligned with update_npc: each text
+    field accepts None (= not provided) or a string (= written verbatim).
+    Empty strings are treated as None so the column ends up NULL rather
+    than holding an empty string — but a non-empty value is ALWAYS written
+    through, never dropped.
     """
+    # Normalize "" → None so the empty-string case stores NULL, but a
+    # non-empty value passes straight through to the INSERT.
+    race                  = (race or "").strip() or None
+    notes                 = notes if (notes is not None and notes != "") else None
+    relationship_to_theron = (relationship_to_theron or "").strip() or None
+    relationship_notes    = (relationship_notes if
+                             (relationship_notes is not None
+                              and relationship_notes != "") else None)
+
     with _get_conn() as conn:
         cur = conn.cursor()
         cur.execute(
             "INSERT INTO characters (campaign_id, name, character_type, race, notes) "
             "VALUES (?, ?, ?, ?, ?)",
-            (_CAMPAIGN_ID, name, character_type, race or None, notes or None),
+            (_CAMPAIGN_ID, name, character_type, race, notes),
         )
         new_id = cur.lastrowid
 
@@ -905,7 +920,7 @@ def add_npc(
                 "(source_character_id, target_character_id, relationship_type, notes) "
                 "VALUES (?, ?, ?, ?)",
                 (_PC_CHARACTER_ID, new_id,
-                 relationship_to_theron, relationship_notes or None),
+                 relationship_to_theron, relationship_notes),
             )
 
     with _get_conn(read_only=True) as conn:

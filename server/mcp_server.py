@@ -1242,25 +1242,30 @@ def update_npc(
 @mcp.tool()
 def add_npc(
     name: Annotated[str, "Full name of the new NPC."],
-    race: Annotated[str, "Race (Human, Elf, Goblin, etc.). Leave blank if unknown."] = "",
+    race: Annotated[
+        str | None,
+        "Race (Human, Elf, Goblin, etc.). Omit if unknown.",
+    ] = None,
     character_type: Annotated[
         str,
         "Type: 'NPC', 'Prisoner', 'Ally', 'Hostile', 'Construct', 'Unknown'.",
     ] = "NPC",
     notes: Annotated[
-        str,
-        "Description, backstory, role in the campaign, known abilities or items.",
-    ] = "",
+        str | None,
+        "Description, backstory, role in the campaign, known abilities or items. "
+        "When provided this is written verbatim to characters.notes — same "
+        "binding as update_npc.notes. Omit to leave the column NULL.",
+    ] = None,
     relationship_to_theron: Annotated[
-        str,
+        str | None,
         "If this NPC has a relationship with Theron, describe it here: "
         "'Hired Soldier', 'Enemy', 'Quest Giver', 'Merchant', 'Prisoner', etc. "
-        "Leave blank if no relationship entry is needed.",
-    ] = "",
+        "Omit if no relationship entry is needed.",
+    ] = None,
     relationship_notes: Annotated[
-        str,
+        str | None,
         "Additional context for the relationship (circumstances of meeting, etc.).",
-    ] = "",
+    ] = None,
 ) -> dict:
     """
     Add a newly encountered or newly relevant NPC to the database.
@@ -5167,23 +5172,21 @@ def update_npc_class(
         int,
         "New level. Pass -1 to leave unchanged (or let an inserted row use 1).",
     ] = -1,
-    new_notes: Annotated[
-        str,
-        "Replacement value for characters.notes. Leave blank to leave unchanged. "
-        "Pass the literal string 'null' to clear the field.",
-    ] = "",
     reason: Annotated[
         str,
         "Short reason for the edit, written to the edit_log.",
     ] = "",
 ) -> dict:
     """
-    Directly correct an NPC's class, level, or notes.
+    Directly correct an NPC's class and/or level.
 
-    Operates on a single class_levels row per NPC. If the NPC has
-    multiple class rows (rare), the first (lowest class_level_id) is
-    edited. Every change is recorded in world_facts under category
-    'edit_log'.
+    Operates on a single class_levels row per NPC. If the NPC has multiple
+    class rows (rare), the first (lowest class_level_id) is edited. Every
+    change is recorded in world_facts under category 'edit_log'.
+
+    This tool NEVER writes to characters.notes. To change an NPC's notes,
+    use update_npc (which has a notes parameter) — that keeps narrative
+    notes from being clobbered by class/level corrections.
     """
     try:
         conn = _open_writable_active()
@@ -5241,21 +5244,14 @@ def update_npc_class(
                                     "new": {"class_name": new_class, "level": lvl,
                                             "class_level_id": cur.lastrowid}})
 
-            # ── notes ────────────────────────────────────────────────────
-            if new_notes:
-                want = None if new_notes.strip().lower() == "null" else new_notes
-                if want != pc_row["notes"]:
-                    conn.execute(
-                        "UPDATE characters SET notes = ? WHERE character_id = ?",
-                        (want, npc_character_id),
-                    )
-                    changes.append({"field": "characters.notes",
-                                    "old": pc_row["notes"], "new": want})
+            # NOTE: this tool deliberately does NOT touch characters.notes.
+            # Notes updates flow through update_npc to avoid clobbering
+            # rich narrative notes with class/level summaries.
 
             if not changes:
                 return {"ok": True, "unchanged": True, "npc_character_id": npc_character_id}
 
-            _log_edit(conn, "update_npc_class", "characters+class_levels",
+            _log_edit(conn, "update_npc_class", "class_levels",
                       npc_character_id, changes, reason)
 
         return {"ok": True, "npc_character_id": npc_character_id,
