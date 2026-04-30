@@ -98,7 +98,82 @@ import sqlite3
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MARKERS INPUT NORMALIZATION
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# The save_turn `markers` parameter is documented as list[str], but in
+# practice MCP clients sometimes serialize the argument as a string — either
+# a JSON-array literal ('["cast:Invisibility", "hp:41>38"]'), a single
+# marker string ('cast:Invisibility'), or a newline/comma-separated batch.
+# This helper accepts every shape and returns a clean list[str].
+# ──────────────────────────────────────────────────────────────────────────────
+
+CANONICAL_MARKER_FORMAT_HELP = (
+    "Markers must be a JSON array of strings, one per state change. "
+    "Each string uses one of these exact prefixes:\n"
+    '  "cast:[spell name]"\n'
+    '  "item_added:[name]"   "item_used:[name]"\n'
+    '  "hp:[old]>[new]"\n'
+    '  "spent:[amount]gp"    "gained:[amount]gp"\n'
+    '  "npc_added:[name]"\n'
+    '  "location_changed:[name]"\n'
+    '  "troop_change:[group]:[old]>[new]"\n'
+    "Example correct call:\n"
+    '  save_turn(player_action="...", dm_narrative="...",\n'
+    '            markers=["cast:Invisibility", "hp:41>38"])'
+)
+
+
+def _normalize_markers(raw: Any) -> list[str]:
+    """
+    Coerce whatever the MCP client sent into a clean list of marker strings.
+
+    Accepts:
+      - list[str]                     → cleaned in place
+      - JSON-array string             → json.loads first
+      - newline-separated string      → split on \\n
+      - comma-separated string        → split on , (only if no newlines)
+      - single marker string          → wrapped in a 1-element list
+      - None / empty / whitespace     → []
+
+    Whitespace is stripped from every entry; empties are dropped.
+    """
+    if raw is None:
+        return []
+
+    if isinstance(raw, list):
+        return [str(m).strip() for m in raw
+                if isinstance(m, str) and str(m).strip()]
+
+    if isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return []
+        # JSON array literal? Try that first.
+        if s.startswith("[") and s.endswith("]"):
+            try:
+                parsed = json.loads(s)
+                if isinstance(parsed, list):
+                    return [str(m).strip() for m in parsed
+                            if isinstance(m, str) and str(m).strip()]
+            except (json.JSONDecodeError, TypeError):
+                pass
+        # Newline-separated takes precedence over commas (commas appear inside
+        # marker values like "Quasquetan, north wall"; newlines never do).
+        if "\n" in s:
+            parts = [p.strip() for p in s.replace("\r", "").split("\n")]
+        elif "," in s:
+            parts = [p.strip() for p in s.split(",")]
+        else:
+            parts = [s]
+        return [p for p in parts if p]
+
+    # Fall through for anything else (dict, int, etc) — treat as no markers.
+    return []
 
 # Allow imports from project root (works whether run from root or server/)
 _ROOT = Path(__file__).parent.parent
@@ -458,14 +533,16 @@ def save_turn(
         "parameter for state changes.",
     ] = "",
     markers: Annotated[
-        list[str] | None,
+        list[str] | str | None,
         "Structured state-change markers — REQUIRED for any turn that mutates "
-        "game state. One string per change, exact prefixes. See docstring for the "
-        "complete catalogue. Examples: 'cast:Magic Missile', 'hp:31>23', "
-        "'spent:500gp', 'item_added:Potion of Healing', "
-        "'troop_change:Iron Watch:120>108'. Pass [] (or omit) only when nothing "
-        "changed (pure dialogue / OOC). A turn with no markers cannot be verified "
-        "and will return verdict='no_claims'.",
+        "game state. PREFERRED: a JSON array of strings, e.g. "
+        '["cast:Invisibility", "hp:41>38"]. ALSO ACCEPTED: a single marker '
+        'string ("cast:Invisibility"), a newline-separated batch '
+        '("cast:Invisibility\\nhp:41>38"), or a JSON-array literal as a string. '
+        "All forms normalize to a list internally. Each marker uses one of "
+        "the prefixes shown in the docstring. Pass [] (or omit) ONLY when "
+        "nothing changed (pure dialogue / OOC) — a turn with no markers cannot "
+        "be verified and will return verdict='no_claims'.",
     ] = None,
     model_name: Annotated[
         str,
@@ -542,15 +619,23 @@ def save_turn(
     is the *write*. verify_turn checks the claim against the write.
     ════════════════════════════════════════════════════════════════════════
     """
+    # ── Normalize markers ─────────────────────────────────────────────────────
+    # Accept list, JSON-array string, newline/comma-separated string, or None.
+    # Track the raw input shape so the AI can debug serialization mismatches.
+    markers_raw_repr = (
+        f"{type(markers).__name__}: {markers!r}"
+        if markers is not None
+        else "None"
+    )
+    clean_markers = _normalize_markers(markers)
+
     structured: dict = {}
     if scene_location:
         structured["location"] = scene_location
     if scene_notes:
         structured["state_changes"] = scene_notes
-    if markers:
-        clean_markers = [m.strip() for m in markers if isinstance(m, str) and m.strip()]
-        if clean_markers:
-            structured["markers"] = clean_markers
+    if clean_markers:
+        structured["markers"] = clean_markers
 
     turn_id = write_ai_turn(
         player_action=player_action,
@@ -566,7 +651,7 @@ def save_turn(
         structured_state=structured or None,
     )
 
-    # ── Auto-verify: parse scene_notes for state claims, cross-check DB ───────
+    # ── Auto-verify: parse markers, cross-check DB ────────────────────────────
     verification = db_verify_turn(turn_id=turn_id)
     db_update_turn_verification(turn_id, json.dumps(verification))
 
@@ -576,6 +661,8 @@ def save_turn(
         "location":     scene_location or "(unchanged)",
         "notes_stored": bool(scene_notes),
         "verification": verification,
+        "markers_received_raw_type": markers_raw_repr,
+        "markers_normalized":        clean_markers,
         "world_fact_reminder": (
             "Check this turn for anything that should be written to the database "
             "immediately — do not let it live only in chat history. Call "
@@ -585,6 +672,14 @@ def save_turn(
             "new named character. Call add_item for any new item the PC now carries."
         ),
     }
+
+    # If verdict came back as no_claims and the caller did pass *something* in
+    # markers, surface the format help so the AI can self-correct on the next
+    # turn instead of repeating the same mistake.
+    if (verification.get("verdict") == "no_claims"
+            and markers is not None
+            and not clean_markers):
+        result["markers_format_help"] = CANONICAL_MARKER_FORMAT_HELP
 
     # Surface conflicts prominently so the DM sees them immediately
     if verification.get("conflicts"):

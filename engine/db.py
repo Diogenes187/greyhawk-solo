@@ -6432,15 +6432,21 @@ def db_verify_turn(turn_id: int | None = None) -> dict:
     found_turn_id = row["turn_id"]
 
     # ── Pull markers list out of structured_response_json ─────────────────────
+    # Capture both what was stored AND the shape it was stored in, so the AI
+    # can see at a glance whether the markers round-tripped correctly.
     markers: list[str] = []
+    raw_in_db: Any = None
+    raw_type:  str  = "missing"
     if row["structured_response_json"]:
         try:
             sc = json.loads(row["structured_response_json"]) or {}
-            raw = sc.get("markers")
-            if isinstance(raw, list):
-                markers = [str(m) for m in raw if isinstance(m, str) and m.strip()]
-        except (json.JSONDecodeError, TypeError):
-            pass
+            raw_in_db = sc.get("markers")
+            raw_type  = type(raw_in_db).__name__ if raw_in_db is not None else "absent"
+            if isinstance(raw_in_db, list):
+                markers = [str(m) for m in raw_in_db
+                           if isinstance(m, str) and m.strip()]
+        except (json.JSONDecodeError, TypeError) as exc:
+            raw_type = f"json_error: {exc.__class__.__name__}"
 
     if not markers:
         return {
@@ -6449,6 +6455,11 @@ def db_verify_turn(turn_id: int | None = None) -> dict:
             "confirmed":  [],
             "unverified": [],
             "conflicts":  [],
+            "debug": {
+                "markers_in_db_raw":  raw_in_db,
+                "markers_in_db_type": raw_type,
+                "markers_parsed":     [],
+            },
             "warning": (
                 "No markers in this turn — state cannot be verified. "
                 "Pass markers=[...] to save_turn whenever game state changes. "
@@ -6459,6 +6470,14 @@ def db_verify_turn(turn_id: int | None = None) -> dict:
         }
 
     parsed = [_vry_parse_marker(m) for m in markers]
+    debug_parsed = [
+        {
+            "raw":  p["raw"],
+            "type": p["type"],
+            **({"reason": p["reason"]} if "reason" in p else {}),
+        }
+        for p in parsed
+    ]
 
     confirmed:  list[dict] = []
     unverified: list[dict] = []
@@ -6721,6 +6740,11 @@ def db_verify_turn(turn_id: int | None = None) -> dict:
         "unverified": unverified,
         "conflicts":  conflicts,
         "marker_count": len(markers),
+        "debug": {
+            "markers_in_db_raw":  raw_in_db,
+            "markers_in_db_type": raw_type,
+            "markers_parsed":     debug_parsed,
+        },
     }
     if malformed:
         result["malformed"] = malformed

@@ -1,0 +1,245 @@
+"""
+test_markers.py — verifies the markers parsing fix.
+
+Covers:
+  1. _normalize_markers accepts every input shape (list, JSON string,
+     newline-separated, comma-separated, single string, None, empty).
+  2. End-to-end save_turn → verify_turn round-trip with markers=["cast:Invisibility"]
+     against a temp database. Asserts verdict != "no_claims" and
+     marker_count > 0 — proving the markers reached the DB and were re-parsed
+     on the way out.
+
+Runs against a TEMPORARY SQLite database in a temp directory. Never touches
+any campaign DB. The active DB path is patched for the duration of the test.
+
+    python test_markers.py
+"""
+import json
+import shutil
+import sqlite3
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+ROOT = Path(__file__).parent
+sys.path.insert(0, str(ROOT))
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Test fixture: a minimal SQLite DB carrying just the tables verify_turn reads.
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _build_test_db(db_path: Path) -> None:
+    conn = sqlite3.connect(db_path)
+    conn.executescript("""
+        CREATE TABLE characters (
+            character_id INTEGER PRIMARY KEY, campaign_id INTEGER, name TEXT,
+            character_type TEXT, race TEXT, alignment TEXT, notes TEXT
+        );
+        CREATE TABLE character_status (
+            character_id INTEGER PRIMARY KEY,
+            hp_current INTEGER, hp_max INTEGER, ac INTEGER,
+            movement INTEGER, attacks_per_round REAL, status_notes TEXT
+        );
+        CREATE TABLE ai_turns (
+            turn_id INTEGER PRIMARY KEY,
+            player_action TEXT, dm_response TEXT,
+            response_id TEXT, previous_response_id TEXT,
+            model_name TEXT, created_at TEXT,
+            turn_packet_json TEXT, structured_response_json TEXT,
+            validation_errors_json TEXT
+        );
+        CREATE TABLE current_scene_state (
+            id INTEGER PRIMARY KEY, current_turn_id INTEGER,
+            current_player_action TEXT, current_dm_response TEXT,
+            structured_state_json TEXT, updated_at TEXT
+        );
+        CREATE TABLE inventory (
+            inventory_id INTEGER PRIMARY KEY, character_id INTEGER, item_id INTEGER,
+            quantity INTEGER, equipped_flag INTEGER,
+            location_id INTEGER, treasury_id INTEGER, notes TEXT
+        );
+        CREATE TABLE items (item_id INTEGER PRIMARY KEY, name TEXT);
+        CREATE TABLE world_facts (
+            world_fact_id INTEGER PRIMARY KEY, campaign_id INTEGER,
+            category TEXT, fact_text TEXT, source_turn_id INTEGER, created_at TEXT
+        );
+        CREATE TABLE troops (
+            troop_id INTEGER PRIMARY KEY, campaign_id INTEGER, group_name TEXT,
+            count INTEGER, troop_type TEXT, location_id INTEGER,
+            commander_character_id INTEGER, notes TEXT
+        );
+        INSERT INTO characters (character_id, campaign_id, name)
+            VALUES (1, 1, 'TestPC');
+        INSERT INTO character_status (character_id, hp_current, hp_max)
+            VALUES (1, 23, 31);
+        -- Spell memory with Invisibility marked expended so verify_turn
+        -- confirms cast:Invisibility instead of just flagging it unverified.
+        INSERT INTO world_facts (campaign_id, category, fact_text)
+            VALUES (1, 'spell_memory',
+                    '{"2": {"slots": [{"spell": "Invisibility", "expended": true}]}}');
+    """)
+    conn.commit()
+    conn.close()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Test cases
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestNormalizeMarkers(unittest.TestCase):
+    """_normalize_markers must accept every input shape an MCP client may send."""
+
+    def setUp(self):
+        from server.mcp_server import _normalize_markers
+        self.normalize = _normalize_markers
+
+    def test_list_passes_through(self):
+        self.assertEqual(
+            self.normalize(["cast:Invisibility", "hp:31>23"]),
+            ["cast:Invisibility", "hp:31>23"],
+        )
+
+    def test_json_array_string(self):
+        self.assertEqual(
+            self.normalize('["cast:Invisibility", "hp:31>23"]'),
+            ["cast:Invisibility", "hp:31>23"],
+        )
+
+    def test_newline_separated_string(self):
+        self.assertEqual(
+            self.normalize("cast:Invisibility\nhp:31>23"),
+            ["cast:Invisibility", "hp:31>23"],
+        )
+
+    def test_comma_separated_string(self):
+        self.assertEqual(
+            self.normalize("cast:Invisibility, hp:31>23"),
+            ["cast:Invisibility", "hp:31>23"],
+        )
+
+    def test_single_marker_string(self):
+        self.assertEqual(
+            self.normalize("cast:Invisibility"),
+            ["cast:Invisibility"],
+        )
+
+    def test_none_returns_empty(self):
+        self.assertEqual(self.normalize(None), [])
+
+    def test_empty_string_returns_empty(self):
+        self.assertEqual(self.normalize(""), [])
+        self.assertEqual(self.normalize("   "), [])
+
+    def test_empty_list_returns_empty(self):
+        self.assertEqual(self.normalize([]), [])
+
+    def test_strips_whitespace_and_drops_empties(self):
+        self.assertEqual(
+            self.normalize(["  cast:X  ", "", "  ", "hp:1>0"]),
+            ["cast:X", "hp:1>0"],
+        )
+
+    def test_non_string_entries_dropped(self):
+        self.assertEqual(
+            self.normalize([1, "cast:X", None, "hp:1>0"]),
+            ["cast:X", "hp:1>0"],
+        )
+
+
+class TestSaveAndVerifyRoundTrip(unittest.TestCase):
+    """End-to-end: a marker list passed in must come back via verify_turn."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmpdir  = Path(tempfile.mkdtemp(prefix="greyhawk_test_markers_"))
+        cls.db_path = cls.tmpdir / "test.db"
+        _build_test_db(cls.db_path)
+
+        # Patch the path resolver so every _get_conn() call hits our temp DB.
+        from engine import db as engine_db
+        cls._patcher = patch.object(
+            engine_db, "_resolve_db_path", return_value=cls.db_path
+        )
+        cls._patcher.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._patcher.stop()
+        shutil.rmtree(cls.tmpdir, ignore_errors=True)
+
+    def _save_turn_with_markers(self, raw_markers):
+        """Mimic save_turn's normalization → write → verify path."""
+        from server.mcp_server import _normalize_markers
+        from engine.db import (
+            write_ai_turn, update_current_scene,
+            db_verify_turn, db_update_turn_verification,
+        )
+
+        clean = _normalize_markers(raw_markers)
+        structured = {"markers": clean} if clean else {}
+
+        turn_id = write_ai_turn(
+            player_action="Cast invisibility on myself.",
+            dm_response="You shimmer and vanish from sight.",
+            model_name="test",
+            structured_response_json=(
+                json.dumps(structured) if structured else None
+            ),
+        )
+        update_current_scene(
+            turn_id=turn_id,
+            player_action="Cast invisibility on myself.",
+            dm_response="You shimmer and vanish from sight.",
+            structured_state=structured or None,
+        )
+        verification = db_verify_turn(turn_id=turn_id)
+        db_update_turn_verification(turn_id, json.dumps(verification))
+        return turn_id, verification
+
+    def test_list_input_roundtrips_to_confirmed(self):
+        """The originally reported bug: passing a list must NOT yield no_claims."""
+        _turn_id, result = self._save_turn_with_markers(["cast:Invisibility"])
+
+        self.assertNotEqual(
+            result.get("verdict"), "no_claims",
+            f"Markers list was lost on the way to the DB. Full result: {result}",
+        )
+        self.assertEqual(result.get("marker_count"), 1)
+        # Spell memory had Invisibility marked expended, so verify should confirm.
+        self.assertEqual(
+            len(result.get("confirmed", [])), 1,
+            f"Expected 1 confirmed entry; got {result}",
+        )
+        self.assertEqual(result["confirmed"][0]["type"], "cast")
+        # Debug fields must be present
+        self.assertIn("debug", result)
+        self.assertEqual(result["debug"]["markers_in_db_type"], "list")
+        self.assertEqual(
+            result["debug"]["markers_in_db_raw"], ["cast:Invisibility"]
+        )
+
+    def test_json_string_input_also_roundtrips(self):
+        _turn_id, result = self._save_turn_with_markers('["cast:Invisibility"]')
+        self.assertNotEqual(result.get("verdict"), "no_claims")
+        self.assertEqual(result.get("marker_count"), 1)
+
+    def test_newline_string_input_also_roundtrips(self):
+        _turn_id, result = self._save_turn_with_markers(
+            "cast:Invisibility\nhp:31>23"
+        )
+        self.assertNotEqual(result.get("verdict"), "no_claims")
+        self.assertEqual(result.get("marker_count"), 2)
+
+    def test_no_markers_returns_no_claims(self):
+        _turn_id, result = self._save_turn_with_markers(None)
+        self.assertEqual(result.get("verdict"), "no_claims")
+        self.assertEqual(result.get("marker_count", 0), 0)
+        # Debug should still surface what was (not) found.
+        self.assertEqual(result["debug"]["markers_in_db_type"], "missing")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
