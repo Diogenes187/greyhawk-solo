@@ -166,6 +166,9 @@ from engine.db import (
     db_assault,
     db_get_siege_state,
     db_negotiate_surrender,
+    # Phase 6 — turn verification
+    db_verify_turn,
+    db_update_turn_verification,
     # Phase 4 — domain
     get_full_domain_state,
     db_add_construction_project,
@@ -488,20 +491,39 @@ def save_turn(
         structured_state=structured or None,
     )
 
-    return {
+    # ── Auto-verify: parse scene_notes for state claims, cross-check DB ───────
+    verification = db_verify_turn(turn_id=turn_id)
+    db_update_turn_verification(turn_id, json.dumps(verification))
+
+    result: dict = {
         "saved":        True,
         "turn_id":      turn_id,
         "location":     scene_location or "(unchanged)",
         "notes_stored": bool(scene_notes),
+        "verification": verification,
         "world_fact_reminder": (
             "Check this turn for anything that should be written to the database "
             "immediately — do not let it live only in chat history. Call "
             "update_world_fact for: named NPCs encountered or mentioned, items "
             "acquired or lost, decisions made, quests opened or closed, rulings "
             "established, alliances or hostilities formed. Call add_npc for any "
-            "new named character. Call add_item for any new item Theron now carries."
+            "new named character. Call add_item for any new item the PC now carries."
         ),
     }
+
+    # Surface conflicts prominently so the DM sees them immediately
+    if verification.get("conflicts"):
+        result["CONFLICTS_DETECTED"] = [
+            c["suggested_call"] for c in verification["conflicts"]
+            if c.get("suggested_call")
+        ]
+    if verification.get("unverified"):
+        result["unverified_claims"] = [
+            u.get("suggested_call", u.get("claim"))
+            for u in verification["unverified"]
+        ]
+
+    return result
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3782,6 +3804,47 @@ def get_character_age(
     years_to_next_check, natural_lifespan_max, ability_changes_applied, dm_note.
     """
     return db_get_character_age(character_id=character_id)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TURN VERIFICATION  (Phase 6)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@mcp.tool()
+def verify_turn(
+    turn_id: Annotated[
+        int,
+        "Turn ID to verify. Omit (or pass 0) to verify the most recent turn.",
+    ] = 0,
+) -> dict:
+    """
+    Parse a saved turn for state-change claims and cross-check each one
+    against the actual current database state.
+
+    Called automatically by save_turn after every write — you only need to
+    call this directly when re-auditing an older turn.
+
+    What it parses (from scene_notes / state_changes):
+    - HP changes: "HP now 23/31", "HP: 31 → 23"
+    - Gold: "spent 500gp", "+200 gold"
+    - Items acquired: "Item added: Potion of Healing"
+    - Items lost/used: "Item used: Torch"
+    - Spells cast: "Cast Sleep"
+    - NPCs added: "NPC added: Merchant Grel"
+
+    Returns:
+    - confirmed: claim matches DB state
+    - unverified: claim found but no corresponding tool call evidence
+    - conflicts: claim directly contradicts DB (e.g. HP mismatch)
+    - suggested_call: the exact tool call to resolve each unverified/conflict
+
+    verdict: "clean" | "needs_attention" | "conflict"
+
+    A "conflict" always means a tool call was missed and must be resolved
+    before the next turn to keep DB state accurate.
+    """
+    return db_verify_turn(turn_id=turn_id if turn_id else None)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
