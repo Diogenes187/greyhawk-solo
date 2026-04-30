@@ -16,6 +16,7 @@ env/
 # ── Campaign saves and active-session config (personal data — never commit) ───
 saves/*
 !saves/.gitkeep
+backups/
 config.json
 
 
