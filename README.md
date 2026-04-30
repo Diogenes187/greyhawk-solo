@@ -175,6 +175,76 @@ after switching.
 
 ---
 
+## Multi-Character Setup & Engine Sync
+
+Each character lives in its own isolated folder (`greyhawk-<name>/`) so
+campaign databases never bleed into each other. `greyhawk-solo` is the
+**source of truth** — all engine development happens here and is pushed
+to GitHub. The other character folders are copies that receive updates
+via the sync script.
+
+### Folder layout
+
+```
+ClaudeDnD/
+├── greyhawk-solo/        ← source repo — develop here
+├── greyhawk-theron/      ← Theron Vale's campaign
+├── greyhawk-aelric/      ← Aelric Silvertongue's campaign
+├── greyhawk-ramun/       ← Ramun Zul's campaign
+└── greyhawk-<name>/      ← any future character
+```
+
+Each folder has its own `saves/<character>.db` and `config.json` that
+are **never overwritten** by the sync script.
+
+### Creating a new character folder
+
+```bash
+# Windows
+clone_for_new_character.bat
+
+# macOS / Linux
+bash clone_for_new_character.sh
+```
+
+Then run `python create_character.py` inside the new folder and add the
+new MCP server entry to your Claude Desktop config.
+
+### Syncing engine updates to all characters
+
+After building and testing improvements in `greyhawk-solo`:
+
+```bash
+# Windows — run from greyhawk-solo/ or double-click in Explorer
+sync_engine.bat
+
+# macOS / Linux
+bash sync_engine.sh
+```
+
+The script:
+1. Scans the parent folder for all `greyhawk-*` siblings
+2. Lists them and asks for confirmation
+3. Copies `engine/`, `server/mcp_server.py`, `schema/ddl.sql`,
+   `schema/starter.sql`, and the sync/clone scripts to each folder
+4. **Never touches** `saves/`, `config.json`, or any `.db` files
+5. Reports success/failure per folder
+6. Reminds you to restart Claude Desktop
+
+**Always restart Claude Desktop after syncing** so all MCP servers
+pick up the updated code.
+
+### Typical development workflow
+
+```
+1. Build and test in greyhawk-solo
+2. git commit && git push
+3. Run sync_engine.bat
+4. Restart Claude Desktop
+```
+
+---
+
 ## Creating a Character via Claude
 
 You can also create a new character entirely in chat. Tell Claude:
