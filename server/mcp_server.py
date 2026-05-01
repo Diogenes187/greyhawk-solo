@@ -5223,21 +5223,43 @@ def update_npc_class(
         int,
         "New level. Pass -1 to leave unchanged (or let an inserted row use 1).",
     ] = -1,
+    new_notes: Annotated[
+        str,
+        "Replacement value for characters.notes. IGNORED unless "
+        "preserve_notes is explicitly set to False. Default behavior is "
+        "to preserve existing rich narrative notes. To actually overwrite, "
+        "pass new_notes='your text' AND preserve_notes=False.",
+    ] = "",
+    preserve_notes: Annotated[
+        bool,
+        "Safety flag. True (default) — characters.notes is NEVER touched, "
+        "even if new_notes is passed. False — new_notes (if non-empty) is "
+        "written to characters.notes. The explicit-opt-in pattern prevents "
+        "rich narrative notes from being silently clobbered by class/level "
+        "edits.",
+    ] = True,
     reason: Annotated[
         str,
         "Short reason for the edit, written to the edit_log.",
     ] = "",
 ) -> dict:
     """
-    Directly correct an NPC's class and/or level.
+    Directly correct an NPC's class and/or level (and optionally notes).
 
     Operates on a single class_levels row per NPC. If the NPC has multiple
     class rows (rare), the first (lowest class_level_id) is edited. Every
     change is recorded in world_facts under category 'edit_log'.
 
-    This tool NEVER writes to characters.notes. To change an NPC's notes,
-    use update_npc (which has a notes parameter) — that keeps narrative
-    notes from being clobbered by class/level corrections.
+    Notes safety:
+      By default this tool will NOT touch characters.notes — that field
+      holds rich narrative state (relationships, life-debts, suspicions,
+      personal effects) that must never be silently replaced by a brief
+      class/level summary. To intentionally overwrite notes through this
+      tool, the caller must pass BOTH new_notes='replacement text' AND
+      preserve_notes=False. Otherwise notes is preserved verbatim.
+
+      For routine notes updates use update_npc, which is the canonical
+      path for narrative state.
     """
     try:
         conn = _open_writable_active()
@@ -5295,18 +5317,44 @@ def update_npc_class(
                                     "new": {"class_name": new_class, "level": lvl,
                                             "class_level_id": cur.lastrowid}})
 
-            # NOTE: this tool deliberately does NOT touch characters.notes.
-            # Notes updates flow through update_npc to avoid clobbering
-            # rich narrative notes with class/level summaries.
+            # ── notes ────────────────────────────────────────────────────
+            # Default behavior is preserve_notes=True — characters.notes is
+            # NEVER touched, even if new_notes is passed. The caller must
+            # explicitly pass preserve_notes=False to opt into a notes write.
+            notes_skipped = False
+            if new_notes and preserve_notes:
+                notes_skipped = True  # Surface to caller in result.
+            elif new_notes and not preserve_notes:
+                want = None if new_notes.strip().lower() == "null" else new_notes
+                if want != pc_row["notes"]:
+                    conn.execute(
+                        "UPDATE characters SET notes = ? WHERE character_id = ?",
+                        (want, npc_character_id),
+                    )
+                    changes.append({"field": "characters.notes",
+                                    "old": pc_row["notes"], "new": want})
 
             if not changes:
-                return {"ok": True, "unchanged": True, "npc_character_id": npc_character_id}
+                result = {"ok": True, "unchanged": True,
+                          "npc_character_id": npc_character_id}
+                if notes_skipped:
+                    result["notes_preserved"] = True
+                    result["hint"] = ("new_notes was provided but preserve_notes "
+                                      "is True; pass preserve_notes=False to "
+                                      "actually overwrite. Or use update_npc.")
+                return result
 
             _log_edit(conn, "update_npc_class", "class_levels",
                       npc_character_id, changes, reason)
 
-        return {"ok": True, "npc_character_id": npc_character_id,
-                "name": pc_row["name"], "changes": changes}
+        result = {"ok": True, "npc_character_id": npc_character_id,
+                  "name": pc_row["name"], "changes": changes,
+                  "notes_preserved": preserve_notes}
+        if notes_skipped:
+            result["hint"] = ("new_notes was provided but preserve_notes is "
+                              "True; pass preserve_notes=False to overwrite, "
+                              "or call update_npc for narrative updates.")
+        return result
     finally:
         conn.close()
 

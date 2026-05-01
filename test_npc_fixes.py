@@ -314,16 +314,22 @@ class TestBug3UpdateNpcClassPreservesNotes(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(after, self.rich_notes,
                          "Rich narrative notes were clobbered by update_npc_class")
 
-    async def test_notes_parameter_no_longer_in_schema(self):
-        """The new_notes parameter must be gone entirely so the AI cannot
-        accidentally pass it."""
+    async def test_notes_parameter_gated_behind_preserve_notes(self):
+        """new_notes is now an opt-in parameter — present in the schema but
+        ignored unless preserve_notes is explicitly set to False. Default
+        behavior remains 'never touch notes'."""
         from server.mcp_server import mcp
         tools = await mcp.list_tools()
         update_npc_class = next(t for t in tools if t.name == "update_npc_class")
         props = update_npc_class.inputSchema["properties"]
-        self.assertNotIn("new_notes", props,
-                         f"new_notes must be removed from update_npc_class; "
-                         f"got params {list(props.keys())}")
+        self.assertIn("new_notes", props,
+                      "new_notes parameter must be present (gated by preserve_notes)")
+        self.assertIn("preserve_notes", props,
+                      "preserve_notes safety flag must be present")
+        # Default must be True so the existing safe behavior holds when the
+        # flag is omitted from a call.
+        self.assertEqual(props["preserve_notes"].get("default"), True,
+                         f"preserve_notes default must be True; got {props['preserve_notes']}")
 
     async def test_class_only_change_still_logs_to_edit_log(self):
         """Confirm the audit trail still records class/level edits."""
@@ -343,6 +349,113 @@ class TestBug3UpdateNpcClassPreservesNotes(unittest.IsolatedAsyncioTestCase):
         c.close()
         self.assertIsNotNone(row, "edit_log entry must exist")
         self.assertIn("update_npc_class", row["fact_text"])
+
+
+class TestBug3PreserveNotesOptIn(unittest.IsolatedAsyncioTestCase):
+    """update_npc_class default behavior preserves notes; explicit opt-in
+    via preserve_notes=False allows an intentional notes overwrite."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmpdir = Path(tempfile.mkdtemp(prefix="greyhawk_b3_optin_"))
+        cls.db_path = cls.tmpdir / "x.db"
+        _build_test_db(cls.db_path)
+
+        cls.rich_notes = (
+            "Captain of the Iron Watch. Owes Theron a life-debt. Carries "
+            "his late wife's signet ring. Suspects the Lord Mayor of corruption."
+        )
+        c = sqlite3.connect(cls.db_path)
+        c.execute(
+            "INSERT INTO characters (campaign_id, name, character_type, notes) "
+            "VALUES (1, 'Iron Captain', 'npc', ?)",
+            (cls.rich_notes,),
+        )
+        c.execute(
+            "INSERT INTO class_levels (character_id, class_name, level, xp) "
+            "VALUES (2, 'Fighter', 4, 8000)"
+        )
+        c.commit()
+        c.close()
+
+        from engine import db as engine_db
+        from server import mcp_server as srv
+        cls._patchers = [
+            patch.object(engine_db, "_resolve_db_path", return_value=cls.db_path),
+            patch.object(srv, "_active_db_path", return_value=cls.db_path),
+        ]
+        for p in cls._patchers:
+            p.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        for p in cls._patchers:
+            p.stop()
+        shutil.rmtree(cls.tmpdir, ignore_errors=True)
+
+    def _read_notes(self, character_id):
+        c = sqlite3.connect(self.db_path)
+        c.row_factory = sqlite3.Row
+        row = c.execute(
+            "SELECT notes FROM characters WHERE character_id = ?",
+            (character_id,),
+        ).fetchone()
+        c.close()
+        return row["notes"] if row else None
+
+    async def test_default_preserves_notes_even_when_new_notes_passed(self):
+        """preserve_notes=True (default) — new_notes is silently ignored."""
+        from server.mcp_server import mcp
+        await mcp.call_tool("update_npc_class", {
+            "npc_character_id": 2,
+            "new_class":        "Ranger",
+            "new_level":        5,
+            "new_notes":        "Generic class summary that should NOT win",
+            # preserve_notes omitted ⇒ default True
+            "reason":           "Re-classed.",
+        })
+        self.assertEqual(self._read_notes(2), self.rich_notes,
+                         "Default preserve_notes=True must keep rich notes intact "
+                         "even when new_notes is passed.")
+
+    async def test_explicit_optin_overwrites_notes(self):
+        """preserve_notes=False — new_notes IS written when non-empty."""
+        from server.mcp_server import mcp
+        new_text = "Re-classed Ranger. Memory wiped by a wizard."
+        result = await mcp.call_tool("update_npc_class", {
+            "npc_character_id": 2,
+            "new_class":        "Ranger",
+            "new_level":        5,
+            "new_notes":        new_text,
+            "preserve_notes":   False,
+            "reason":           "Story-driven memory wipe.",
+        })
+        text = result[0].text if hasattr(result[0], "text") else str(result[0])
+        payload = json.loads(text)
+        self.assertEqual(payload.get("notes_preserved"), False)
+        self.assertEqual(self._read_notes(2), new_text)
+
+    async def test_new_notes_without_optin_returns_hint(self):
+        """If the AI passes new_notes but forgets preserve_notes=False, the
+        result includes a hint explaining the safety gate."""
+        from server.mcp_server import mcp
+        # Reset the row so this test is independent.
+        c = sqlite3.connect(self.db_path)
+        c.execute("UPDATE characters SET notes=? WHERE character_id=2",
+                  (self.rich_notes,))
+        c.commit(); c.close()
+
+        result = await mcp.call_tool("update_npc_class", {
+            "npc_character_id": 2,
+            "new_class":        "Druid",
+            "new_notes":        "Generic summary",
+        })
+        text = result[0].text if hasattr(result[0], "text") else str(result[0])
+        payload = json.loads(text)
+        self.assertIn("hint", payload)
+        self.assertIn("preserve_notes", payload["hint"])
+        # And critically: notes is unchanged.
+        self.assertEqual(self._read_notes(2), self.rich_notes)
 
 
 if __name__ == "__main__":
