@@ -6807,6 +6807,7 @@ CREATE TABLE IF NOT EXISTS area_instances (
     treasure_json       TEXT,
     treasure_status     TEXT NOT NULL DEFAULT 'intact',
     encounter_status    TEXT NOT NULL DEFAULT 'pending',
+    tier                TEXT NOT NULL DEFAULT 'standard',
     created_date        TEXT NOT NULL,
     notes               TEXT
 );
@@ -6816,8 +6817,21 @@ CREATE INDEX IF NOT EXISTS idx_area_instances_location_name
 
 
 def _ensure_area_instances_table(conn) -> None:
-    """Idempotent runtime migration. Only runs on writable connections."""
+    """
+    Idempotent runtime migration. Only runs on writable connections.
+    Handles both 'table missing' and 'table exists but missing tier column'
+    (the latter for campaign DBs created before Phase 7 tiering).
+    """
     conn.executescript(_AREA_INSTANCES_DDL)
+    # Defensive ALTER: add the `tier` column if an older population pass
+    # created the table without it.
+    cols = [r["name"] for r in conn.execute(
+        "PRAGMA table_info(area_instances)").fetchall()]
+    if "tier" not in cols:
+        conn.execute(
+            "ALTER TABLE area_instances "
+            "ADD COLUMN tier TEXT NOT NULL DEFAULT 'standard'"
+        )
 
 
 def _area_instances_table_exists(conn) -> bool:
@@ -6899,6 +6913,7 @@ def db_populate_area(
                     "monster_name":  spec.get("monster_name"),
                     "count":         spec.get("count"),
                     "treasure_type": spec.get("treasure_type"),
+                    "tier":          spec.get("tier"),
                 })
         else:
             n = num_rooms if (num_rooms is not None and num_rooms > 0) else random.randint(4, 6)
@@ -6917,6 +6932,7 @@ def db_populate_area(
             mname = room["monster_name"]
             count = room["count"]
             ttype = room["treasure_type"]
+            room_tier = room.get("tier")
 
             if not mname or not count:
                 rolled = get_random_dungeon_encounter(dungeon_level)
@@ -6930,6 +6946,13 @@ def db_populate_area(
             hd_text = (mstats.get("hit_dice") or "1") if mstats else "1"
             if not ttype and mstats:
                 ttype = (mstats.get("treasure_type") or "").strip() or None
+
+            # Auto-classify tier if the room spec didn't lock one in.
+            if not room_tier:
+                room_tier = _classify_npc_tier(
+                    monster_name=mname, monster_stats=mstats,
+                )
+            room_tier = _normalize_tier(room_tier)
 
             hp_list, _eff_hd = _roll_individual_hp(hd_text, int(count))
             statuses = ["alive"] * len(hp_list)
@@ -6952,15 +6975,15 @@ def db_populate_area(
                     dungeon_level, monster_type, monster_count,
                     individual_hp_json, monster_status_json,
                     treasure_json, treasure_status, encounter_status,
-                    created_date, notes
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'intact', 'pending', ?, ?)
+                    tier, created_date, notes
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'intact', 'pending', ?, ?, ?)
                 """,
                 (
                     _CAMPAIGN_ID, location_id, location_name, room["room_label"],
                     int(dungeon_level), mname, len(hp_list),
                     json.dumps(hp_list), json.dumps(statuses),
                     json.dumps(treasure) if treasure else None,
-                    now, notes,
+                    room_tier, now, notes,
                 ),
             )
             created_rows.append({
@@ -6969,6 +6992,7 @@ def db_populate_area(
                 "monster_type":     mname,
                 "monster_count":    len(hp_list),
                 "individual_hp":    hp_list,
+                "tier":             room_tier,
                 "treasure_summary": _summarize_treasure(treasure),
             })
 
@@ -7046,6 +7070,14 @@ def db_get_area_encounters(
         except (json.JSONDecodeError, TypeError):
             treasure = {}
 
+        # `tier` is a Phase-7.1 column; older rows may not have it. Default
+        # to 'standard' when absent.
+        tier_val = "standard"
+        try:
+            tier_val = r["tier"] or "standard"
+        except (IndexError, KeyError):
+            tier_val = "standard"
+
         rooms.append({
             "area_instance_id": r["area_instance_id"],
             "room_label":       r["room_label"],
@@ -7054,6 +7086,7 @@ def db_get_area_encounters(
             "individual_hp":    hp_list,
             "monster_status":   status_list,
             "encounter_status": r["encounter_status"],
+            "tier":             tier_val,
             "treasure":         treasure,
             "treasure_status":  r["treasure_status"],
             "dungeon_level":    r["dungeon_level"],
@@ -7104,6 +7137,12 @@ def db_get_monster_instance(area_instance_id: int, monster_index: int = 0) -> di
 
     mstats = lookup_monster(row["monster_type"]) or {}
 
+    tier_val = "standard"
+    try:
+        tier_val = row["tier"] or "standard"
+    except (IndexError, KeyError):
+        tier_val = "standard"
+
     return {
         "area_instance_id": area_instance_id,
         "room_label":       row["room_label"],
@@ -7111,6 +7150,7 @@ def db_get_monster_instance(area_instance_id: int, monster_index: int = 0) -> di
         "monster_index":    monster_index,
         "hp_current":       hp_list[monster_index],
         "status":           statuses[monster_index] if monster_index < len(statuses) else "alive",
+        "tier":             tier_val,
         "stats":            mstats,
         "shared_treasure":  treasure,
         "treasure_status":  row["treasure_status"],
@@ -7374,6 +7414,11 @@ def _ability_priority(class_name: str) -> list[str]:
     return result[:6]
 
 
+def _roll_3d6_straight() -> int:
+    """Roll 3d6. Returns int 3..18. Used for minion-tier NPCs."""
+    return sum(random.randint(1, 6) for _ in range(3))
+
+
 def _roll_4d6_drop_lowest() -> int:
     """Roll 4d6 and drop the lowest die. Returns int 3..18."""
     rolls = [random.randint(1, 6) for _ in range(4)]
@@ -7381,39 +7426,161 @@ def _roll_4d6_drop_lowest() -> int:
     return sum(rolls[1:])  # drop rolls[0] (the lowest)
 
 
-def _roll_and_assign_abilities(class_name: str) -> dict:
+def _roll_5d6_keep_best_3() -> int:
+    """Roll 5d6 and keep the best 3. Returns int 3..18 with a strong upper bias."""
+    rolls = sorted([random.randint(1, 6) for _ in range(5)], reverse=True)
+    return sum(rolls[:3])  # keep top 3
+
+
+_TIER_ROLL_METHOD = {
+    "minion":   "3d6_straight",
+    "standard": "4d6_drop_lowest",
+    "boss":     "5d6_keep_best_3",
+}
+
+
+def _normalize_tier(tier: str | None) -> str:
+    t = (tier or "standard").strip().lower()
+    return t if t in _TIER_ROLL_METHOD else "standard"
+
+
+def _roll_one_score(tier: str) -> int:
+    if tier == "minion":   return _roll_3d6_straight()
+    if tier == "boss":     return _roll_5d6_keep_best_3()
+    return _roll_4d6_drop_lowest()
+
+
+def _roll_and_assign_abilities(class_name: str, tier: str = "standard") -> dict:
     """
-    Roll six 4d6-drop-lowest scores, sort descending, and assign them to
-    abilities in the priority order for the given class. Returns a dict
-    keyed by ability name (lowercase). The highest score always lands on
-    the prime requisite — never random.
+    Roll six ability scores using the tier's roll method and assign them.
+
+    Tier semantics:
+      - 'minion':   3d6 straight in fixed STR/INT/WIS/DEX/CON/CHA order with
+                    NO smart assignment. Cannon-fodder NPCs feel cannon-fodder.
+      - 'standard': 4d6 drop lowest, sorted descending, assigned by class
+                    priority (highest → prime requisite).
+      - 'boss':     5d6 keep best 3, sorted descending, assigned by class
+                    priority. Mean ≈ 15.7 — boss NPCs feel meaningfully harder.
+
+    Returns a dict keyed by ability name (lowercase).
     """
-    scores = sorted(
-        [_roll_4d6_drop_lowest() for _ in range(6)], reverse=True
-    )
+    tier = _normalize_tier(tier)
+
+    if tier == "minion":
+        return {
+            "strength":     _roll_3d6_straight(),
+            "intelligence": _roll_3d6_straight(),
+            "wisdom":       _roll_3d6_straight(),
+            "dexterity":    _roll_3d6_straight(),
+            "constitution": _roll_3d6_straight(),
+            "charisma":     _roll_3d6_straight(),
+        }
+
+    scores = sorted([_roll_one_score(tier) for _ in range(6)], reverse=True)
     priority = _ability_priority(class_name)
     return {ability: int(scores[i]) for i, ability in enumerate(priority)}
 
 
-def _roll_npc_stats(class_name: str, level: int = 1) -> dict:
-    """
-    Roll AD&D 1e NPC stats: 6 abilities via 4d6-drop-lowest with smart
-    class-aware assignment, HP, AC, THAC0, starting equipment, carried
-    gold, and a small chance of a personal magic item. Pure rolling — no
-    DB writes.
+# ── Tier auto-detection ──────────────────────────────────────────────────────
 
-    Ability assignment puts the highest rolled score on the class's prime
-    requisite (e.g. STR for Fighter, INT for Magic-User, WIS for Cleric,
-    DEX for Thief). Second-highest goes to CON for survivability across
-    most classes, except Monk where it goes to WIS per class design.
+# Title / leadership keywords that always elevate an encounter to boss tier.
+_BOSS_KEYWORDS = (
+    "leader", "chief", "captain", "lord", "lady",
+    "king", "queen", "prince", "princess",
+    "boss", "champion", "warlord", "general",
+    "high priest", "high priestess",
+    "archmage", "warden", "master", "matriarch", "patriarch",
+    "elder", "ancient", "dread",
+)
+
+
+def _parse_hd_value(hd_text: str) -> float:
+    """
+    Pull a numeric HD value out of a monsters.hit_dice string. Returns 0.0
+    when nothing useful can be extracted.
+    """
+    if not hd_text:
+        return 0.0
+    s = str(hd_text).strip().lower()
+    if s in ("½", "1/2"):
+        return 0.5
+    # Take the leading number before the first +/-/space
+    m = re.match(r"\s*(\d+(?:\.\d+)?)", s)
+    if not m:
+        return 0.0
+    try:
+        return float(m.group(1))
+    except ValueError:
+        return 0.0
+
+
+def _classify_npc_tier(
+    monster_name:  str | None = None,
+    monster_stats: dict | None = None,
+    level:         int = 0,
+    is_named_npc:  bool = False,
+) -> str:
+    """
+    Auto-tier an encounter by inspecting its traits. Returns one of
+    'minion' | 'standard' | 'boss'. Conservative — defaults to 'standard'.
+
+    Boss triggers (any one):
+      - monster_name contains a leadership / title keyword
+      - monster_stats.hit_dice >= 8
+      - level >= 7  (NPC class level)
+
+    `is_named_npc` is accepted for future use but does NOT by itself
+    elevate to boss — most named NPCs are merchants, henchmen, or one-line
+    flavor characters who shouldn't roll boss-tier stats. The AI should
+    pass npc_tier='boss' explicitly when a proper-named character is a
+    deliberate antagonist below level 7.
+    """
+    name_l = (monster_name or "").lower()
+    if any(kw in name_l for kw in _BOSS_KEYWORDS):
+        return "boss"
+
+    hd = _parse_hd_value((monster_stats or {}).get("hit_dice", ""))
+    if hd >= 8:
+        return "boss"
+
+    if level >= 7:
+        return "boss"
+
+    return "standard"
+
+
+def _roll_npc_stats(
+    class_name: str,
+    level: int = 1,
+    npc_tier: str = "standard",
+) -> dict:
+    """
+    Roll AD&D 1e NPC stats: 6 abilities, HP, AC, THAC0, starting equipment,
+    carried gold, and a small chance of a personal magic item. Pure rolling
+    — no DB writes.
+
+    Tier controls roll method:
+      'minion'   — 3d6 straight in order. No smart assignment. Mean ≈ 10.5.
+                   Use for cannon fodder, generic guards, random encounters.
+      'standard' — 4d6 drop lowest with smart class-aware assignment. Mean
+                   ≈ 12.24. Use for most named NPCs.
+      'boss'     — 5d6 keep best 3 with smart class-aware assignment. Mean
+                   ≈ 15.7. Use for named villains, faction leaders, dungeon
+                   bosses, anyone with a title in the story.
+
+    For 'standard' and 'boss', ability assignment puts the highest rolled
+    score on the class's prime requisite (STR for Fighter, INT for
+    Magic-User, WIS for Cleric, DEX for Thief, etc.). Second-highest goes
+    to CON for survivability across most classes (Monk exception → WIS).
     Multi-class names like 'Fighter/Magic-User' split the top scores
     between both prime requisites in declared order.
     """
+    tier = _normalize_tier(npc_tier)
     cl = _normalize_class_token(class_name) or "fighter"
     hd  = _NPC_HIT_DIE.get(cl, 8)
     base_ac = _NPC_DEFAULT_AC.get(cl, 9)
 
-    abilities = _roll_and_assign_abilities(class_name)
+    abilities = _roll_and_assign_abilities(class_name, tier=tier)
 
     fighter_class = cl in ("fighter", "paladin", "ranger")
     con_bonus = _con_hp_bonus(abilities["constitution"], fighter_class)
@@ -7439,10 +7606,11 @@ def _roll_npc_stats(class_name: str, level: int = 1) -> dict:
     return {
         "class":             class_name,
         "level":             level,
+        "tier":              tier,
         "hit_die":           f"d{hd}",
         "abilities":         abilities,
-        "ability_priority":  _ability_priority(class_name),
-        "roll_method":       "4d6_drop_lowest",
+        "ability_priority":  _ability_priority(class_name) if tier != "minion" else None,
+        "roll_method":       _TIER_ROLL_METHOD[tier],
         "hp_max":            hp_max,
         "hp_rolls":          hp_rolls,
         "con_hp_bonus":      con_bonus,
@@ -7483,19 +7651,36 @@ def db_populate_npc(
     class_name: str = "Fighter",
     race: str | None = None,
     force_reroll: bool = False,
+    npc_tier: str | None = None,
 ) -> dict:
     """
     Pre-roll full stats for a named NPC and persist them to the existing
     characters/character_abilities/character_status/class_levels tables.
 
+    npc_tier controls stat-rolling strength:
+      'minion'   — 3d6 straight, no smart assignment (cannon fodder)
+      'standard' — 4d6 drop lowest with class-aware assignment (default)
+      'boss'     — 5d6 keep best 3 with class-aware assignment (named
+                   villains, faction leaders, dungeon bosses)
+
+    When npc_tier is None (default), the tier is auto-detected from level:
+    level >= 7 ⇒ 'boss', otherwise 'standard'. Pass an explicit value to
+    override.
+
     Idempotent: if the NPC already has a class_levels row AND an abilities
     row, returns the existing stats unchanged. Pass force_reroll=True to
-    overwrite (used for testing).
+    overwrite.
 
     The NPC must already exist in the characters table (created via
-    add_npc). This function does NOT create a new character row — it
-    enriches an existing one.
+    add_npc). This function does NOT create a new character row.
     """
+    # Auto-detect tier when caller didn't specify.
+    if npc_tier is None:
+        npc_tier = _classify_npc_tier(
+            monster_name=npc_name, level=level, is_named_npc=True,
+        )
+    tier = _normalize_tier(npc_tier)
+
     with _get_conn(read_only=True) as conn:
         npc_row = conn.execute(
             "SELECT character_id, name, character_type, race "
@@ -7524,7 +7709,7 @@ def db_populate_npc(
     if has_class and has_abilities and not force_reroll:
         return _read_npc_full_stats(char_id, already_populated=True)
 
-    stats = _roll_npc_stats(class_name, level)
+    stats = _roll_npc_stats(class_name, level, npc_tier=tier)
     a = stats["abilities"]
 
     with _get_conn() as conn:
@@ -7587,6 +7772,7 @@ def db_populate_npc(
         wf_payload = {
             "character_id":      char_id,
             "name":              npc_row["name"],
+            "tier":              stats.get("tier", "standard"),
             "thac0":             stats["thac0"],
             "hit_die":           stats["hit_die"],
             "equipment":         stats["equipment"],
@@ -7655,6 +7841,7 @@ def _read_npc_full_stats(character_id: int, already_populated: bool) -> dict:
         "race":              char["race"] if char else None,
         "class":             cls["class_name"] if cls else None,
         "level":             cls["level"] if cls else None,
+        "tier":              extra.get("tier", "standard"),
         "abilities":         _row_to_dict(ab) if ab else {},
         "hp_current":        st["hp_current"] if st else None,
         "hp_max":            st["hp_max"] if st else None,

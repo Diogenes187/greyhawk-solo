@@ -5647,19 +5647,37 @@ def populate_npc(
         str,
         "Race override. Defaults to whatever's already on the characters row.",
     ] = "",
+    npc_tier: Annotated[
+        str,
+        "Stat-rolling tier. Three options:\n"
+        "  'minion'   — 3d6 straight in order, no smart assignment. Use for "
+        "cannon fodder, generic guards, and random-encounter mooks.\n"
+        "  'standard' — 4d6 drop lowest with class-aware assignment. Default "
+        "for most named NPCs.\n"
+        "  'boss'     — 5d6 keep best 3 with class-aware assignment. Use for "
+        "named villains, faction leaders, dungeon bosses, anyone with a "
+        "title.\n"
+        "Leave blank to auto-detect from level (>= 7 ⇒ boss, otherwise "
+        "standard).",
+    ] = "",
 ) -> dict:
     """
     Pre-roll a complete stat block for a named NPC and persist it across the
     standard tables (class_levels, character_abilities, character_status)
-    plus a world_facts row carrying THAC0, equipment, carried gold, and any
-    personal magic items.
+    plus a world_facts row carrying tier, THAC0, equipment, carried gold,
+    and any personal magic items.
 
     Idempotent: if the NPC already has class_levels and character_abilities
     rows the existing stats are returned unchanged. To deliberately reroll,
     delete the rows via direct_db_edit first.
 
-    Stats rolled:
-      - 6 abilities (3d6 in order, AD&D 1e classic)
+    Tier semantics:
+      minion     3d6 straight, no smart assignment.            Mean ≈ 10.5
+      standard   4d6 drop lowest, smart class assignment.      Mean ≈ 12.2
+      boss       5d6 keep best 3, smart class assignment.      Mean ≈ 15.7
+
+    Stats rolled per tier:
+      - 6 abilities (smart-assigned for standard/boss, fixed-order for minion)
       - HP (per-class hit die × level + CON bonus)
       - AC (class default minus DEX bonus)
       - THAC0 (per-class progression)
@@ -5673,6 +5691,7 @@ def populate_npc(
             level=int(level),
             class_name=class_name,
             race=race or None,
+            npc_tier=(npc_tier.strip() or None),
         )
     except Exception as e:
         return {"error": str(e), "tool": "populate_npc"}

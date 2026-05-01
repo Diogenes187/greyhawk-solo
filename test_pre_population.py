@@ -156,6 +156,18 @@ def _build_test_db(db_path: Path) -> None:
              treasure_type, intelligence, alignment)
             VALUES ('Orc', '1', '6', '1d8', '1',
                     'L', 'Average', 'Lawful Evil');
+        -- Title-keyword monster (auto-classifies as boss).
+        INSERT INTO monsters
+            (name, hit_dice, armor_class, damage, number_of_attacks,
+             treasure_type, intelligence, alignment)
+            VALUES ('Goblin Chief', '3', '5', '1d8', '1',
+                    'C', 'Average', 'Lawful Evil');
+        -- High-HD monster (auto-classifies as boss via HD >= 8).
+        INSERT INTO monsters
+            (name, hit_dice, armor_class, damage, number_of_attacks,
+             treasure_type, intelligence, alignment)
+            VALUES ('Hill Giant', '8+1+2', '4', '2-16', '1',
+                    'D', 'Low', 'Chaotic Evil');
 
         -- Minimal treasure type C (small lair haul).
         INSERT INTO treasure_types
@@ -212,7 +224,9 @@ class _BaseFixture(unittest.IsolatedAsyncioTestCase):
                   " dungeon_level INTEGER, monster_type TEXT, monster_count INTEGER,"
                   " individual_hp_json TEXT, monster_status_json TEXT,"
                   " treasure_json TEXT, treasure_status TEXT,"
-                  " encounter_status TEXT, created_date TEXT, notes TEXT)")
+                  " encounter_status TEXT,"
+                  " tier TEXT NOT NULL DEFAULT 'standard',"
+                  " created_date TEXT, notes TEXT)")
         c.execute("DELETE FROM area_instances")
         # Wipe rolled NPC stats but keep the base characters row for Iron
         # Captain (character_id=2) — populate_npc requires it.
@@ -382,10 +396,11 @@ class TestStartCombatUsesPreRolledHp(_BaseFixture):
                 dungeon_level, monster_type, monster_count,
                 individual_hp_json, monster_status_json,
                 treasure_json, treasure_status, encounter_status,
-                created_date
+                tier, created_date
             ) VALUES (1, 1, 'Iron Tunnel', 'Guard Post', 1, 'Goblin', 3,
                       '[7, 4, 5]', '[\"alive\",\"alive\",\"alive\"]',
-                      '{}', 'intact', 'pending', '2026-04-30T00:00:00Z')
+                      '{}', 'intact', 'pending', 'standard',
+                      '2026-04-30T00:00:00Z')
         """)
         c.commit()
         c.close()
@@ -630,6 +645,195 @@ class TestSmartAbilityAssignment(_BaseFixture):
         # All three should be using the new method.
         for npc in (f, c, m):
             self.assertEqual(npc["roll_method"], "4d6_drop_lowest")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Boss-tier rolling + auto-detection
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestNpcTiers(_BaseFixture):
+    """Verify minion / standard / boss tiers produce visibly different stat
+    arrays, and that auto-detection picks the right tier."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        c = sqlite3.connect(cls.db_path)
+        c.executemany(
+            "INSERT INTO characters "
+            "(character_id, campaign_id, name, character_type, race) "
+            "VALUES (?, ?, ?, 'npc', 'Human')",
+            [
+                (20, 1, "Mook Guard"),         # minion target
+                (21, 1, "Sergeant Vell"),      # standard target
+                (22, 1, "Warlord Drax"),       # boss by name
+                (23, 1, "Battle Captain"),     # boss by 'captain' keyword
+                (24, 1, "Quiet Veteran"),      # boss by level >= 7
+                (25, 1, "Plain Recruit"),      # standard by default
+            ],
+        )
+        c.commit()
+        c.close()
+
+    # ── Distribution checks ──────────────────────────────────────────────────
+
+    async def test_boss_mean_higher_than_standard_higher_than_minion(self):
+        """Means: 3d6 ≈ 10.5 < 4d6 drop lowest ≈ 12.24 < 5d6 keep best 3 ≈
+        13.43. Sample 600 rolls of each and check the ordering. Generous
+        slack to keep the test stable across random seeds."""
+        from engine.db import (
+            _roll_3d6_straight, _roll_4d6_drop_lowest, _roll_5d6_keep_best_3,
+        )
+        N = 600
+        m = sum(_roll_3d6_straight()    for _ in range(N)) / N
+        s = sum(_roll_4d6_drop_lowest() for _ in range(N)) / N
+        b = sum(_roll_5d6_keep_best_3() for _ in range(N)) / N
+        self.assertLess(m, s, f"3d6 mean ({m:.1f}) should be < 4d6dl ({s:.1f})")
+        self.assertLess(s, b, f"4d6dl mean ({s:.1f}) should be < 5d6kb3 ({b:.1f})")
+        # Hard floors with comfortable variance protection.
+        self.assertGreater(m, 9.5)    # 3d6 floor (theoretical 10.5)
+        self.assertGreater(s, 11.5)   # 4d6dl floor (theoretical 12.24)
+        self.assertGreater(b, 12.7)   # 5d6kb3 floor (theoretical 13.43)
+
+    # ── Explicit tier on populate_npc ───────────────────────────────────────
+
+    async def test_explicit_minion_uses_3d6_in_order(self):
+        result = await self._call("populate_npc", {
+            "npc_name": "Mook Guard", "level": 1, "class_name": "Fighter",
+            "npc_tier": "minion",
+        })
+        self.assertEqual(result["tier"], "minion")
+        self.assertEqual(result["roll_method"], "3d6_straight")
+        # No smart assignment for minions — STR is NOT guaranteed to be max.
+        # We can't deterministically assert "STR is not max" because random
+        # rolls can put it there by coincidence; but we CAN assert the
+        # result key reports no priority list was applied.
+        self.assertIsNone(result["ability_priority"])
+
+    async def test_explicit_standard_uses_4d6_drop_lowest(self):
+        result = await self._call("populate_npc", {
+            "npc_name": "Sergeant Vell", "level": 3, "class_name": "Fighter",
+            "npc_tier": "standard",
+        })
+        self.assertEqual(result["tier"], "standard")
+        self.assertEqual(result["roll_method"], "4d6_drop_lowest")
+        ab = result["abilities"]
+        self.assertEqual(ab["strength"], max(ab.values()))
+
+    async def test_explicit_boss_uses_5d6_keep_best_3_and_smart_assigns(self):
+        result = await self._call("populate_npc", {
+            "npc_name": "Warlord Drax", "level": 5, "class_name": "Fighter",
+            "npc_tier": "boss",
+        })
+        self.assertEqual(result["tier"], "boss")
+        self.assertEqual(result["roll_method"], "5d6_keep_best_3")
+        ab = result["abilities"]
+        self.assertEqual(ab["strength"], max(ab.values()),
+                         "Boss-tier Fighter must still smart-assign STR as prime")
+
+    # ── Auto-detection ──────────────────────────────────────────────────────
+
+    async def test_auto_detection_level_7_plus_is_boss(self):
+        result = await self._call("populate_npc", {
+            "npc_name": "Quiet Veteran", "level": 7, "class_name": "Fighter",
+            # tier omitted → auto-detect via level >= 7
+        })
+        self.assertEqual(result["tier"], "boss")
+        self.assertEqual(result["roll_method"], "5d6_keep_best_3")
+
+    async def test_auto_detection_low_level_is_standard(self):
+        result = await self._call("populate_npc", {
+            "npc_name": "Plain Recruit", "level": 1, "class_name": "Fighter",
+        })
+        self.assertEqual(result["tier"], "standard")
+
+    async def test_classify_helper_matrix(self):
+        """The auto-classifier rules in isolation."""
+        from engine.db import _classify_npc_tier
+        # Title keywords
+        self.assertEqual(_classify_npc_tier(monster_name="Goblin Chief"), "boss")
+        self.assertEqual(_classify_npc_tier(monster_name="Orc Captain"), "boss")
+        self.assertEqual(_classify_npc_tier(monster_name="High Priestess Lyra"), "boss")
+        self.assertEqual(_classify_npc_tier(monster_name="Goblin Warlord"), "boss")
+        # Plain monsters
+        self.assertEqual(_classify_npc_tier(monster_name="Goblin"), "standard")
+        # HD-based
+        self.assertEqual(
+            _classify_npc_tier(monster_name="Hill Giant",
+                               monster_stats={"hit_dice": "8+1+2"}),
+            "boss",
+        )
+        self.assertEqual(
+            _classify_npc_tier(monster_name="Wolf",
+                               monster_stats={"hit_dice": "2+2"}),
+            "standard",
+        )
+        # Level-based — only level >= 7 elevates. is_named_npc alone
+        # is NOT enough to flip a low-level NPC to boss.
+        self.assertEqual(_classify_npc_tier(level=7, is_named_npc=True), "boss")
+        self.assertEqual(_classify_npc_tier(level=10), "boss")
+        self.assertEqual(_classify_npc_tier(level=4, is_named_npc=True), "standard")
+        self.assertEqual(_classify_npc_tier(level=3, is_named_npc=True), "standard")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Mixed-tier population (the user's exact request)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestMixedTierArea(_BaseFixture):
+    """Populate an area with a mix of standard mooks and a boss monster.
+    Confirm each room carries its tier, and that boss NPC stat blocks
+    average noticeably higher than standard NPC stat blocks."""
+
+    async def test_area_rooms_carry_per_room_tier(self):
+        from engine.db import db_populate_area
+        result = db_populate_area(
+            location_name="Goblin Caves",
+            dungeon_level=2,
+            room_specs=[
+                {"room_label": "Entry pit",      "monster_name": "Goblin",       "count": 4},
+                {"room_label": "Guard chamber",  "monster_name": "Orc",          "count": 3},
+                {"room_label": "Throne room",    "monster_name": "Goblin Chief", "count": 1},
+                {"room_label": "Giant's hall",   "monster_name": "Hill Giant",   "count": 1},
+            ],
+        )
+        self.assertTrue(result["populated"])
+        rooms = {r["room_label"]: r for r in result["rooms"]}
+
+        self.assertEqual(rooms["Entry pit"]["tier"],     "standard")
+        self.assertEqual(rooms["Guard chamber"]["tier"], "standard")
+        # Auto-classified: keyword match.
+        self.assertEqual(rooms["Throne room"]["tier"],   "boss")
+        # Auto-classified: HD >= 8.
+        self.assertEqual(rooms["Giant's hall"]["tier"],  "boss")
+
+        # Round-trip: get_area_encounters surfaces tier per room.
+        readback = await self._call("get_area_encounters",
+                                    {"location_name": "Goblin Caves"})
+        seen = {r["room_label"]: r["tier"] for r in readback["rooms"]}
+        self.assertEqual(seen["Throne room"],  "boss")
+        self.assertEqual(seen["Giant's hall"], "boss")
+        self.assertEqual(seen["Entry pit"],    "standard")
+
+    async def test_boss_npc_stat_block_averages_higher_than_minion(self):
+        """The user's exact ask: populate boss & minion NPCs and confirm
+        boss stats are noticeably higher. Roll multiple to dampen variance."""
+        from engine.db import _roll_npc_stats
+        boss_totals: list[int] = []
+        minion_totals: list[int] = []
+        for _ in range(40):
+            b = _roll_npc_stats("Fighter", level=5, npc_tier="boss")
+            m = _roll_npc_stats("Fighter", level=5, npc_tier="minion")
+            boss_totals.append(sum(b["abilities"].values()))
+            minion_totals.append(sum(m["abilities"].values()))
+        boss_avg = sum(boss_totals) / len(boss_totals)
+        mook_avg = sum(minion_totals) / len(minion_totals)
+        # Theoretical: boss totals (~80.6, 6 × 13.43) vs minion totals
+        # (~63, 6 × 10.5). With N=40 and slack for variance the delta
+        # should comfortably exceed 10.
+        self.assertGreater(boss_avg - mook_avg, 10,
+            f"Boss avg ({boss_avg:.1f}) should be noticeably higher than "
+            f"minion avg ({mook_avg:.1f})")
 
 
 if __name__ == "__main__":

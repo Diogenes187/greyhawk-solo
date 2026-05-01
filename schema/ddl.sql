@@ -996,6 +996,7 @@ CREATE TABLE area_instances (
     treasure_json       TEXT,
     treasure_status     TEXT NOT NULL DEFAULT 'intact',
     encounter_status    TEXT NOT NULL DEFAULT 'pending',
+    tier                TEXT NOT NULL DEFAULT 'standard',
     created_date        TEXT NOT NULL,
     notes               TEXT,
     FOREIGN KEY (campaign_id) REFERENCES campaigns(campaign_id),
