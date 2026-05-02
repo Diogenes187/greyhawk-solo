@@ -29,10 +29,11 @@ Tools exposed:
   update_troop_count       -- Set or adjust count on a troop group
   add_troop_group          -- Insert a new troop group (optionally with commander)
   add_livestock            -- Insert a new livestock row at a location
-  add_item                 -- Create an item and assign it to inventory (with combat fields)
+  add_item                 -- Create an item and assign it to inventory (with combat fields, character_target)
   equip_item               -- Set a character's inventory item into a slot
   list_equipped            -- Compact slot-by-slot loadout for mid-combat reference
-  list_inventory           -- Per-character inventory with magic_only/equipped_only filters
+  list_inventory           -- Per-character inventory with magic_only/equipped_only/summary_only filters
+  search_inventory         -- Substring item-name search; returns compact 5-field summaries
   update_world_fact        -- Upsert a campaign fact in world_facts
   update_npc               -- Change notes, status, race, alignment on an NPC
   add_npc                  -- Add a new NPC and optional relationship to Theron
@@ -369,6 +370,8 @@ from engine.db import (
     _WEAPON_TYPES,
     _ensure_inventory_slot_column,
     _ensure_items_combat_columns,
+    # Phase 13 — inventory tool refinements
+    db_search_inventory,
     # Phase 4 — domain
     get_full_domain_state,
     db_add_construction_project,
@@ -1348,6 +1351,14 @@ def add_item(
         "ring2, neck, back. Leave blank to stow. Auto-vacates any prior "
         "occupant of the slot.",
     ] = "",
+    character_target: Annotated[
+        str,
+        "Optional name (case-insensitive prefix match) or numeric character_id "
+        "of the recipient when assign_to='character'. Leave blank to default "
+        "to the PC. Lets henchmen, hirelings, or any tracked NPC receive the "
+        "item directly without a follow-up reassignment. Rejects with a "
+        "'character_target did not resolve' error if the name/id is unknown.",
+    ] = "",
 ) -> dict:
     """
     Create a new item and place it in an inventory.
@@ -1364,7 +1375,12 @@ def add_item(
     'character'). Pass it for known-equipped purchases like 'a +1 cloak
     of protection put straight on'.
 
-    Returns item_id, inventory_id, and assignment details as confirmation.
+    character_target lets non-PC characters (henchmen, hirelings, NPCs
+    in the party) receive the item directly. Only meaningful when
+    assign_to='character'.
+
+    Returns item_id, inventory_id, character_id (when applicable), and
+    assignment details as confirmation.
     """
     try:
         result = db_add_item(
@@ -1379,6 +1395,7 @@ def add_item(
             weapon_type=(weapon_type or None),
             armor_class_bonus=armor_class_bonus,
             slot=(slot or None),
+            character_target=(character_target or None),
         )
         return {"created": True, **result}
     except ValueError as e:
@@ -6086,14 +6103,21 @@ def list_inventory(
         "than list_equipped — includes value, weight notes, carry_notes, "
         "etc.",
     ] = False,
+    summary_only: Annotated[
+        bool,
+        "If true, return only the 5 fields needed for cross-reference: "
+        "inventory_id, name, slot, magic_flag, equipped. Cuts a 200-row "
+        "inventory from ~75 KB to ~6 KB. Combines freely with magic_only "
+        "and equipped_only.",
+    ] = False,
 ) -> dict:
     """
     Return one character's inventory as a focused, filterable list.
 
     Solves the 'get_character_state is too large mid-session' problem.
-    Each row carries inventory_id, item_id, name, item_type, magic_flag,
-    value_gp, slot, equipped, quantity, the full combat fields
-    (damage_dice, damage_bonus, to_hit_bonus, weapon_type,
+    Default row shape carries inventory_id, item_id, name, item_type,
+    magic_flag, value_gp, slot, equipped, quantity, the full combat
+    fields (damage_dice, damage_bonus, to_hit_bonus, weapon_type,
     armor_class_bonus), item_notes, and carry_notes.
 
     Filters:
@@ -6101,12 +6125,57 @@ def list_inventory(
       equipped_only=True → only currently-equipped items (more detail than
                           list_equipped — useful when you also need
                           item_notes / value / quantity)
+      summary_only=True  → drop everything except inventory_id, name, slot,
+                          magic_flag, equipped. Use this when scanning
+                          large inventories or when downstream tools only
+                          need the inventory_id to act.
     """
     try:
         return db_list_inventory(
             character_target=character_target,
             magic_only=bool(magic_only),
             equipped_only=bool(equipped_only),
+            summary_only=bool(summary_only),
+        )
+    except ValueError as e:
+        return {"error": str(e)}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TOOL: search_inventory
+# ══════════════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def search_inventory(
+    character_target: Annotated[
+        str,
+        "Character to inspect — name (case-insensitive prefix match) or "
+        "numeric character_id.",
+    ],
+    name_substring: Annotated[
+        str,
+        "Item-name substring to match. Case-insensitive substring (NOT "
+        "prefix) — 'sword' matches 'Long Sword', '+1 short sword', "
+        "'sword cane', etc. Whitespace is preserved.",
+    ],
+) -> dict:
+    """
+    Substring item-name search within one character's inventory.
+
+    Solves the 'what is the exact stored name of X?' problem without
+    dumping the whole inventory. Returns the compact 5-field summary
+    shape (inventory_id, name, slot, magic_flag, equipped) so the
+    result is small enough to inspect even when many items match.
+
+    Feed the resulting inventory_id back into equip_item or
+    update_inventory_item for any follow-up action.
+
+    Returns {"error": "..."} on bad character or empty substring.
+    """
+    try:
+        return db_search_inventory(
+            character_target=character_target,
+            name_substring=name_substring,
         )
     except ValueError as e:
         return {"error": str(e)}

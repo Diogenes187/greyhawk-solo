@@ -805,12 +805,17 @@ def add_item(
     weapon_type: str | None = None,
     armor_class_bonus: int = 0,
     slot: str | None = None,
+    # ── Phase 13: character_target lets non-PC characters receive the item ──
+    character_target: str | int | None = None,
 ) -> dict:
     """
     Create a new item and assign it to an inventory row.
 
     assign_to controls where it goes:
-      "character" — assigned to Theron Vale (character_id=1)
+      "character" — assigned to a character. By default that is the PC
+                    (character_id=1). Pass character_target (name prefix
+                    or numeric id) to assign to any other character —
+                    henchmen, hirelings, NPCs in the party, etc.
       "location"  — assigned to a location by name (location_name required)
       "treasury"  — assigned to a treasury account by name (treasury_name required)
 
@@ -826,7 +831,8 @@ def add_item(
     is honored only when slot is None.
 
     Returns a dict with item_id, inventory_id, and the assignment details.
-    Raises ValueError on bad inputs or missing location/treasury.
+    Raises ValueError on bad inputs, missing location/treasury, or an
+    unresolvable character_target.
     """
     _ensure_items_combat_columns()
     _ensure_inventory_slot_column()
@@ -842,11 +848,28 @@ def add_item(
             f"got {slot!r}."
         )
 
+    # Reject character_target on non-character assignments — caller
+    # mistake, surface it loudly rather than silently ignoring.
+    if character_target not in (None, "", 0) and assign_to != "character":
+        raise ValueError(
+            "character_target only applies when assign_to='character'; "
+            f"got assign_to={assign_to!r}."
+        )
+
     # Resolve assignment FK
     char_id = loc_id = treasury_id = None
 
     if assign_to == "character":
-        char_id = _PC_CHARACTER_ID
+        if character_target not in (None, "", 0):
+            cid = _resolve_character(character_target)
+            if cid is None:
+                raise ValueError(
+                    f"character_target {character_target!r} did not resolve "
+                    "— use list_characters to discover available names/ids."
+                )
+            char_id = cid
+        else:
+            char_id = _PC_CHARACTER_ID
     elif assign_to == "location":
         if not location_name:
             raise ValueError("location_name required when assign_to='location'.")
@@ -937,6 +960,7 @@ def add_item(
         "armor_class_bonus": int(armor_class_bonus or 0),
         "notes":             notes,
         "assigned_to":       assign_to,
+        "character_id":      char_id,
         "location_name":     location_name,
         "treasury_name":     treasury_name,
         "equipped":          bool(equipped_int),
@@ -9696,22 +9720,39 @@ def db_list_equipped(character_target: int | str) -> dict:
 
 # ── list_inventory ────────────────────────────────────────────────────────────
 
+def _summary_row_from_inventory(r: dict) -> dict:
+    """Compact 5-field shape used by summary_only and search_inventory."""
+    return {
+        "inventory_id": r["inventory_id"],
+        "name":         r["name"],
+        "slot":         r["slot"],
+        "magic_flag":   bool(r["magic_flag"]),
+        "equipped":     bool(r["equipped_flag"] or r["slot"]),
+    }
+
+
 def db_list_inventory(
     character_target: int | str,
     magic_only:       bool = False,
     equipped_only:    bool = False,
+    summary_only:     bool = False,
 ) -> dict:
     """
     Return one character's inventory with optional filters. Solves the
     'get_character_state is too large mid-session' problem.
 
-    Each row carries: inventory_id, item_id, name, item_type, magic_flag,
-    value_gp, slot, quantity, damage_dice, damage_bonus, to_hit_bonus,
-    weapon_type, armor_class_bonus, item_notes, carry_notes.
+    Full row shape (default) carries: inventory_id, item_id, name,
+    item_type, magic_flag, value_gp, slot, equipped, quantity,
+    damage_dice, damage_bonus, to_hit_bonus, weapon_type,
+    armor_class_bonus, item_notes, carry_notes.
 
     Filters:
       magic_only=True    → only items with magic_flag=1
       equipped_only=True → only items with slot IS NOT NULL
+      summary_only=True  → drop everything except inventory_id, name,
+                           slot, magic_flag, equipped — cuts a 200-row
+                           inventory from ~75 KB to ~6 KB. Combines
+                           freely with magic_only and equipped_only.
     """
     _ensure_inventory_slot_column()
     _ensure_items_combat_columns()
@@ -9745,9 +9786,11 @@ def db_list_inventory(
         cur.execute(sql, tuple(params))
         rows = [dict(r) for r in cur.fetchall()]
 
-    items: list[dict] = []
-    for r in rows:
-        items.append({
+    items: list[dict]
+    if summary_only:
+        items = [_summary_row_from_inventory(r) for r in rows]
+    else:
+        items = [{
             "inventory_id":      r["inventory_id"],
             "item_id":           r["item_id"],
             "name":              r["name"],
@@ -9764,12 +9807,64 @@ def db_list_inventory(
             "armor_class_bonus": r["armor_class_bonus"] or 0,
             "item_notes":        r["item_notes"],
             "carry_notes":       r["carry_notes"],
-        })
+        } for r in rows]
 
     return {
         "character_id":  cid,
         "magic_only":    bool(magic_only),
         "equipped_only": bool(equipped_only),
+        "summary_only":  bool(summary_only),
         "count":         len(items),
         "items":         items,
+    }
+
+
+# ── search_inventory ──────────────────────────────────────────────────────────
+
+def db_search_inventory(
+    character_target: int | str,
+    name_substring:   str,
+) -> dict:
+    """
+    Substring (not prefix) match on item name within one character's
+    inventory. Returns the compact summary_only shape so the result is
+    safe to dump even on big inventories.
+
+    Use to answer 'what is the exact stored name of X?' without dumping
+    everything — feed the result's inventory_id back into equip_item or
+    update_inventory_item.
+    """
+    _ensure_inventory_slot_column()
+    _ensure_items_combat_columns()
+
+    cid = _resolve_character(character_target)
+    if cid is None:
+        raise ValueError(
+            f"character_target {character_target!r} did not resolve."
+        )
+
+    s = (name_substring or "").strip()
+    if not s:
+        raise ValueError("name_substring is empty.")
+
+    with _get_conn(read_only=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT inv.inventory_id, inv.slot, inv.equipped_flag, "
+            "       i.name, i.magic_flag "
+            "FROM inventory inv JOIN items i ON i.item_id = inv.item_id "
+            "WHERE inv.character_id = ? "
+            "  AND LOWER(i.name) LIKE LOWER(?) "
+            # Equipped first, then by name.
+            "ORDER BY (inv.slot IS NULL), i.name",
+            (cid, f"%{s}%"),
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+
+    items = [_summary_row_from_inventory(r) for r in rows]
+    return {
+        "character_id":   cid,
+        "name_substring": s,
+        "count":          len(items),
+        "items":          items,
     }
