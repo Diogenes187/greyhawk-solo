@@ -341,6 +341,11 @@ from engine.db import (
     db_update_monster_instance,
     db_find_pre_rolled_for_combat,
     db_populate_npc,
+    # Phase 8 — character roster, XP grants, class-level management
+    db_grant_xp,
+    db_add_class_level,
+    db_list_characters,
+    _resolve_character,
     # Phase 4 — domain
     get_full_domain_state,
     db_add_construction_project,
@@ -374,20 +379,63 @@ mcp = FastMCP(
 # ══════════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
-def get_character_state() -> dict:
+def get_character_state(
+    character_id: Annotated[
+        int,
+        "Optional character_id to fetch. Pass 0 (default) to fetch the PC. "
+        "Use list_characters to discover IDs.",
+    ] = 0,
+    character_name: Annotated[
+        str,
+        "Optional name (or unique prefix) of the character to fetch — "
+        "alternative to character_id. Case-insensitive prefix match. "
+        "Ignored when character_id is non-zero.",
+    ] = "",
+) -> dict:
     """
-    Return Theron Vale's complete character state from the database.
+    Return a complete character state from the database.
 
-    Includes: name, race, class levels (Fighter 7 / Magic-User 7), current and
-    max HP, AC, movement, attacks per round, all six ability scores, full
-    equipped and carried inventory with magic item flags, and status notes.
+    Default behavior (no parameters) returns the PC. Pass character_id or
+    character_name to fetch any other character's full sheet — useful for
+    henchmen, hirelings, NPCs in the party, prisoners, or any tracked
+    character that needs stats inspected.
 
-    Call this at session start or any time you need to verify Theron's current
-    stats before describing combat outcomes, skill checks, or spell options.
+    Includes: name, race, class levels with XP, current and max HP, AC,
+    movement, attacks per round, all six ability scores, full equipped and
+    carried inventory with magic item flags, and status notes.
+
+    Call this at session start, when checking henchmen morale, before
+    resolving combat for a non-PC, or any time you need to verify a
+    character's current stats.
     """
-    char = load_character()
-    if not char:
-        return {"error": "Character not found in database."}
+    explicit_lookup = bool(
+        (character_id and int(character_id) > 0) or character_name
+    )
+
+    if character_id and int(character_id) > 0:
+        cid = _resolve_character(int(character_id))
+    elif character_name:
+        cid = _resolve_character(character_name)
+    else:
+        cid = None
+
+    # Lookup failed — but the caller asked for a specific character. Surface
+    # the error rather than silently returning the PC.
+    if explicit_lookup and cid is None:
+        return {"error": (f"Character not found for "
+                          f"id={character_id!r}, name={character_name!r}. "
+                          "Use list_characters to discover available IDs.")}
+
+    if cid is not None:
+        char = load_character(character_id=cid)
+        if not char:
+            return {"error": f"Character not found for "
+                             f"id={character_id!r}, name={character_name!r}"}
+    else:
+        # Default — the PC.
+        char = load_character()
+        if not char:
+            return {"error": "PC not found in database."}
 
     # Flatten for readability at the tool boundary
     status = char.pop("status", {}) or {}
@@ -5743,6 +5791,120 @@ def populate_npc(
         )
     except Exception as e:
         return {"error": str(e), "tool": "populate_npc"}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CHARACTER ROSTER, XP GRANTS, CLASS-LEVEL MANAGEMENT  (Phase 8)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@mcp.tool()
+def list_characters() -> dict:
+    """
+    Return every character in the active campaign — id, name, type
+    (PC/NPC/etc), race, alignment, class levels with XP, and a notes
+    preview. Solves the "what's their character_id?" problem.
+
+    Call this when you need to discover IDs for grant_xp, add_class_level,
+    update_npc, or get_character_state(character_id=...). Cheap — single
+    query, fixed columns.
+    """
+    try:
+        return db_list_characters()
+    except Exception as e:
+        return {"error": str(e), "tool": "list_characters"}
+
+
+@mcp.tool()
+def grant_xp(
+    character_targets: Annotated[
+        list[str],
+        "Array of character targets. Each entry is either a numeric "
+        "character_id as a string ('1', '2') or a name prefix ('Theron', "
+        "'Caiya', 'Ruk'). Mixed lists are fine. Use list_characters to "
+        "discover names and IDs.",
+    ],
+    amount: Annotated[
+        int,
+        "XP to add to every targeted character's class_levels row(s). "
+        "Negative amounts are accepted (XP debt / penalty); the row's xp "
+        "is clamped to 0 minimum.",
+    ],
+    event_description: Annotated[
+        str,
+        "Short description of why XP was awarded — written to the "
+        "world_facts xp_log audit row. Examples: 'Cleared the goblin "
+        "warren', 'Recovered the Mayor's signet', 'Defeated Hill Giant'.",
+    ] = "",
+) -> dict:
+    """
+    Award XP to one or more party members and check each for a level-up.
+
+    Per-character per-class result includes old_xp, new_xp,
+    next_level_threshold, xp_to_next_level, and a `levelup_available`
+    boolean. The level itself is NOT auto-incremented — call
+    update_class_level (or add_class_level for a new class) to actually
+    promote the character so HP/THAC0/spells are explicitly recomputed.
+
+    Audit: writes a single category='xp_log' row to world_facts with
+    timestamp, amount, event_description, and the resolved character_ids.
+
+    Targets accept any mix of numeric IDs and name prefixes — both
+    resolve through the same case-insensitive lookup.
+    """
+    try:
+        return db_grant_xp(
+            character_targets=list(character_targets or []),
+            amount=int(amount),
+            event_description=event_description or "",
+        )
+    except Exception as e:
+        return {"error": str(e), "tool": "grant_xp"}
+
+
+@mcp.tool()
+def add_class_level(
+    character_target: Annotated[
+        str,
+        "Character_id (numeric string) or name prefix. E.g. '2' or 'Caiya'. "
+        "Use list_characters to discover IDs.",
+    ],
+    class_name: Annotated[
+        str,
+        "Class to add. Common: Fighter, Cleric, Magic-User, Thief, Ranger, "
+        "Paladin, Druid, Assassin, Monk, Bard, Illusionist.",
+    ],
+    level: Annotated[
+        int,
+        "Starting level for this class. Default 1.",
+    ] = 1,
+    xp: Annotated[
+        int,
+        "Starting XP for this class. Default 0.",
+    ] = 0,
+) -> dict:
+    """
+    Insert a new row into class_levels for a character. Use this for:
+      - Adding a multi-class line to an existing character
+      - Recording a new henchman's class
+      - Seeding a tracked NPC's class data so grant_xp can find a row
+
+    Refuses to insert a duplicate (same character_id + class_name). To
+    modify an existing row use update_class_level or direct_db_edit.
+
+    Returns the new class_level_id and the inserted values, plus the next
+    level XP threshold so you can see how much room is left before the
+    character can level up.
+    """
+    try:
+        return db_add_class_level(
+            character_target=character_target,
+            class_name=class_name,
+            level=int(level),
+            xp=int(xp),
+        )
+    except Exception as e:
+        return {"error": str(e), "tool": "add_class_level"}
 
 
 if __name__ == "__main__":

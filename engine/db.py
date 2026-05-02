@@ -7854,3 +7854,348 @@ def _read_npc_full_stats(character_id: int, already_populated: bool) -> dict:
         "roll_method":       extra.get("roll_method", "4d6_drop_lowest"),
         "ability_priority":  extra.get("ability_priority", []),
     }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CHARACTER ROSTER, XP, AND CLASS-LEVEL MANAGEMENT (Phase 8)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Live-gameplay improvements:
+#   - Resolve characters by ID *or* name across every party-management tool
+#   - grant_xp: party-wide XP awards with auto level-up detection + audit log
+#   - add_class_level: explicit insertion (multi-class, henchmen, dual-class)
+#   - list_characters: one-shot roster so the AI never has to probe IDs
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Cache the classes.json XP tables on first read.
+_XP_TABLE_CACHE: dict[str, list[int]] | None = None
+
+
+def _load_xp_tables() -> dict[str, list[int]]:
+    """Lazy-load every class's xp_table from data/classes.json."""
+    global _XP_TABLE_CACHE
+    if _XP_TABLE_CACHE is not None:
+        return _XP_TABLE_CACHE
+    path = _ROOT / "data" / "classes.json"
+    out: dict[str, list[int]] = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        for cls_name, cls_data in (data or {}).items():
+            tbl = cls_data.get("xp_table") or []
+            if isinstance(tbl, list) and tbl:
+                out[cls_name.lower()] = [int(x) for x in tbl]
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        # Missing or malformed classes.json — return whatever we managed to
+        # parse (possibly empty). Callers degrade gracefully.
+        pass
+    _XP_TABLE_CACHE = out
+    return out
+
+
+def _xp_threshold_for_next_level(class_name: str, current_level: int) -> int | None:
+    """
+    Return the XP needed to advance from `current_level` to `current_level+1`
+    for the given class, or None if the table is unavailable / capped.
+
+    classes.json xp_table is 0-indexed by *level minus one*: index 0 = level 1
+    starting XP (always 0); index 1 = XP needed for level 2; etc.  So the
+    threshold to reach level (L+1) lives at xp_table[L].
+    """
+    tbl = _load_xp_tables().get((class_name or "").strip().lower())
+    if not tbl:
+        return None
+    if current_level < 1:
+        current_level = 1
+    if current_level >= len(tbl):
+        return None  # past the end of the table — no further auto-level
+    return int(tbl[current_level])
+
+
+def _resolve_character(target: int | str | None) -> int | None:
+    """
+    Resolve a character target (int id, numeric string, or name prefix) to
+    a character_id within the active campaign. Returns None if not found.
+    """
+    if target is None:
+        return None
+    # Direct int.
+    if isinstance(target, int):
+        with _get_conn(read_only=True) as conn:
+            row = conn.execute(
+                "SELECT character_id FROM characters "
+                "WHERE character_id = ? AND campaign_id = ? LIMIT 1",
+                (target, _CAMPAIGN_ID),
+            ).fetchone()
+        return row["character_id"] if row else None
+
+    # Strings: try numeric first, then name prefix (case-insensitive).
+    s = str(target).strip()
+    if not s:
+        return None
+    if s.isdigit():
+        return _resolve_character(int(s))
+    with _get_conn(read_only=True) as conn:
+        row = conn.execute(
+            "SELECT character_id FROM characters "
+            "WHERE LOWER(name) LIKE LOWER(?) AND campaign_id = ? "
+            "ORDER BY character_id LIMIT 1",
+            (f"{s}%", _CAMPAIGN_ID),
+        ).fetchone()
+    return row["character_id"] if row else None
+
+
+# ── grant_xp ─────────────────────────────────────────────────────────────────
+
+def db_grant_xp(
+    character_targets: list,
+    amount: int,
+    event_description: str,
+) -> dict:
+    """
+    Add XP to every targeted character's class_levels row(s) and check each
+    for a level-up threshold. The same XP amount is added to every class
+    row a character has (multi-class characters split XP by AD&D rules
+    elsewhere; this is a flat grant for narrative simplicity — the AI can
+    rebalance via update_class_level if needed).
+
+    Targets accept ints (character_id) or strings (numeric or name prefix).
+    Returns a per-character result with new XP totals, current level,
+    next-level threshold, and a `levelup_available` flag.
+
+    Logs a single category='xp_log' world_facts row recording the grant
+    with timestamp, amount, event_description, and the resolved
+    character_ids.
+    """
+    import datetime
+    if not isinstance(character_targets, list):
+        character_targets = [character_targets]
+    if amount is None:
+        return {"error": "amount is required"}
+    try:
+        amount_int = int(amount)
+    except (TypeError, ValueError):
+        return {"error": f"amount must be an integer; got {amount!r}"}
+
+    results: list[dict] = []
+    resolved_ids: list[int] = []
+    unresolved: list = []
+
+    with _get_conn() as conn:
+        for tgt in character_targets:
+            cid = _resolve_character(tgt)
+            if cid is None:
+                unresolved.append(tgt)
+                results.append({
+                    "target":   tgt,
+                    "error":    f"character not found: {tgt!r}",
+                })
+                continue
+            resolved_ids.append(cid)
+
+            char_row = conn.execute(
+                "SELECT name FROM characters WHERE character_id = ?",
+                (cid,),
+            ).fetchone()
+            char_name = char_row["name"] if char_row else f"#{cid}"
+
+            class_rows = conn.execute(
+                "SELECT class_level_id, class_name, level, xp "
+                "FROM class_levels WHERE character_id = ? ORDER BY class_level_id",
+                (cid,),
+            ).fetchall()
+
+            if not class_rows:
+                results.append({
+                    "target":         tgt,
+                    "character_id":   cid,
+                    "name":           char_name,
+                    "error":          (f"{char_name} has no class_levels row. "
+                                       "Use add_class_level to seed one before "
+                                       "granting XP."),
+                })
+                continue
+
+            per_class: list[dict] = []
+            any_levelup = False
+            for cr in class_rows:
+                new_xp = max(0, int(cr["xp"] or 0) + amount_int)
+                conn.execute(
+                    "UPDATE class_levels SET xp = ? WHERE class_level_id = ?",
+                    (new_xp, cr["class_level_id"]),
+                )
+                threshold = _xp_threshold_for_next_level(
+                    cr["class_name"], int(cr["level"]),
+                )
+                levelup = bool(threshold is not None and new_xp >= threshold)
+                if levelup:
+                    any_levelup = True
+                per_class.append({
+                    "class_name":            cr["class_name"],
+                    "current_level":         int(cr["level"]),
+                    "old_xp":                int(cr["xp"] or 0),
+                    "new_xp":                new_xp,
+                    "next_level_threshold":  threshold,
+                    "xp_to_next_level":      (None if threshold is None
+                                              else max(0, threshold - new_xp)),
+                    "levelup_available":     levelup,
+                })
+
+            results.append({
+                "target":             tgt,
+                "character_id":       cid,
+                "name":               char_name,
+                "amount_added":       amount_int,
+                "classes":            per_class,
+                "levelup_available":  any_levelup,
+            })
+
+        # ── Audit log ─────────────────────────────────────────────────────
+        if resolved_ids:
+            now = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+            log_payload = {
+                "ts":                now,
+                "amount":            amount_int,
+                "event":             event_description or "",
+                "character_ids":     resolved_ids,
+                "unresolved":        [str(t) for t in unresolved],
+            }
+            conn.execute(
+                "INSERT INTO world_facts "
+                "(campaign_id, category, fact_text, source_note) "
+                "VALUES (?, 'xp_log', ?, ?)",
+                (_CAMPAIGN_ID, json.dumps(log_payload),
+                 f"grant_xp: {amount_int} XP to {len(resolved_ids)} char(s) — "
+                 f"{event_description or 'no description'}"),
+            )
+
+    return {
+        "granted":    bool(resolved_ids),
+        "amount":     amount_int,
+        "event":      event_description or "",
+        "results":    results,
+        "unresolved": [str(t) for t in unresolved] if unresolved else [],
+    }
+
+
+# ── add_class_level ──────────────────────────────────────────────────────────
+
+def db_add_class_level(
+    character_target: int | str,
+    class_name: str,
+    level: int = 1,
+    xp: int = 0,
+) -> dict:
+    """
+    Insert a fresh class_levels row for a character. Refuses to insert a
+    duplicate (same character_id + class_name) — caller must use
+    update_class_level / direct_db_edit to modify an existing row.
+
+    Returns the new class_level_id and the inserted values, or an error
+    when the character can't be resolved or the row already exists.
+    """
+    cid = _resolve_character(character_target)
+    if cid is None:
+        return {"error": f"character not found: {character_target!r}"}
+    class_name = (class_name or "").strip()
+    if not class_name:
+        return {"error": "class_name is required"}
+    try:
+        level = int(level)
+        xp    = int(xp)
+    except (TypeError, ValueError):
+        return {"error": "level and xp must be integers"}
+    if level < 1:
+        return {"error": f"level must be >= 1; got {level}"}
+    if xp < 0:
+        return {"error": f"xp must be >= 0; got {xp}"}
+
+    with _get_conn() as conn:
+        existing = conn.execute(
+            "SELECT class_level_id, level, xp FROM class_levels "
+            "WHERE character_id = ? AND LOWER(class_name) = LOWER(?) LIMIT 1",
+            (cid, class_name),
+        ).fetchone()
+        if existing:
+            return {
+                "error": (f"class_levels row already exists for character_id={cid}, "
+                          f"class_name={class_name!r}. Use update_class_level "
+                          "(or direct_db_edit) to modify an existing row."),
+                "existing": {
+                    "class_level_id": existing["class_level_id"],
+                    "level":          existing["level"],
+                    "xp":             existing["xp"],
+                },
+            }
+
+        cur = conn.execute(
+            "INSERT INTO class_levels (character_id, class_name, level, xp) "
+            "VALUES (?, ?, ?, ?)",
+            (cid, class_name, level, xp),
+        )
+        new_id = cur.lastrowid
+
+        char_row = conn.execute(
+            "SELECT name FROM characters WHERE character_id = ?", (cid,),
+        ).fetchone()
+
+    return {
+        "added":          True,
+        "class_level_id": new_id,
+        "character_id":   cid,
+        "name":           char_row["name"] if char_row else None,
+        "class_name":     class_name,
+        "level":          level,
+        "xp":             xp,
+        "next_level_threshold": _xp_threshold_for_next_level(class_name, level),
+    }
+
+
+# ── list_characters ──────────────────────────────────────────────────────────
+
+def db_list_characters() -> dict:
+    """
+    Return every character in the active campaign with a one-line summary:
+    id, name, type, race, alignment, class levels, notes preview.
+    """
+    with _get_conn(read_only=True) as conn:
+        rows = conn.execute(
+            "SELECT character_id, name, character_type, race, alignment, notes "
+            "FROM characters WHERE campaign_id = ? "
+            "ORDER BY character_id",
+            (_CAMPAIGN_ID,),
+        ).fetchall()
+
+        out: list[dict] = []
+        for r in rows:
+            cls_rows = conn.execute(
+                "SELECT class_name, level, xp FROM class_levels "
+                "WHERE character_id = ? ORDER BY class_level_id",
+                (r["character_id"],),
+            ).fetchall()
+            classes = [
+                {"class_name": cr["class_name"],
+                 "level":      cr["level"],
+                 "xp":         cr["xp"]}
+                for cr in cls_rows
+            ]
+            classes_summary = (
+                "/".join(f"{c['class_name']} {c['level']}" for c in classes)
+                if classes else "(no class)"
+            )
+            notes_preview = (r["notes"] or "")
+            if len(notes_preview) > 120:
+                notes_preview = notes_preview[:117].rstrip() + "..."
+
+            out.append({
+                "character_id":     r["character_id"],
+                "name":             r["name"],
+                "character_type":   r["character_type"],
+                "race":             r["race"],
+                "alignment":        r["alignment"],
+                "classes":          classes,
+                "classes_summary":  classes_summary,
+                "notes_preview":    notes_preview,
+            })
+
+    return {"count": len(out), "characters": out}
