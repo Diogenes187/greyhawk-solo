@@ -8199,3 +8199,563 @@ def db_list_characters() -> dict:
             })
 
     return {"count": len(out), "characters": out}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PHASE 9 — AERIAL ENCOUNTERS & REACTION ROLLS
+# Sky-scanning encounter checks · 2d6 social reaction table
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ---------------------------------------------------------------------------
+# Aerial encounter tables (AD&D 1e DMG-style)
+# Keyed by elevation tier → terrain → list of (lo, hi, creature, num_appearing)
+# Each terrain table is a d20 roll (1–20). Unlisted terrains fall back to
+# the elevation's "default" table.
+# ---------------------------------------------------------------------------
+_AERIAL_ENCOUNTERS: dict[str, dict[str, list[tuple[int, int, str, str]]]] = {
+    # Low altitude — under 1000 ft. Predators, scavengers, lower-tier flyers.
+    "low": {
+        "forest": [
+            (1,  4,  "Giant Eagle",        "1d3"),
+            (5,  7,  "Giant Hawk",         "1d4"),
+            (8,  9,  "Stirge",             "3d6"),
+            (10, 11, "Harpy",              "1d4"),
+            (12, 13, "Hippogriff",         "1d4"),
+            (14, 15, "Giant Owl",          "1d3"),
+            (16, 16, "Wyvern",             "1d2"),
+            (17, 17, "Griffon",            "1d2"),
+            (18, 18, "Peryton",            "1d2"),
+            (19, 19, "Pegasus",            "1d2"),
+            (20, 20, "Green Dragon",       "1"),
+        ],
+        "mountains": [
+            (1,  3,  "Giant Eagle",        "1d4"),
+            (4,  6,  "Hippogriff",         "1d4"),
+            (7,  8,  "Griffon",            "1d3"),
+            (9,  10, "Wyvern",             "1d2"),
+            (11, 12, "Gargoyle",           "1d6"),
+            (13, 14, "Giant Hawk",         "1d4"),
+            (15, 15, "Peryton",            "1d2"),
+            (16, 16, "Harpy",              "1d4"),
+            (17, 17, "Aarakocra",          "2d6"),
+            (18, 18, "Manticore",          "1d2"),
+            (19, 19, "White Dragon",       "1"),
+            (20, 20, "Red Dragon",         "1"),
+        ],
+        "plains": [
+            (1,  4,  "Giant Eagle",        "1d3"),
+            (5,  7,  "Giant Hawk",         "1d4"),
+            (8,  10, "Hippogriff",         "1d4"),
+            (11, 12, "Pegasus",            "1d4"),
+            (13, 14, "Griffon",            "1d3"),
+            (15, 16, "Harpy",              "1d4"),
+            (17, 17, "Sphinx (Androsphinx)", "1"),
+            (18, 18, "Wyvern",             "1d2"),
+            (19, 19, "Chimera",            "1"),
+            (20, 20, "Blue Dragon",        "1"),
+        ],
+        "coast": [
+            (1,  4,  "Giant Eagle",        "1d3"),
+            (5,  8,  "Giant Hawk",         "1d4"),
+            (9,  10, "Stirge",             "2d6"),
+            (11, 12, "Harpy",              "1d4"),
+            (13, 14, "Pegasus",            "1d3"),
+            (15, 16, "Hippogriff",         "1d4"),
+            (17, 17, "Griffon",            "1d2"),
+            (18, 18, "Wyvern",             "1"),
+            (19, 19, "Sea Hag",            "1d2"),
+            (20, 20, "Bronze Dragon",      "1"),
+        ],
+        "swamp": [
+            (1,  4,  "Stirge",             "3d6"),
+            (5,  7,  "Giant Mosquito",     "2d4"),
+            (8,  9,  "Harpy",              "1d4"),
+            (10, 11, "Giant Bat",          "2d4"),
+            (12, 13, "Vampire Bat",        "1d6"),
+            (14, 14, "Wyvern",             "1"),
+            (15, 15, "Will-O-(the)-Wisp",  "1d3"),
+            (16, 16, "Imp",                "1"),
+            (17, 17, "Quasit",             "1"),
+            (18, 18, "Mist Dragon",        "1"),
+            (19, 19, "Black Dragon",       "1"),
+            (20, 20, "Demon (Type I)",     "1"),
+        ],
+        "hills": [
+            (1,  3,  "Giant Eagle",        "1d4"),
+            (4,  6,  "Giant Hawk",         "1d4"),
+            (7,  9,  "Hippogriff",         "1d4"),
+            (10, 11, "Griffon",            "1d3"),
+            (12, 13, "Harpy",              "1d4"),
+            (14, 15, "Gargoyle",           "1d4"),
+            (16, 16, "Wyvern",             "1d2"),
+            (17, 17, "Peryton",            "1d2"),
+            (18, 18, "Manticore",          "1d2"),
+            (19, 19, "Chimera",            "1"),
+            (20, 20, "Green Dragon",       "1"),
+        ],
+        "desert": [
+            (1,  4,  "Giant Hawk",         "1d4"),
+            (5,  7,  "Giant Eagle",        "1d3"),
+            (8,  10, "Hippogriff",         "1d4"),
+            (11, 12, "Vulture",            "2d6"),
+            (13, 14, "Griffon",            "1d2"),
+            (15, 16, "Harpy",              "1d4"),
+            (17, 17, "Wyvern",             "1d2"),
+            (18, 18, "Sphinx (Criosphinx)", "1"),
+            (19, 19, "Manticore",          "1d2"),
+            (20, 20, "Blue Dragon",        "1"),
+        ],
+        "default": [
+            (1,  4,  "Giant Eagle",        "1d3"),
+            (5,  7,  "Giant Hawk",         "1d4"),
+            (8,  10, "Hippogriff",         "1d4"),
+            (11, 12, "Stirge",             "2d6"),
+            (13, 14, "Harpy",              "1d4"),
+            (15, 16, "Griffon",            "1d2"),
+            (17, 17, "Gargoyle",           "1d4"),
+            (18, 18, "Wyvern",             "1d2"),
+            (19, 19, "Manticore",          "1"),
+            (20, 20, "Green Dragon",       "1"),
+        ],
+    },
+
+    # Medium altitude — 1000–5000 ft. Dragons, manticores, pegasi, chimera.
+    "medium": {
+        "forest": [
+            (1,  4,  "Giant Hawk",         "1d4"),
+            (5,  7,  "Pegasus",            "1d4"),
+            (8,  9,  "Griffon",            "1d3"),
+            (10, 11, "Hippogriff",         "1d4"),
+            (12, 13, "Wyvern",             "1d2"),
+            (14, 15, "Manticore",          "1d2"),
+            (16, 16, "Peryton",            "1d3"),
+            (17, 17, "Chimera",            "1"),
+            (18, 18, "Green Dragon",       "1"),
+            (19, 19, "Roc (small)",        "1"),
+            (20, 20, "Couatl",             "1"),
+        ],
+        "mountains": [
+            (1,  3,  "Giant Hawk",         "1d4"),
+            (4,  6,  "Griffon",            "1d3"),
+            (7,  8,  "Wyvern",             "1d2"),
+            (9,  10, "Manticore",          "1d2"),
+            (11, 12, "Chimera",            "1"),
+            (13, 14, "Roc",                "1"),
+            (15, 15, "Pegasus",            "1d3"),
+            (16, 16, "Red Dragon",         "1"),
+            (17, 17, "Silver Dragon",      "1"),
+            (18, 18, "White Dragon",       "1"),
+            (19, 19, "Cloud Giant (mounted)", "1"),
+            (20, 20, "Storm Giant (mounted)", "1"),
+        ],
+        "plains": [
+            (1,  4,  "Giant Hawk",         "1d4"),
+            (5,  7,  "Pegasus",            "1d4"),
+            (8,  10, "Griffon",            "1d3"),
+            (11, 12, "Wyvern",             "1d2"),
+            (13, 14, "Manticore",          "1d2"),
+            (15, 16, "Chimera",            "1"),
+            (17, 17, "Roc (small)",        "1"),
+            (18, 18, "Blue Dragon",        "1"),
+            (19, 19, "Brass Dragon",       "1"),
+            (20, 20, "Couatl",             "1"),
+        ],
+        "coast": [
+            (1,  4,  "Giant Hawk",         "1d4"),
+            (5,  7,  "Pegasus",            "1d3"),
+            (8,  9,  "Griffon",            "1d2"),
+            (10, 11, "Wyvern",             "1d2"),
+            (12, 13, "Manticore",          "1d2"),
+            (14, 15, "Roc",                "1"),
+            (16, 16, "Chimera",            "1"),
+            (17, 17, "Bronze Dragon",      "1"),
+            (18, 18, "Storm Giant",        "1"),
+            (19, 19, "Cloud Giant",        "1"),
+            (20, 20, "Couatl",             "1"),
+        ],
+        "swamp": [
+            (1,  3,  "Giant Hawk",         "1d4"),
+            (4,  6,  "Wyvern",             "1d2"),
+            (7,  8,  "Manticore",          "1d2"),
+            (9,  10, "Will-O-(the)-Wisp",  "1d4"),
+            (11, 12, "Imp",                "1"),
+            (13, 14, "Quasit",             "1"),
+            (15, 16, "Mist Dragon",        "1"),
+            (17, 17, "Black Dragon",       "1"),
+            (18, 18, "Demon (Type II)",    "1"),
+            (19, 19, "Devil (Erinyes)",    "1d2"),
+            (20, 20, "Roc",                "1"),
+        ],
+        "hills": [
+            (1,  3,  "Giant Hawk",         "1d4"),
+            (4,  6,  "Pegasus",            "1d3"),
+            (7,  9,  "Griffon",            "1d3"),
+            (10, 11, "Wyvern",             "1d2"),
+            (12, 13, "Manticore",          "1d2"),
+            (14, 15, "Chimera",            "1"),
+            (16, 16, "Peryton",            "1d3"),
+            (17, 17, "Roc (small)",        "1"),
+            (18, 18, "Green Dragon",       "1"),
+            (19, 19, "Brass Dragon",       "1"),
+            (20, 20, "Cloud Giant",        "1"),
+        ],
+        "desert": [
+            (1,  3,  "Giant Hawk",         "1d4"),
+            (4,  6,  "Wyvern",             "1d2"),
+            (7,  9,  "Manticore",          "1d2"),
+            (10, 11, "Griffon",            "1d2"),
+            (12, 13, "Chimera",            "1"),
+            (14, 15, "Roc",                "1"),
+            (16, 16, "Sphinx (Androsphinx)", "1"),
+            (17, 17, "Blue Dragon",        "1"),
+            (18, 18, "Brass Dragon",       "1"),
+            (19, 19, "Djinni",             "1"),
+            (20, 20, "Efreeti",            "1"),
+        ],
+        "default": [
+            (1,  4,  "Giant Hawk",         "1d4"),
+            (5,  7,  "Pegasus",            "1d3"),
+            (8,  10, "Griffon",            "1d2"),
+            (11, 12, "Wyvern",             "1d2"),
+            (13, 14, "Manticore",          "1d2"),
+            (15, 16, "Chimera",            "1"),
+            (17, 17, "Roc (small)",        "1"),
+            (18, 18, "Peryton",            "1d3"),
+            (19, 19, "Couatl",             "1"),
+            (20, 20, "Red Dragon",         "1"),
+        ],
+    },
+
+    # High altitude — above 5000 ft. Rocs, true elementals, dragons, planar.
+    "high": {
+        "forest": [
+            (1,  4,  "Roc",                "1"),
+            (5,  7,  "Air Elemental",      "1"),
+            (8,  10, "Invisible Stalker",  "1"),
+            (11, 12, "Cloud Giant",        "1"),
+            (13, 14, "Storm Giant",        "1"),
+            (15, 16, "Couatl",             "1"),
+            (17, 17, "Djinni",             "1"),
+            (18, 18, "Silver Dragon",      "1"),
+            (19, 19, "Gold Dragon",        "1"),
+            (20, 20, "Aerial Servant",     "1"),
+        ],
+        "mountains": [
+            (1,  3,  "Roc",                "1d2"),
+            (4,  6,  "Air Elemental",      "1"),
+            (7,  9,  "Storm Giant",        "1"),
+            (10, 11, "Cloud Giant",        "1d2"),
+            (12, 13, "Silver Dragon",      "1"),
+            (14, 15, "Gold Dragon",        "1"),
+            (16, 16, "Red Dragon",         "1"),
+            (17, 17, "Djinni",             "1"),
+            (18, 18, "Invisible Stalker",  "1"),
+            (19, 19, "Couatl",             "1"),
+            (20, 20, "Aerial Servant",     "1"),
+        ],
+        "plains": [
+            (1,  4,  "Roc",                "1"),
+            (5,  7,  "Air Elemental",      "1"),
+            (8,  10, "Invisible Stalker",  "1"),
+            (11, 12, "Cloud Giant",        "1"),
+            (13, 14, "Couatl",             "1"),
+            (15, 16, "Storm Giant",        "1"),
+            (17, 17, "Djinni",             "1"),
+            (18, 18, "Brass Dragon",       "1"),
+            (19, 19, "Gold Dragon",        "1"),
+            (20, 20, "Aerial Servant",     "1"),
+        ],
+        "coast": [
+            (1,  3,  "Roc",                "1"),
+            (4,  6,  "Air Elemental",      "1"),
+            (7,  9,  "Storm Giant",        "1d2"),
+            (10, 11, "Cloud Giant",        "1"),
+            (12, 13, "Bronze Dragon",      "1"),
+            (14, 15, "Silver Dragon",      "1"),
+            (16, 16, "Couatl",             "1"),
+            (17, 17, "Djinni",             "1"),
+            (18, 18, "Invisible Stalker",  "1"),
+            (19, 19, "Gold Dragon",        "1"),
+            (20, 20, "Aerial Servant",     "1"),
+        ],
+        "swamp": [
+            (1,  4,  "Air Elemental",      "1"),
+            (5,  7,  "Invisible Stalker",  "1"),
+            (8,  9,  "Roc",                "1"),
+            (10, 11, "Mist Dragon",        "1"),
+            (12, 13, "Demon (Type IV)",    "1"),
+            (14, 15, "Devil (Horned)",     "1"),
+            (16, 16, "Couatl",             "1"),
+            (17, 17, "Storm Giant",        "1"),
+            (18, 18, "Cloud Giant",        "1"),
+            (19, 19, "Djinni",             "1"),
+            (20, 20, "Solar",              "1"),
+        ],
+        "hills": [
+            (1,  3,  "Roc",                "1"),
+            (4,  6,  "Air Elemental",      "1"),
+            (7,  9,  "Cloud Giant",        "1"),
+            (10, 11, "Storm Giant",        "1"),
+            (12, 13, "Invisible Stalker",  "1"),
+            (14, 15, "Couatl",             "1"),
+            (16, 16, "Silver Dragon",      "1"),
+            (17, 17, "Gold Dragon",        "1"),
+            (18, 18, "Brass Dragon",       "1"),
+            (19, 19, "Djinni",             "1"),
+            (20, 20, "Aerial Servant",     "1"),
+        ],
+        "desert": [
+            (1,  3,  "Roc",                "1d2"),
+            (4,  6,  "Air Elemental",      "1"),
+            (7,  9,  "Djinni",             "1"),
+            (10, 12, "Efreeti",            "1"),
+            (13, 14, "Cloud Giant",        "1"),
+            (15, 16, "Storm Giant",        "1"),
+            (17, 17, "Couatl",             "1"),
+            (18, 18, "Brass Dragon",       "1"),
+            (19, 19, "Gold Dragon",        "1"),
+            (20, 20, "Aerial Servant",     "1"),
+        ],
+        "default": [
+            (1,  4,  "Roc",                "1"),
+            (5,  7,  "Air Elemental",      "1"),
+            (8,  10, "Invisible Stalker",  "1"),
+            (11, 12, "Cloud Giant",        "1"),
+            (13, 14, "Storm Giant",        "1"),
+            (15, 16, "Couatl",             "1"),
+            (17, 17, "Djinni",             "1"),
+            (18, 18, "Silver Dragon",      "1"),
+            (19, 19, "Gold Dragon",        "1"),
+            (20, 20, "Aerial Servant",     "1"),
+        ],
+    },
+}
+
+_AERIAL_ALTITUDE_LABEL: dict[str, str] = {
+    "low":    "Under 1000 ft",
+    "medium": "1000-5000 ft",
+    "high":   "Above 5000 ft",
+}
+
+_AERIAL_APPROACH_DIRECTIONS: list[str] = [
+    "from the north",
+    "from the northeast",
+    "from the east",
+    "from the southeast",
+    "from the south",
+    "from the southwest",
+    "from the west",
+    "from the northwest",
+    "directly above (descending)",
+    "from below (rising on a thermal)",
+]
+
+# Purely instinctual fauna — reaction roll is meaningless because the
+# creature is acting on hunger or territorial drive rather than disposition.
+_AERIAL_INSTINCT_ONLY: set[str] = {
+    "Stirge",
+    "Giant Mosquito",
+    "Giant Bat",
+    "Vampire Bat",
+    "Vulture",
+    "Giant Hawk",
+    "Giant Owl",
+    "Giant Eagle",
+}
+
+
+def _roll_dice_expr(text: str) -> int:
+    """
+    Roll a simple dice expression: 'NdM', 'NdM+K', 'NdM-K', 'X-Y', or a
+    plain integer. Returns the rolled total (minimum 1).
+    """
+    if not text:
+        return 1
+    s = str(text).strip().lower()
+    m = re.match(r"^(\d+)d(\d+)([+-]\d+)?$", s)
+    if m:
+        n     = int(m.group(1))
+        sides = int(m.group(2))
+        mod   = int(m.group(3) or 0)
+        total = sum(random.randint(1, sides) for _ in range(n)) + mod
+        return max(1, total)
+    m = re.match(r"^(\d+)-(\d+)$", s)
+    if m:
+        return random.randint(int(m.group(1)), int(m.group(2)))
+    try:
+        return max(1, int(float(s)))
+    except ValueError:
+        return 1
+
+
+def db_check_aerial_encounter(
+    elevation:   str = "low",
+    terrain:     str = "plains",
+    chance_in_6: int = 1,
+) -> dict:
+    """
+    Check for an aerial encounter at the given elevation tier and terrain.
+
+    Rolls 1d6 against chance_in_6. On miss returns a 'clear' result with
+    encounter=False. On hit, rolls a creature on the AD&D 1e aerial table
+    for the given elevation x terrain, with count, altitude descriptor,
+    approach direction, and a reaction_roll_eligible flag for whether
+    parley/reaction is meaningful for that creature.
+    """
+    elev = (elevation or "low").lower().strip()
+    if elev not in _AERIAL_ENCOUNTERS:
+        elev = "low"
+    terr = (terrain or "plains").lower().strip().replace(" ", "_")
+    chance = max(1, min(int(chance_in_6 or 1), 6))
+
+    d6 = random.randint(1, 6)
+    triggered = d6 <= chance
+
+    result: dict = {
+        "encounter":    triggered,
+        "d6_roll":      d6,
+        "chance_in_6":  chance,
+        "elevation":    elev,
+        "altitude":     _AERIAL_ALTITUDE_LABEL.get(elev, ""),
+        "terrain":      terr,
+    }
+
+    if not triggered:
+        result.update({
+            "creature":               None,
+            "count":                  0,
+            "approach":               "",
+            "reaction_roll_eligible": False,
+            "note": (
+                f"Sky is clear (rolled {d6}, needed <= {chance})."
+            ),
+        })
+        return result
+
+    by_terrain = _AERIAL_ENCOUNTERS[elev]
+    table = by_terrain.get(terr) or by_terrain["default"]
+
+    d20 = random.randint(1, 20)
+    creature, num_appearing_text = table[-1][2], table[-1][3]
+    for (lo, hi, name, na) in table:
+        if lo <= d20 <= hi:
+            creature, num_appearing_text = name, na
+            break
+
+    count    = _roll_dice_expr(num_appearing_text)
+    approach = random.choice(_AERIAL_APPROACH_DIRECTIONS)
+    reaction_eligible = creature not in _AERIAL_INSTINCT_ONLY
+
+    result.update({
+        "creature":               creature,
+        "count":                  count,
+        "number_appearing_text":  num_appearing_text,
+        "d20_roll":               d20,
+        "approach":               approach,
+        "reaction_roll_eligible": reaction_eligible,
+        "note": (
+            f"Aerial contact at {_AERIAL_ALTITUDE_LABEL.get(elev, '')}: "
+            f"{count}x {creature} approaching {approach} over {terr} "
+            f"(d20={d20})."
+        ),
+    })
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Reaction roll (AD&D 1e DMG, 2d6 + Cha + situation)
+# ---------------------------------------------------------------------------
+_REACTION_TIERS: list[tuple[int, str, str, str]] = [
+    # (upper_bound, tier_key, label, interpretation_template)
+    (2,  "immediate_attack",
+         "Immediate Attack",
+         "{name} attacks at once - no parlay possible. Roll initiative."),
+    (5,  "hostile",
+         "Hostile",
+         "{name} is hostile and likely to attack unless given strong reason "
+         "otherwise (gifts, threats, retreat)."),
+    (8,  "uncertain",
+         "Uncertain / Wary",
+         "{name} is wary and undecided - watching, weapons ready. Further "
+         "interaction may swing the encounter either way."),
+    (11, "indifferent",
+         "Indifferent / Neutral",
+         "{name} is neutral - willing to converse but not predisposed to "
+         "help. Trade or persuasion may shift them."),
+    (999, "friendly",
+         "Friendly",
+         "{name} is friendly and willing to talk, trade, or even cooperate "
+         "within reason."),
+]
+
+
+def db_roll_reaction(
+    creature_name:      str,
+    charisma_modifier:  int = 0,
+    situation_modifier: int = 0,
+) -> dict:
+    """
+    Roll 2d6 + Cha mod + situation mod on the AD&D 1e reaction table.
+
+    situation_modifier is clamped to [-3, +3]. Logs the full roll to
+    world_facts (category 'reaction_log') so the DM can audit social
+    encounter history.
+    """
+    name    = (creature_name or "the creature").strip() or "the creature"
+    cha_mod = int(charisma_modifier or 0)
+    sit_mod = max(-3, min(3, int(situation_modifier or 0)))
+
+    d_a  = random.randint(1, 6)
+    d_b  = random.randint(1, 6)
+    base  = d_a + d_b
+    final = base + cha_mod + sit_mod
+
+    tier_key, label, interpretation = "friendly", "Friendly", ""
+    for upper, key, lbl, tmpl in _REACTION_TIERS:
+        if final <= upper:
+            tier_key, label = key, lbl
+            interpretation = tmpl.format(name=name)
+            break
+
+    breakdown = (
+        f"2d6=({d_a}+{d_b})={base}, Cha {cha_mod:+d}, "
+        f"situation {sit_mod:+d} -> {final}"
+    )
+
+    log_entry = {
+        "creature":           name,
+        "d6_a":               d_a,
+        "d6_b":               d_b,
+        "base_2d6":           base,
+        "charisma_modifier":  cha_mod,
+        "situation_modifier": sit_mod,
+        "final_result":       final,
+        "tier":               tier_key,
+        "label":              label,
+    }
+
+    persisted = True
+    try:
+        with _get_conn() as conn:
+            conn.execute(
+                "INSERT INTO world_facts "
+                "(campaign_id, category, fact_text, source_note) "
+                "VALUES (?, 'reaction_log', ?, 'reaction_system')",
+                (_CAMPAIGN_ID, json.dumps(log_entry)),
+            )
+    except Exception:
+        persisted = False
+
+    return {
+        "creature":           name,
+        "d6_rolls":           [d_a, d_b],
+        "base_2d6":           base,
+        "charisma_modifier":  cha_mod,
+        "situation_modifier": sit_mod,
+        "final_result":       final,
+        "tier":               tier_key,
+        "disposition":        label,
+        "interpretation":     interpretation,
+        "breakdown":          breakdown,
+        "logged":             persisted,
+    }

@@ -46,6 +46,8 @@ Tools exposed:
   DUNGEON
   check_wandering_monster -- Roll 1-in-6 wandering monster check (one dungeon turn)
   random_encounter        -- Roll random encounter for given dungeon level
+  check_aerial_encounter  -- Roll 1-in-6 aerial check; rolls AD&D 1e flying-creature table on hit
+  roll_reaction           -- 2d6 + Cha + situation on the AD&D 1e reaction table; logs to reaction_log
   generate_treasure       -- Roll complete treasure haul for type A-Z
 
   DOMAIN
@@ -346,6 +348,9 @@ from engine.db import (
     db_add_class_level,
     db_list_characters,
     _resolve_character,
+    # Phase 9 — aerial encounters & reaction rolls
+    db_check_aerial_encounter,
+    db_roll_reaction,
     # Phase 4 — domain
     get_full_domain_state,
     db_add_construction_project,
@@ -2747,6 +2752,106 @@ def random_encounter(
     )
 
     return result
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TOOL: check_aerial_encounter
+# ══════════════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def check_aerial_encounter(
+    elevation: Annotated[
+        str,
+        "Elevation tier: 'low' (under 1000 ft — giant eagles, hippogriffs, "
+        "griffons, wyverns, gargoyles), 'medium' (1000–5000 ft — dragons, "
+        "manticores, pegasi, chimera, giant hawks), or 'high' (above 5000 ft "
+        "— rocs, storm giants, air elementals, invisible stalkers). "
+        "Determines which AD&D 1e aerial encounter table is rolled.",
+    ] = "low",
+    terrain: Annotated[
+        str,
+        "Terrain below the party: forest, mountains, plains, coast, swamp, "
+        "hills, or desert. Falls back to a generic table for the elevation "
+        "if the terrain isn't explicitly tabled.",
+    ] = "plains",
+    chance_in_6: Annotated[
+        int,
+        "Number of d6 faces that trigger an encounter. AD&D default is 1 "
+        "(1-in-6). Use 2 over migratory paths, dragon territory, or open-sky "
+        "flight on hippogriff/pegasus mounts. Clamped to 1–6.",
+    ] = 1,
+) -> dict:
+    """
+    Roll a 1-in-6 (or chance_in_6) check for an aerial encounter.
+
+    On miss returns {"encounter": false} with a "sky is clear" note. On hit
+    rolls a creature on the AD&D 1e aerial encounter table for the given
+    elevation × terrain, plus number appearing, altitude descriptor, and
+    approach direction. The reaction_roll_eligible flag is True when the
+    creature is intelligent enough that parley/reaction is meaningful;
+    follow up with roll_reaction() to determine disposition.
+
+    Call once per hour of overland flight, or whenever the party scans the
+    skies in known territory. Pairs with check_wandering_monster (ground)
+    and start_combat (if the encounter turns hostile).
+    """
+    return db_check_aerial_encounter(
+        elevation=elevation,
+        terrain=terrain,
+        chance_in_6=chance_in_6,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TOOL: roll_reaction
+# ══════════════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def roll_reaction(
+    creature_name: Annotated[
+        str,
+        "Name of the creature, NPC, or group whose disposition is being "
+        "rolled. Used in the interpretation text and persisted to "
+        "world_facts category 'reaction_log'.",
+    ],
+    charisma_modifier: Annotated[
+        int,
+        "Charisma reaction adjustment of the speaker (the PC negotiating). "
+        "AD&D 1e Cha mods range from -5 (Cha 3) to +4 (Cha 18+). Default 0.",
+    ] = 0,
+    situation_modifier: Annotated[
+        int,
+        "Circumstantial adjustment in [-3, +3]. Positive: gifts, shared "
+        "language, common enemy, charm spell active, peaceful approach. "
+        "Negative: drawn weapons, recent insult, faction rivalry, prior "
+        "wrong done. Out-of-range values are clamped.",
+    ] = 0,
+) -> dict:
+    """
+    Roll 2d6 + Cha mod + situation mod on the AD&D 1e reaction table.
+
+    Result tiers (final 2d6 + modifiers):
+      ≤ 2  → Immediate attack (no parlay possible)
+      3–5  → Hostile, likely to attack
+      6–8  → Uncertain / wary
+      9–11 → Indifferent / neutral
+      12+  → Friendly, willing to talk
+
+    Returns the full breakdown (both d6 results, modifiers, final), the
+    disposition tier, and a one-line behavioral interpretation. Logs every
+    roll to world_facts (category 'reaction_log') for an audit trail of
+    social encounter outcomes.
+
+    Use for: NPC first meetings, creatures encountered without surprise,
+    parley attempts, charm-spell follow-ups, and any moment the party's
+    welcome is in question. This tool is the mechanical backbone for
+    every social encounter — call it instead of inventing dispositions.
+    """
+    return db_roll_reaction(
+        creature_name=creature_name,
+        charisma_modifier=charisma_modifier,
+        situation_modifier=situation_modifier,
+    )
 
 
 @mcp.tool()
