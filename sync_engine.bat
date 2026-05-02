@@ -62,45 +62,44 @@ for /l %%I in (1,1,%COUNT%) do (
     echo.
     echo  [%%I/%COUNT%] !DNAME!
 
-    :: engine/ — full folder sync (no saves, no .db)
+    rem engine/ -- full folder sync, exclude .db files
     robocopy "%SRC%\engine" "!DST!\engine" /E /XF "*.db" /NP /NFL /NDL /NJH /NJS >nul 2>&1
     if errorlevel 8 (
         echo    ERROR: engine/ copy failed
         set /a FAIL+=1
-        goto :next_%%I
+    ) else (
+        echo    OK  engine/
+
+        rem server/mcp_server.py
+        copy /y "%SRC%\server\mcp_server.py" "!DST!\server\mcp_server.py" >nul 2>&1
+        if errorlevel 1 (echo    WARN: server/mcp_server.py copy failed) else (echo    OK  server/mcp_server.py)
+
+        rem schema files
+        copy /y "%SRC%\schema\ddl.sql"     "!DST!\schema\ddl.sql"     >nul 2>&1
+        if errorlevel 1 (echo    WARN: schema/ddl.sql copy failed)     else (echo    OK  schema/ddl.sql)
+
+        copy /y "%SRC%\schema\starter.sql" "!DST!\schema\starter.sql" >nul 2>&1
+        if errorlevel 1 (echo    WARN: schema/starter.sql copy failed) else (echo    OK  schema/starter.sql)
+
+        rem clone/sync helper scripts
+        if exist "%SRC%\clone_for_new_character.bat" (
+            copy /y "%SRC%\clone_for_new_character.bat" "!DST!\clone_for_new_character.bat" >nul 2>&1
+            if errorlevel 1 (echo    WARN: clone_for_new_character.bat copy failed) else (echo    OK  clone_for_new_character.bat)
+        )
+        if exist "%SRC%\clone_for_new_character.sh" (
+            copy /y "%SRC%\clone_for_new_character.sh" "!DST!\clone_for_new_character.sh" >nul 2>&1
+            if errorlevel 1 (echo    WARN: clone_for_new_character.sh copy failed) else (echo    OK  clone_for_new_character.sh)
+        )
+
+        rem sync scripts themselves
+        copy /y "%SRC%\sync_engine.bat" "!DST!\sync_engine.bat" >nul 2>&1
+        if errorlevel 1 (echo    WARN: sync_engine.bat copy failed) else (echo    OK  sync_engine.bat)
+
+        copy /y "%SRC%\sync_engine.sh"  "!DST!\sync_engine.sh"  >nul 2>&1
+        if errorlevel 1 (echo    WARN: sync_engine.sh copy failed)  else (echo    OK  sync_engine.sh)
+
+        set /a PASS+=1
     )
-    echo    OK  engine/
-
-    :: server/mcp_server.py
-    copy /y "%SRC%\server\mcp_server.py" "!DST!\server\mcp_server.py" >nul 2>&1
-    if errorlevel 1 (echo    WARN: server/mcp_server.py copy failed) else (echo    OK  server/mcp_server.py)
-
-    :: schema files
-    copy /y "%SRC%\schema\ddl.sql"     "!DST!\schema\ddl.sql"     >nul 2>&1
-    if errorlevel 1 (echo    WARN: schema/ddl.sql copy failed)     else (echo    OK  schema/ddl.sql)
-
-    copy /y "%SRC%\schema\starter.sql" "!DST!\schema\starter.sql" >nul 2>&1
-    if errorlevel 1 (echo    WARN: schema/starter.sql copy failed) else (echo    OK  schema/starter.sql)
-
-    :: clone/sync helper scripts
-    if exist "%SRC%\clone_for_new_character.bat" (
-        copy /y "%SRC%\clone_for_new_character.bat" "!DST!\clone_for_new_character.bat" >nul 2>&1
-        if errorlevel 1 (echo    WARN: clone_for_new_character.bat copy failed) else (echo    OK  clone_for_new_character.bat)
-    )
-    if exist "%SRC%\clone_for_new_character.sh" (
-        copy /y "%SRC%\clone_for_new_character.sh" "!DST!\clone_for_new_character.sh" >nul 2>&1
-        if errorlevel 1 (echo    WARN: clone_for_new_character.sh copy failed) else (echo    OK  clone_for_new_character.sh)
-    )
-
-    :: sync scripts themselves
-    copy /y "%SRC%\sync_engine.bat" "!DST!\sync_engine.bat" >nul 2>&1
-    if errorlevel 1 (echo    WARN: sync_engine.bat copy failed) else (echo    OK  sync_engine.bat)
-
-    copy /y "%SRC%\sync_engine.sh"  "!DST!\sync_engine.sh"  >nul 2>&1
-    if errorlevel 1 (echo    WARN: sync_engine.sh copy failed)  else (echo    OK  sync_engine.sh)
-
-    set /a PASS+=1
-    :next_%%I
 )
 
 echo.
