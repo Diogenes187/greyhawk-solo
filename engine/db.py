@@ -798,18 +798,50 @@ def add_item(
     treasury_name: str | None = None,
     equipped: bool = False,
     carry_notes: str = "",
+    # ── Phase 12 structured combat fields (all optional) ──
+    damage_dice: str | None = None,
+    damage_bonus: int = 0,
+    to_hit_bonus: int = 0,
+    weapon_type: str | None = None,
+    armor_class_bonus: int = 0,
+    slot: str | None = None,
 ) -> dict:
     """
-    Create a new item and assign it to an inventory slot.
+    Create a new item and assign it to an inventory row.
 
     assign_to controls where it goes:
       "character" — assigned to Theron Vale (character_id=1)
       "location"  — assigned to a location by name (location_name required)
       "treasury"  — assigned to a treasury account by name (treasury_name required)
 
+    Combat fields (damage_dice / damage_bonus / to_hit_bonus / weapon_type /
+    armor_class_bonus) are written into the items row. weapon_type must be
+    one of: one_handed, two_handed, off_hand, ranged, thrown — or None.
+
+    slot is character-only and equips the new item directly. Must be a valid
+    inventory slot (mainhand, offhand, head, body, cloak, belt, boots,
+    gloves, ring1, ring2, neck, back) or None. If slot is set, equipped_flag
+    is also set to 1 to keep the legacy column in sync, and any existing
+    occupant of that slot is auto-vacated. The legacy `equipped` parameter
+    is honored only when slot is None.
+
     Returns a dict with item_id, inventory_id, and the assignment details.
     Raises ValueError on bad inputs or missing location/treasury.
     """
+    _ensure_items_combat_columns()
+    _ensure_inventory_slot_column()
+
+    if weapon_type is not None and weapon_type not in _WEAPON_TYPES:
+        raise ValueError(
+            f"weapon_type must be one of {sorted(_WEAPON_TYPES)} or omitted; "
+            f"got {weapon_type!r}."
+        )
+    if slot is not None and slot not in _INVENTORY_SLOTS:
+        raise ValueError(
+            f"slot must be one of {sorted(_INVENTORY_SLOTS)} or omitted; "
+            f"got {slot!r}."
+        )
+
     # Resolve assignment FK
     char_id = loc_id = treasury_id = None
 
@@ -846,38 +878,69 @@ def add_item(
     else:
         raise ValueError("assign_to must be 'character', 'location', or 'treasury'.")
 
+    if slot is not None and assign_to != "character":
+        raise ValueError(
+            "slot can only be set when assign_to='character' (only "
+            "characters wear equipment)."
+        )
+
+    # Resolve effective equipped_flag: slot wins if given.
+    equipped_int = 1 if slot is not None else (1 if equipped else 0)
+
     with _get_conn() as conn:
         cur = conn.cursor()
-        # Insert item
+        # Insert item with combat columns
         cur.execute(
-            "INSERT INTO items (campaign_id, name, item_type, magic_flag, value_gp, notes) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (_CAMPAIGN_ID, name, item_type or None, 1 if magic_flag else 0,
-             value_gp, notes or None),
+            "INSERT INTO items "
+            "(campaign_id, name, item_type, magic_flag, value_gp, "
+            " damage_dice, damage_bonus, to_hit_bonus, weapon_type, "
+            " armor_class_bonus, notes) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (_CAMPAIGN_ID, name, item_type or None,
+             1 if magic_flag else 0, value_gp,
+             damage_dice or None, int(damage_bonus or 0),
+             int(to_hit_bonus or 0), weapon_type,
+             int(armor_class_bonus or 0), notes or None),
         )
         item_id = cur.lastrowid
 
-        # Insert inventory row — exactly one FK must be set (enforced by DB CHECK)
+        # If equipping into a specific slot, vacate the current occupant first.
+        if slot is not None and char_id is not None:
+            cur.execute(
+                "UPDATE inventory SET slot = NULL, equipped_flag = 0 "
+                "WHERE character_id = ? AND slot = ?",
+                (char_id, slot),
+            )
+
+        # Insert inventory row — exactly one FK must be set (DB CHECK).
         cur.execute(
-            "INSERT INTO inventory (character_id, location_id, treasury_id, "
-            "item_id, quantity, equipped_flag, notes) VALUES (?, ?, ?, ?, 1, ?, ?)",
+            "INSERT INTO inventory "
+            "(character_id, location_id, treasury_id, item_id, quantity, "
+            " equipped_flag, slot, notes) "
+            "VALUES (?, ?, ?, ?, 1, ?, ?, ?)",
             (char_id, loc_id, treasury_id, item_id,
-             1 if equipped else 0, carry_notes or None),
+             equipped_int, slot, carry_notes or None),
         )
         inv_id = cur.lastrowid
 
     return {
-        "item_id":      item_id,
-        "inventory_id": inv_id,
-        "name":         name,
-        "item_type":    item_type,
-        "magic_flag":   magic_flag,
-        "value_gp":     value_gp,
-        "notes":        notes,
-        "assigned_to":  assign_to,
-        "location_name": location_name,
-        "treasury_name": treasury_name,
-        "equipped":     equipped,
+        "item_id":           item_id,
+        "inventory_id":      inv_id,
+        "name":              name,
+        "item_type":         item_type,
+        "magic_flag":        magic_flag,
+        "value_gp":          value_gp,
+        "damage_dice":       damage_dice,
+        "damage_bonus":      int(damage_bonus or 0),
+        "to_hit_bonus":      int(to_hit_bonus or 0),
+        "weapon_type":       weapon_type,
+        "armor_class_bonus": int(armor_class_bonus or 0),
+        "notes":             notes,
+        "assigned_to":       assign_to,
+        "location_name":     location_name,
+        "treasury_name":     treasury_name,
+        "equipped":          bool(equipped_int),
+        "slot":              slot,
     }
 
 
@@ -9175,4 +9238,538 @@ def db_list_treasury_accounts() -> dict:
         "count":             len(accounts),
         "treasury_total_gp": total_gp,
         "accounts":          accounts,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PHASE 12 — INVENTORY SLOT SYSTEM
+# Equipped-by-slot model · structured combat fields · auto-migration
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Allowed equipment slots. Non-null slot = equipped; one item per slot per
+# character (enforced by db_equip_item, not by a UNIQUE constraint, so the
+# data layer can heal duplicates rather than crash on them).
+_INVENTORY_SLOTS: set[str] = {
+    "mainhand", "offhand", "head", "body", "cloak", "belt",
+    "boots", "gloves", "ring1", "ring2", "neck", "back",
+}
+
+_WEAPON_TYPES: set[str] = {
+    "one_handed", "two_handed", "off_hand", "ranged", "thrown",
+}
+
+# Heuristics for the one-time equipped_flag → slot migration. Keyed against
+# the lowercased item_type string. First match wins.
+_TYPE_KEYWORDS_TO_SLOT: list[tuple[tuple[str, ...], str]] = [
+    (("shield",),                                                "offhand"),
+    (("ring",),                                                  "ring1"),
+    (("amulet", "necklace", "periapt", "pendant", "torc"),       "neck"),
+    (("cloak", "cape", "mantle", "robe"),                        "cloak"),
+    (("helm", "helmet", "cap", "hat", "hood", "circlet", "crown"), "head"),
+    (("boots", "shoes", "sandals", "slippers"),                  "boots"),
+    (("glove", "gauntlet", "bracer"),                            "gloves"),
+    (("belt", "girdle", "sash"),                                 "belt"),
+    (("pack", "quiver", "haversack", "rucksack", "satchel"),     "back"),
+    # Body armor — must come AFTER more specific slot matches above.
+    (("armor", "armour", "plate", "mail", "leather", "studded",
+      "scale", "chain", "padded", "hauberk", "cuirass", "brigandine"), "body"),
+    # Weapons — any of these in item_type maps to mainhand.
+    (("sword", "dagger", "axe", "mace", "bow", "spear", "club",
+      "hammer", "flail", "staff", "wand", "lance", "halberd",
+      "polearm", "trident", "scimitar", "rapier", "morningstar",
+      "warhammer", "pick", "javelin", "sling", "crossbow",
+      "longbow", "shortbow", "weapon"),                          "mainhand"),
+]
+
+
+def _table_has_column(conn, table: str, col: str) -> bool:
+    """True if `table` has a column named `col`."""
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    # PRAGMA table_info rows expose: cid, name, type, notnull, dflt_value, pk
+    return any((r[1] if not isinstance(r, sqlite3.Row) else r["name"]) == col
+               for r in rows)
+
+
+def _classify_type_to_slot(item_type: str | None) -> str | None:
+    """Best-guess slot for an item_type string. Returns None if ambiguous."""
+    if not item_type:
+        return None
+    s = item_type.lower()
+    for keywords, slot in _TYPE_KEYWORDS_TO_SLOT:
+        for kw in keywords:
+            if kw in s:
+                return slot
+    return None
+
+
+def _ensure_inventory_slot_column() -> None:
+    """
+    Idempotently add the inventory.slot column. On first add, migrate every
+    existing equipped_flag=1 row by best-guess from items.item_type:
+      - weapons   → slot='mainhand'
+      - shields   → slot='offhand'
+      - body armor→ slot='body'
+      - etc. per _TYPE_KEYWORDS_TO_SLOT
+    Ambiguous rows are left with slot=NULL and a flag appended to inventory.notes
+    so the player can resolve them via equip_item later. Also enforces the
+    invariant equipped_flag = 1 IFF slot IS NOT NULL.
+    """
+    with _get_conn() as conn:
+        if _table_has_column(conn, "inventory", "slot"):
+            return
+        conn.execute("ALTER TABLE inventory ADD COLUMN slot TEXT")
+
+        # Walk every equipped_flag=1 inventory row and assign a slot.
+        rows = conn.execute(
+            "SELECT inv.inventory_id, inv.character_id, inv.notes, "
+            "       i.item_type, i.name "
+            "FROM inventory inv "
+            "JOIN items i ON i.item_id = inv.item_id "
+            "WHERE inv.equipped_flag = 1 AND inv.character_id IS NOT NULL"
+        ).fetchall()
+
+        # Per-character per-slot occupancy tracking — first hit wins, the
+        # rest get notes-flagged so the player can sort them out manually.
+        seen: dict[tuple[int, str], int] = {}
+
+        for r in rows:
+            inv_id    = r["inventory_id"] if not isinstance(r, tuple) else r[0]
+            char_id   = r["character_id"] if not isinstance(r, tuple) else r[1]
+            old_notes = r["notes"]        if not isinstance(r, tuple) else r[2]
+            item_type = r["item_type"]    if not isinstance(r, tuple) else r[3]
+            item_name = r["name"]         if not isinstance(r, tuple) else r[4]
+
+            slot = _classify_type_to_slot(item_type)
+            ambiguity_note = None
+
+            if slot is None:
+                ambiguity_note = (
+                    f"[migration] was equipped_flag=1 but item_type "
+                    f"{item_type!r} did not map to a slot — manual "
+                    f"equip_item() needed."
+                )
+            elif (char_id, slot) in seen:
+                # Slot already taken by an earlier equipped row for this
+                # character. Leave this one stowed and flag it.
+                prev_inv = seen[(char_id, slot)]
+                ambiguity_note = (
+                    f"[migration] guessed slot={slot!r} for {item_name!r} "
+                    f"but inventory_id={prev_inv} was migrated into that "
+                    f"slot first — pick one via equip_item()."
+                )
+                slot = None
+            else:
+                seen[(char_id, slot)] = inv_id
+
+            new_notes = old_notes
+            if ambiguity_note:
+                new_notes = (
+                    (old_notes + " | " if old_notes else "") + ambiguity_note
+                )
+
+            conn.execute(
+                "UPDATE inventory SET slot = ?, equipped_flag = ?, notes = ? "
+                "WHERE inventory_id = ?",
+                (slot, 1 if slot is not None else 0, new_notes, inv_id),
+            )
+
+        # Cleanup: any row with slot IS NOT NULL must have equipped_flag=1,
+        # any row with slot IS NULL must have equipped_flag=0 (the invariant).
+        conn.execute(
+            "UPDATE inventory SET equipped_flag = 1 "
+            "WHERE slot IS NOT NULL AND equipped_flag = 0"
+        )
+        conn.execute(
+            "UPDATE inventory SET equipped_flag = 0 "
+            "WHERE slot IS NULL AND equipped_flag = 1"
+        )
+
+
+def _ensure_items_combat_columns() -> None:
+    """
+    Idempotently add the five Phase 12 combat columns to items:
+      damage_dice TEXT, damage_bonus INTEGER DEFAULT 0,
+      to_hit_bonus INTEGER DEFAULT 0, weapon_type TEXT,
+      armor_class_bonus INTEGER DEFAULT 0.
+    Each column is added only if missing. Existing rows take the default.
+    """
+    new_cols = [
+        ("damage_dice",       "TEXT"),
+        ("damage_bonus",      "INTEGER DEFAULT 0"),
+        ("to_hit_bonus",      "INTEGER DEFAULT 0"),
+        ("weapon_type",       "TEXT"),
+        ("armor_class_bonus", "INTEGER DEFAULT 0"),
+    ]
+    with _get_conn() as conn:
+        for name, decl in new_cols:
+            if not _table_has_column(conn, "items", name):
+                conn.execute(f"ALTER TABLE items ADD COLUMN {name} {decl}")
+
+
+# ── Item resolution helper ────────────────────────────────────────────────────
+
+def _resolve_inventory_item(
+    char_id: int,
+    item_target: int | str,
+) -> dict:
+    """
+    Resolve item_target → an inventory row owned by char_id.
+
+    item_target rules:
+      int (or numeric string) > 0  → treated as inventory_id directly.
+      str (non-numeric)            → case-insensitive prefix match on items.name
+                                     within this character's inventory.
+
+    Raises ValueError if not found or ambiguous (multiple matches).
+    Returns the full inventory + item joined row as a dict.
+    """
+    with _get_conn(read_only=True) as conn:
+        cur = conn.cursor()
+
+        # Numeric → direct inventory_id lookup.
+        as_int = None
+        if isinstance(item_target, int):
+            as_int = int(item_target)
+        elif isinstance(item_target, str) and item_target.strip().isdigit():
+            as_int = int(item_target.strip())
+        if as_int is not None and as_int > 0:
+            cur.execute(
+                "SELECT inv.*, i.name AS item_name, i.item_type, i.magic_flag, "
+                "       i.value_gp, i.damage_dice, i.damage_bonus, "
+                "       i.to_hit_bonus, i.weapon_type, i.armor_class_bonus, "
+                "       i.notes AS item_notes "
+                "FROM inventory inv JOIN items i ON i.item_id = inv.item_id "
+                "WHERE inv.inventory_id = ? AND inv.character_id = ?",
+                (as_int, char_id),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise ValueError(
+                    f"inventory_id={as_int} not found for character_id={char_id}."
+                )
+            return dict(row)
+
+        # String → name prefix match scoped to this character.
+        s = (str(item_target) or "").strip()
+        if not s:
+            raise ValueError("item_name_or_id is empty.")
+        cur.execute(
+            "SELECT inv.*, i.name AS item_name, i.item_type, i.magic_flag, "
+            "       i.value_gp, i.damage_dice, i.damage_bonus, "
+            "       i.to_hit_bonus, i.weapon_type, i.armor_class_bonus, "
+            "       i.notes AS item_notes "
+            "FROM inventory inv JOIN items i ON i.item_id = inv.item_id "
+            "WHERE inv.character_id = ? AND LOWER(i.name) LIKE LOWER(?) "
+            "ORDER BY inv.inventory_id",
+            (char_id, f"{s}%"),
+        )
+        rows = cur.fetchall()
+    if not rows:
+        raise ValueError(
+            f"No inventory item starting with {s!r} for character_id={char_id}."
+        )
+    if len(rows) > 1:
+        candidates = [
+            f"inventory_id={r['inventory_id']} ({r['item_name']})"
+            for r in rows
+        ]
+        raise ValueError(
+            f"Ambiguous item name {s!r} for character_id={char_id} — "
+            f"matched {len(rows)} rows: {candidates}. "
+            "Pass an exact inventory_id to disambiguate."
+        )
+    return dict(rows[0])
+
+
+# ── equip_item ────────────────────────────────────────────────────────────────
+
+def db_equip_item(
+    character_target: int | str,
+    item_name_or_id:  int | str,
+    slot:             str | None,
+) -> dict:
+    """
+    Set an inventory row's slot, auto-vacating whatever was previously in
+    that slot for this character.
+
+    slot=None unequips the item (sets slot to NULL, equipped_flag to 0).
+
+    Returns:
+      {
+        "character_id":          int,
+        "previously_unequipped": [{...}, ...]  # 0 or 1 row that lost the slot
+        "now_equipped":          {...}         # the item's new state
+        "loadout":               [{slot, name, ...}, ...]  # full equipped list
+      }
+
+    Raises ValueError on bad slot, missing character, missing item, or
+    ambiguous item name.
+    """
+    _ensure_inventory_slot_column()
+    _ensure_items_combat_columns()
+
+    if slot is not None and slot not in _INVENTORY_SLOTS:
+        raise ValueError(
+            f"slot must be one of {sorted(_INVENTORY_SLOTS)} or None to "
+            f"unequip; got {slot!r}."
+        )
+
+    cid = _resolve_character(character_target)
+    if cid is None:
+        raise ValueError(
+            f"character_target {character_target!r} did not resolve — "
+            "use list_characters to discover available names/ids."
+        )
+
+    item_row = _resolve_inventory_item(cid, item_name_or_id)
+    inv_id   = item_row["inventory_id"]
+    cur_slot = item_row.get("slot")
+
+    previously_unequipped: list[dict] = []
+
+    with _get_conn() as conn:
+        cur = conn.cursor()
+
+        # Vacate whatever currently holds the target slot (if any) — but
+        # don't bother if the item being moved is already there.
+        if slot is not None:
+            cur.execute(
+                "SELECT inv.inventory_id, i.name AS item_name "
+                "FROM inventory inv JOIN items i ON i.item_id = inv.item_id "
+                "WHERE inv.character_id = ? AND inv.slot = ? "
+                "  AND inv.inventory_id <> ?",
+                (cid, slot, inv_id),
+            )
+            for r in cur.fetchall():
+                previously_unequipped.append({
+                    "inventory_id": r["inventory_id"],
+                    "name":         r["item_name"],
+                    "from_slot":    slot,
+                })
+                cur.execute(
+                    "UPDATE inventory SET slot = NULL, equipped_flag = 0 "
+                    "WHERE inventory_id = ?",
+                    (r["inventory_id"],),
+                )
+
+        # Apply the new slot to the target item.
+        new_equipped_flag = 1 if slot is not None else 0
+        cur.execute(
+            "UPDATE inventory SET slot = ?, equipped_flag = ? "
+            "WHERE inventory_id = ?",
+            (slot, new_equipped_flag, inv_id),
+        )
+
+    # Re-read the item's full state for the response.
+    refreshed = _resolve_inventory_item(cid, inv_id)
+
+    loadout = db_list_equipped(character_target)
+
+    return {
+        "character_id":          cid,
+        "inventory_id":          inv_id,
+        "previously_unequipped": previously_unequipped,
+        "previous_slot":         cur_slot,
+        "now_equipped": {
+            "inventory_id":      inv_id,
+            "name":              refreshed["item_name"],
+            "slot":              refreshed.get("slot"),
+            "item_type":         refreshed.get("item_type"),
+            "magic_flag":        bool(refreshed.get("magic_flag")),
+            "damage_dice":       refreshed.get("damage_dice"),
+            "damage_bonus":      refreshed.get("damage_bonus") or 0,
+            "to_hit_bonus":      refreshed.get("to_hit_bonus") or 0,
+            "weapon_type":       refreshed.get("weapon_type"),
+            "armor_class_bonus": refreshed.get("armor_class_bonus") or 0,
+        },
+        "loadout":               loadout["slots"],
+    }
+
+
+# ── list_equipped ─────────────────────────────────────────────────────────────
+
+# Slot display order — matches the natural reading order on a character sheet.
+_SLOT_DISPLAY_ORDER: list[str] = [
+    "mainhand", "offhand", "head", "body", "cloak", "belt",
+    "boots", "gloves", "ring1", "ring2", "neck", "back",
+]
+
+
+def _format_combat_summary(row: dict) -> str:
+    """
+    One-line summary used by list_equipped. Examples:
+      '+1 short sword (1d6+1, +1 to hit)'   for a weapon
+      'chainmail (AC bonus 6)'              for armor
+      'cloak of protection (AC bonus 1)'    for misc gear
+    """
+    bits: list[str] = []
+    dmg = row.get("damage_dice")
+    db_ = row.get("damage_bonus") or 0
+    th  = row.get("to_hit_bonus") or 0
+    ac  = row.get("armor_class_bonus") or 0
+
+    if dmg:
+        if db_:
+            bits.append(f"{dmg}{db_:+d}")
+        else:
+            bits.append(dmg)
+    if th:
+        bits.append(f"{th:+d} to hit")
+    if ac:
+        bits.append(f"AC bonus {ac:+d}")
+    return " (" + ", ".join(bits) + ")" if bits else ""
+
+
+def db_list_equipped(character_target: int | str) -> dict:
+    """
+    Return only equipped (slot IS NOT NULL) inventory rows for the target
+    character, organized by slot in display order. Designed for compact
+    mid-combat reference — output is bounded by len(_INVENTORY_SLOTS) = 12.
+
+    Format per slot:
+      {"slot": "mainhand", "name": "+1 short sword",
+       "summary": "mainhand: +1 short sword (1d6+1, +1 to hit)",
+       "inventory_id": ..., "item_type": ..., ...}
+    """
+    _ensure_inventory_slot_column()
+    _ensure_items_combat_columns()
+
+    cid = _resolve_character(character_target)
+    if cid is None:
+        raise ValueError(
+            f"character_target {character_target!r} did not resolve."
+        )
+
+    with _get_conn(read_only=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT inv.inventory_id, inv.slot, inv.notes AS carry_notes, "
+            "       i.item_id, i.name, i.item_type, i.magic_flag, "
+            "       i.damage_dice, i.damage_bonus, i.to_hit_bonus, "
+            "       i.weapon_type, i.armor_class_bonus, i.notes AS item_notes "
+            "FROM inventory inv JOIN items i ON i.item_id = inv.item_id "
+            "WHERE inv.character_id = ? AND inv.slot IS NOT NULL",
+            (cid,),
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+
+    by_slot: dict[str, dict] = {r["slot"]: r for r in rows}
+
+    slots: list[dict] = []
+    for slot in _SLOT_DISPLAY_ORDER:
+        if slot not in by_slot:
+            continue
+        r = by_slot[slot]
+        summary_tail = _format_combat_summary(r)
+        slots.append({
+            "slot":              slot,
+            "inventory_id":      r["inventory_id"],
+            "item_id":           r["item_id"],
+            "name":              r["name"],
+            "item_type":         r["item_type"],
+            "magic_flag":        bool(r["magic_flag"]),
+            "damage_dice":       r["damage_dice"],
+            "damage_bonus":      r["damage_bonus"] or 0,
+            "to_hit_bonus":      r["to_hit_bonus"] or 0,
+            "weapon_type":       r["weapon_type"],
+            "armor_class_bonus": r["armor_class_bonus"] or 0,
+            "summary":           f"{slot}: {r['name']}{summary_tail}",
+        })
+
+    # Surface unknown / extra slots that aren't in the canonical order.
+    extras = [s for s in by_slot if s not in _SLOT_DISPLAY_ORDER]
+    for slot in extras:
+        r = by_slot[slot]
+        slots.append({
+            "slot":         slot,
+            "inventory_id": r["inventory_id"],
+            "name":         r["name"],
+            "summary":      f"{slot}: {r['name']} [non-standard slot]",
+        })
+
+    return {
+        "character_id": cid,
+        "count":        len(slots),
+        "slots":        slots,
+    }
+
+
+# ── list_inventory ────────────────────────────────────────────────────────────
+
+def db_list_inventory(
+    character_target: int | str,
+    magic_only:       bool = False,
+    equipped_only:    bool = False,
+) -> dict:
+    """
+    Return one character's inventory with optional filters. Solves the
+    'get_character_state is too large mid-session' problem.
+
+    Each row carries: inventory_id, item_id, name, item_type, magic_flag,
+    value_gp, slot, quantity, damage_dice, damage_bonus, to_hit_bonus,
+    weapon_type, armor_class_bonus, item_notes, carry_notes.
+
+    Filters:
+      magic_only=True    → only items with magic_flag=1
+      equipped_only=True → only items with slot IS NOT NULL
+    """
+    _ensure_inventory_slot_column()
+    _ensure_items_combat_columns()
+
+    cid = _resolve_character(character_target)
+    if cid is None:
+        raise ValueError(
+            f"character_target {character_target!r} did not resolve."
+        )
+
+    where = ["inv.character_id = ?"]
+    params: list = [cid]
+    if magic_only:
+        where.append("i.magic_flag = 1")
+    if equipped_only:
+        where.append("inv.slot IS NOT NULL")
+
+    sql = (
+        "SELECT inv.inventory_id, inv.quantity, inv.slot, inv.equipped_flag, "
+        "       inv.notes AS carry_notes, "
+        "       i.item_id, i.name, i.item_type, i.magic_flag, i.value_gp, "
+        "       i.damage_dice, i.damage_bonus, i.to_hit_bonus, "
+        "       i.weapon_type, i.armor_class_bonus, i.notes AS item_notes "
+        "FROM inventory inv JOIN items i ON i.item_id = inv.item_id "
+        f"WHERE {' AND '.join(where)} "
+        # Equipped first, then by slot order, then by name.
+        "ORDER BY (inv.slot IS NULL), i.name"
+    )
+    with _get_conn(read_only=True) as conn:
+        cur = conn.cursor()
+        cur.execute(sql, tuple(params))
+        rows = [dict(r) for r in cur.fetchall()]
+
+    items: list[dict] = []
+    for r in rows:
+        items.append({
+            "inventory_id":      r["inventory_id"],
+            "item_id":           r["item_id"],
+            "name":              r["name"],
+            "item_type":         r["item_type"],
+            "magic_flag":        bool(r["magic_flag"]),
+            "value_gp":          r["value_gp"],
+            "slot":              r["slot"],
+            "equipped":          bool(r["equipped_flag"] or r["slot"]),
+            "quantity":          r["quantity"] or 1,
+            "damage_dice":       r["damage_dice"],
+            "damage_bonus":      r["damage_bonus"] or 0,
+            "to_hit_bonus":      r["to_hit_bonus"] or 0,
+            "weapon_type":       r["weapon_type"],
+            "armor_class_bonus": r["armor_class_bonus"] or 0,
+            "item_notes":        r["item_notes"],
+            "carry_notes":       r["carry_notes"],
+        })
+
+    return {
+        "character_id":  cid,
+        "magic_only":    bool(magic_only),
+        "equipped_only": bool(equipped_only),
+        "count":         len(items),
+        "items":         items,
     }

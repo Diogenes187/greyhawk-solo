@@ -488,6 +488,7 @@ CREATE TABLE inventory (
     item_id INTEGER NOT NULL,
     quantity INTEGER DEFAULT 1,
     equipped_flag INTEGER DEFAULT 0,
+    slot TEXT,                              -- mainhand|offhand|head|body|cloak|belt|boots|gloves|ring1|ring2|neck|back, or NULL = stowed. Non-null slot is the source of truth for equipped state; equipped_flag is kept in sync (1 iff slot IS NOT NULL).
     notes TEXT,
     FOREIGN KEY (character_id) REFERENCES characters(character_id),
     FOREIGN KEY (location_id) REFERENCES locations(location_id),
@@ -503,6 +504,11 @@ CREATE TABLE items (
     item_type TEXT,
     magic_flag INTEGER DEFAULT 0,
     value_gp INTEGER,
+    damage_dice TEXT,                       -- e.g. '1d6', '2d4'; null for non-weapons
+    damage_bonus INTEGER DEFAULT 0,         -- +N to damage rolls (magic, str, etc.)
+    to_hit_bonus INTEGER DEFAULT 0,         -- +N to attack rolls
+    weapon_type TEXT,                       -- one_handed|two_handed|off_hand|ranged|thrown; null for non-weapons
+    armor_class_bonus INTEGER DEFAULT 0,    -- AC contribution (e.g. 6 for chainmail; subtract from AC10 baseline)
     notes TEXT,
     FOREIGN KEY (campaign_id) REFERENCES campaigns(campaign_id)
 );

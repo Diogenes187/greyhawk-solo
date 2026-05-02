@@ -29,7 +29,10 @@ Tools exposed:
   update_troop_count       -- Set or adjust count on a troop group
   add_troop_group          -- Insert a new troop group (optionally with commander)
   add_livestock            -- Insert a new livestock row at a location
-  add_item                 -- Create an item and assign it to inventory
+  add_item                 -- Create an item and assign it to inventory (with combat fields)
+  equip_item               -- Set a character's inventory item into a slot
+  list_equipped            -- Compact slot-by-slot loadout for mid-combat reference
+  list_inventory           -- Per-character inventory with magic_only/equipped_only filters
   update_world_fact        -- Upsert a campaign fact in world_facts
   update_npc               -- Change notes, status, race, alignment on an NPC
   add_npc                  -- Add a new NPC and optional relationship to Theron
@@ -358,6 +361,14 @@ from engine.db import (
     # Phase 10 — treasury account create/list
     db_add_treasury_account,
     db_list_treasury_accounts,
+    # Phase 12 — equipment slot system
+    db_equip_item,
+    db_list_equipped,
+    db_list_inventory,
+    _INVENTORY_SLOTS,
+    _WEAPON_TYPES,
+    _ensure_inventory_slot_column,
+    _ensure_items_combat_columns,
     # Phase 4 — domain
     get_full_domain_state,
     db_add_construction_project,
@@ -1289,7 +1300,7 @@ def add_item(
     notes: Annotated[str, "Description, enchantment details, provenance, etc."] = "",
     assign_to: Annotated[
         str,
-        "Where to put the item: 'character' (Theron's personal inventory), "
+        "Where to put the item: 'character' (the PC's personal inventory), "
         "'location' (stored at a realm location), or 'treasury' (in a treasury account).",
     ] = "character",
     location_name: Annotated[
@@ -1300,15 +1311,58 @@ def add_item(
         str,
         "Required when assign_to='treasury'. Partial name match.",
     ] = "",
-    equipped: Annotated[bool, "True if Theron is wearing/wielding this item right now."] = False,
+    equipped: Annotated[
+        bool,
+        "Legacy: marks the item equipped without assigning a specific slot. "
+        "Prefer the slot parameter; equipped is honored only when slot is empty.",
+    ] = False,
     carry_notes: Annotated[str, "How it's carried: 'Worn', 'In pack', 'Sheathed', etc."] = "",
+    # ── Phase 12 structured combat fields ──
+    damage_dice: Annotated[
+        str,
+        "Damage dice expression for weapons, e.g. '1d6', '2d4', '1d8'. "
+        "Leave blank for non-weapons.",
+    ] = "",
+    damage_bonus: Annotated[
+        int,
+        "Flat +N to damage rolls (magic enhancement, ability bonus baked in, etc.).",
+    ] = 0,
+    to_hit_bonus: Annotated[
+        int,
+        "Flat +N to attack rolls.",
+    ] = 0,
+    weapon_type: Annotated[
+        str,
+        "Weapon category: one_handed | two_handed | off_hand | ranged | thrown. "
+        "Leave blank for non-weapons.",
+    ] = "",
+    armor_class_bonus: Annotated[
+        int,
+        "AC contribution. For armor: the AD&D AC value the piece provides "
+        "(e.g. 6 for chainmail). For misc gear: a +N defensive bonus.",
+    ] = 0,
+    slot: Annotated[
+        str,
+        "Equip the new item directly into this slot (character-only). One of: "
+        "mainhand, offhand, head, body, cloak, belt, boots, gloves, ring1, "
+        "ring2, neck, back. Leave blank to stow. Auto-vacates any prior "
+        "occupant of the slot.",
+    ] = "",
 ) -> dict:
     """
     Create a new item and place it in an inventory.
 
-    Use this when Theron acquires new gear, loots a defeated enemy, commissions
-    equipment, or when a realm asset (siege engine, stored supplies) needs to
-    be tracked.
+    Use when the PC acquires new gear, loots a defeated enemy, commissions
+    equipment, or when a realm asset (siege engine, stored supplies) needs
+    to be tracked.
+
+    Combat fields (damage_dice / damage_bonus / to_hit_bonus / weapon_type /
+    armor_class_bonus) are written into the items table so they can drive
+    attack/AC math without re-parsing the notes field.
+
+    slot equips the item directly at insert time (only when assign_to=
+    'character'). Pass it for known-equipped purchases like 'a +1 cloak
+    of protection put straight on'.
 
     Returns item_id, inventory_id, and assignment details as confirmation.
     """
@@ -1319,6 +1373,12 @@ def add_item(
             location_name=location_name or None,
             treasury_name=treasury_name or None,
             equipped=equipped, carry_notes=carry_notes,
+            damage_dice=(damage_dice or None),
+            damage_bonus=damage_bonus,
+            to_hit_bonus=to_hit_bonus,
+            weapon_type=(weapon_type or None),
+            armor_class_bonus=armor_class_bonus,
+            slot=(slot or None),
         )
         return {"created": True, **result}
     except ValueError as e:
@@ -5392,9 +5452,28 @@ def update_class_level(
 # TOOL: update_inventory_item
 # ══════════════════════════════════════════════════════════════════════════════
 
+# Fields that live on the inventory table itself.
 _INVENTORY_EDITABLE = {
-    "quantity", "equipped_flag", "notes",
+    "quantity", "equipped_flag", "slot", "notes",
     "character_id", "location_id", "treasury_id", "item_id",
+}
+
+# Fields that live on the items table — update_inventory_item routes these
+# to the linked items row instead of the inventory row.
+_ITEM_EDITABLE_VIA_INVENTORY = {
+    "name", "item_type", "magic_flag", "value_gp",
+    "damage_dice", "damage_bonus", "to_hit_bonus",
+    "weapon_type", "armor_class_bonus",
+    "item_notes",   # alias for items.notes (to disambiguate from inventory.notes)
+}
+
+_INVENTORY_INT_FIELDS = {
+    "quantity", "equipped_flag", "character_id", "location_id",
+    "treasury_id", "item_id",
+}
+_ITEM_INT_FIELDS = {
+    "magic_flag", "value_gp", "damage_bonus", "to_hit_bonus",
+    "armor_class_bonus",
 }
 
 
@@ -5406,14 +5485,19 @@ def update_inventory_item(
     ],
     field: Annotated[
         str,
-        "Column to update. One of: quantity, equipped_flag, notes, "
-        "character_id, location_id, treasury_id, item_id.",
+        "Column to update. Inventory fields: quantity, equipped_flag, slot, "
+        "notes, character_id, location_id, treasury_id, item_id. Item fields "
+        "(routed to the linked items row): name, item_type, magic_flag, "
+        "value_gp, damage_dice, damage_bonus, to_hit_bonus, weapon_type, "
+        "armor_class_bonus, item_notes.",
     ],
     new_value: Annotated[
         str,
-        "New value as a string. Numeric fields (quantity, equipped_flag, "
-        "*_id) are parsed as ints; for NULL pass the literal string 'null'. "
-        "For booleans, use '1' / '0' in equipped_flag.",
+        "New value as a string. Integer fields are parsed as ints; for NULL "
+        "pass the literal string 'null'. For booleans (magic_flag, "
+        "equipped_flag) use '1' / '0'. slot must be one of: mainhand, "
+        "offhand, head, body, cloak, belt, boots, gloves, ring1, ring2, "
+        "neck, back, or 'null' to unequip.",
     ],
     reason: Annotated[
         str,
@@ -5421,30 +5505,59 @@ def update_inventory_item(
     ] = "",
 ) -> dict:
     """
-    Update one field on a single inventory row.
+    Update one field on a single inventory or item row.
 
-    To change multiple fields, call this tool once per field. The
-    companion tool remove_inventory_item deletes a row entirely. Every
-    edit is recorded in world_facts under category 'edit_log'.
+    Field-routing: inventory-table fields update the inventory row directly;
+    item-table fields update the linked items row (so a single tool serves
+    both layers). To change multiple fields, call this tool once per field.
+    The companion tool remove_inventory_item deletes an inventory row
+    entirely. Every edit is recorded in world_facts under category
+    'edit_log'.
+
+    Slot semantics: when field='slot' and the new value is non-null, the
+    invariant 'equipped_flag = 1 IFF slot IS NOT NULL' is enforced — the
+    inventory row's equipped_flag is auto-synced. Setting slot='null'
+    likewise clears equipped_flag. To re-slot an item with auto-vacate of
+    the previous occupant, prefer the equip_item tool.
     """
-    if field not in _INVENTORY_EDITABLE:
+    is_inv_field  = field in _INVENTORY_EDITABLE
+    is_item_field = field in _ITEM_EDITABLE_VIA_INVENTORY
+    if not (is_inv_field or is_item_field):
         return {
-            "error":   f"Field {field!r} is not editable via this tool.",
-            "allowed": sorted(_INVENTORY_EDITABLE),
+            "error": f"Field {field!r} is not editable via this tool.",
+            "allowed_inventory_fields": sorted(_INVENTORY_EDITABLE),
+            "allowed_item_fields":      sorted(_ITEM_EDITABLE_VIA_INVENTORY),
         }
 
-    # Coerce the value
+    # Coerce the new_value to its native type.
     parsed: object
     if new_value.strip().lower() == "null":
         parsed = None
-    elif field in {"quantity", "equipped_flag",
-                   "character_id", "location_id", "treasury_id", "item_id"}:
+    elif field in _INVENTORY_INT_FIELDS or field in _ITEM_INT_FIELDS:
         try:
             parsed = int(new_value)
         except ValueError:
             return {"error": f"{field} requires an integer, got {new_value!r}."}
     else:
         parsed = new_value
+
+    # Slot validation (inventory.slot only).
+    if field == "slot" and parsed is not None:
+        if parsed not in _INVENTORY_SLOTS:
+            return {
+                "error": f"slot must be one of {sorted(_INVENTORY_SLOTS)} or 'null'; got {new_value!r}.",
+            }
+
+    # weapon_type validation (items.weapon_type).
+    if field == "weapon_type" and parsed is not None:
+        if parsed not in _WEAPON_TYPES:
+            return {
+                "error": f"weapon_type must be one of {sorted(_WEAPON_TYPES)} or 'null'; got {new_value!r}.",
+            }
+
+    # Make sure the schema has the new columns before we touch them.
+    _ensure_inventory_slot_column()
+    _ensure_items_combat_columns()
 
     try:
         conn = _open_writable_active()
@@ -5459,23 +5572,73 @@ def update_inventory_item(
         if not row:
             return {"error": f"No inventory row with inventory_id={inventory_id}."}
 
-        old = row[field]
+        if is_inv_field:
+            old = row[field]
+            if old == parsed:
+                return {"ok": True, "unchanged": True, "inventory_id": inventory_id}
+
+            with conn:
+                conn.execute(
+                    f"UPDATE inventory SET {field} = ? WHERE inventory_id = ?",
+                    (parsed, inventory_id),
+                )
+                # Sync the slot/equipped_flag invariant when either changes.
+                if field == "slot":
+                    conn.execute(
+                        "UPDATE inventory SET equipped_flag = ? "
+                        "WHERE inventory_id = ?",
+                        (1 if parsed is not None else 0, inventory_id),
+                    )
+                _log_edit(conn, "update_inventory_item", "inventory",
+                          inventory_id,
+                          [{"field": field, "old": old, "new": parsed}],
+                          reason)
+            return {
+                "ok":           True,
+                "inventory_id": inventory_id,
+                "table":        "inventory",
+                "field":        field,
+                "old":          old,
+                "new":          parsed,
+            }
+
+        # ── Item-table routing ───────────────────────────────────────────────
+        item_id = row["item_id"]
+        # 'item_notes' is the param-level alias for items.notes (to keep it
+        # disambiguated from inventory.notes at the tool boundary).
+        sql_field = "notes" if field == "item_notes" else field
+
+        item_row = conn.execute(
+            "SELECT * FROM items WHERE item_id = ?",
+            (item_id,),
+        ).fetchone()
+        if not item_row:
+            return {"error": f"Linked items row item_id={item_id} not found."}
+
+        old = item_row[sql_field]
         if old == parsed:
-            return {"ok": True, "unchanged": True, "inventory_id": inventory_id}
+            return {
+                "ok":           True,
+                "unchanged":    True,
+                "inventory_id": inventory_id,
+                "item_id":      item_id,
+            }
 
         with conn:
             conn.execute(
-                f"UPDATE inventory SET {field} = ? WHERE inventory_id = ?",
-                (parsed, inventory_id),
+                f"UPDATE items SET {sql_field} = ? WHERE item_id = ?",
+                (parsed, item_id),
             )
-            _log_edit(conn, "update_inventory_item", "inventory",
-                      inventory_id,
-                      [{"field": field, "old": old, "new": parsed}],
+            _log_edit(conn, "update_inventory_item", "items",
+                      item_id,
+                      [{"field": sql_field, "old": old, "new": parsed}],
                       reason)
         return {
             "ok":           True,
             "inventory_id": inventory_id,
-            "field":        field,
+            "item_id":      item_id,
+            "table":        "items",
+            "field":        sql_field,
             "old":          old,
             "new":          parsed,
         }
@@ -5813,6 +5976,140 @@ def direct_db_edit(
         }
     finally:
         conn.close()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TOOL: equip_item
+# ══════════════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def equip_item(
+    character_target: Annotated[
+        str,
+        "Character to equip — name (case-insensitive prefix match) or "
+        "numeric character_id. Pass an exact id when names are ambiguous.",
+    ],
+    item_name_or_id: Annotated[
+        str,
+        "Item to equip — partial item name (within this character's "
+        "inventory) or numeric inventory_id. Names are matched case-"
+        "insensitively as a prefix; ambiguous matches return an error "
+        "listing the candidates so the caller can pass an exact "
+        "inventory_id.",
+    ],
+    slot: Annotated[
+        str,
+        "Target slot — one of: mainhand, offhand, head, body, cloak, belt, "
+        "boots, gloves, ring1, ring2, neck, back. Pass empty string or "
+        "'null' to unequip (set slot=NULL).",
+    ],
+) -> dict:
+    """
+    Set a character's inventory item into a specific equipment slot.
+
+    Auto-vacates whatever previously held that slot for the character —
+    the displaced item drops back to slot=NULL (stowed) but stays in the
+    inventory. Pass slot='' or 'null' to simply unequip the item.
+
+    Returns a dict with:
+      previously_unequipped — array of items that were vacated (0 or 1)
+      previous_slot         — the slot the equipped item came from (or null)
+      now_equipped          — full state of the newly-equipped item
+      loadout               — current full slot loadout (compact summary)
+
+    The equipped_flag column is auto-synced (1 iff slot IS NOT NULL).
+    """
+    slot_norm: str | None = (slot or "").strip()
+    if slot_norm == "" or slot_norm.lower() == "null":
+        slot_norm = None
+
+    try:
+        result = db_equip_item(
+            character_target=character_target,
+            item_name_or_id=item_name_or_id,
+            slot=slot_norm,
+        )
+        return {"ok": True, **result}
+    except ValueError as e:
+        return {"error": str(e)}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TOOL: list_equipped
+# ══════════════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def list_equipped(
+    character_target: Annotated[
+        str,
+        "Character to inspect — name (case-insensitive prefix match) or "
+        "numeric character_id.",
+    ],
+) -> dict:
+    """
+    Return ONLY equipped (slot IS NOT NULL) inventory rows organized by
+    slot in the natural reading order.
+
+    Output is bounded by 12 lines (one per canonical slot) — small enough
+    to keep loaded mid-combat without burning context. Each entry includes
+    a one-line summary like 'mainhand: +1 short sword (1d6+1, +1 to hit)'
+    plus the full structured combat fields for math.
+
+    Use this any time you need 'what is the PC actually wielding/wearing
+    right now?' without the full get_character_state payload.
+    """
+    try:
+        return db_list_equipped(character_target=character_target)
+    except ValueError as e:
+        return {"error": str(e)}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TOOL: list_inventory
+# ══════════════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def list_inventory(
+    character_target: Annotated[
+        str,
+        "Character to inspect — name (case-insensitive prefix match) or "
+        "numeric character_id.",
+    ],
+    magic_only: Annotated[
+        bool,
+        "If true, return only items with magic_flag=1. Combine with "
+        "equipped_only for an instant 'magic items currently worn' view.",
+    ] = False,
+    equipped_only: Annotated[
+        bool,
+        "If true, return only items with a non-null slot. More detailed "
+        "than list_equipped — includes value, weight notes, carry_notes, "
+        "etc.",
+    ] = False,
+) -> dict:
+    """
+    Return one character's inventory as a focused, filterable list.
+
+    Solves the 'get_character_state is too large mid-session' problem.
+    Each row carries inventory_id, item_id, name, item_type, magic_flag,
+    value_gp, slot, equipped, quantity, the full combat fields
+    (damage_dice, damage_bonus, to_hit_bonus, weapon_type,
+    armor_class_bonus), item_notes, and carry_notes.
+
+    Filters:
+      magic_only=True    → only magic items (instant magic-item list)
+      equipped_only=True → only currently-equipped items (more detail than
+                          list_equipped — useful when you also need
+                          item_notes / value / quantity)
+    """
+    try:
+        return db_list_inventory(
+            character_target=character_target,
+            magic_only=bool(magic_only),
+            equipped_only=bool(equipped_only),
+        )
+    except ValueError as e:
+        return {"error": str(e)}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
