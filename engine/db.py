@@ -635,9 +635,17 @@ def add_troop_group(
     count: int,
     location_name: str,
     notes: str = "",
+    commander_character_id: int | None = None,
+    commander_name: str | None = None,
 ) -> dict:
     """
-    Insert a new troop group at a given location. Returns the new troop row.
+    Insert a new troop group at a given location.
+
+    If commander_character_id is given (>0), it is used directly after a
+    sanity check that the character row exists. If commander_name is given
+    instead, the character is looked up by case-insensitive prefix match.
+    If both are given the explicit id wins. Returns the new troop row,
+    including the resolved commander name where one is linked.
     """
     if count < 0:
         raise ValueError("Count cannot be negative.")
@@ -654,12 +662,47 @@ def add_troop_group(
             raise ValueError(f"Location '{location_name}' not found.")
         loc_id = row["location_id"]
 
+    # Resolve commander → character_id (id wins over name when both given).
+    cmd_id: int | None = None
+    if commander_character_id is not None and int(commander_character_id) > 0:
+        cmd_id = int(commander_character_id)
+        with _get_conn(read_only=True) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT character_id FROM characters "
+                "WHERE character_id = ? AND campaign_id = ?",
+                (cmd_id, _CAMPAIGN_ID),
+            )
+            if not cur.fetchone():
+                raise ValueError(
+                    f"commander_character_id={cmd_id} not found in characters."
+                )
+    elif commander_name and commander_name.strip():
+        with _get_conn(read_only=True) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT character_id, name FROM characters "
+                "WHERE LOWER(name) LIKE LOWER(?) AND campaign_id = ? LIMIT 1",
+                (f"{commander_name.strip()}%", _CAMPAIGN_ID),
+            )
+            row = cur.fetchone()
+        if not row:
+            raise ValueError(
+                f"Commander '{commander_name}' not found in characters — "
+                "use list_characters to discover the right name or pass "
+                "commander_character_id directly."
+            )
+        cmd_id = row["character_id"]
+
     with _get_conn() as conn:
         cur = conn.cursor()
         cur.execute(
-            "INSERT INTO troops (campaign_id, location_id, group_name, troop_type, count, notes) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (_CAMPAIGN_ID, loc_id, group_name, troop_type, count, notes or None),
+            "INSERT INTO troops "
+            "(campaign_id, location_id, group_name, troop_type, count, "
+            " commander_character_id, notes) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (_CAMPAIGN_ID, loc_id, group_name, troop_type, count,
+             cmd_id, notes or None),
         )
         new_id = cur.lastrowid
 
@@ -667,9 +710,74 @@ def add_troop_group(
         cur = conn.cursor()
         cur.execute(
             "SELECT t.troop_id, t.group_name, t.troop_type, t.count, "
+            "t.commander_character_id, c.name AS commander, "
             "l.name AS location, t.notes "
-            "FROM troops t LEFT JOIN locations l ON l.location_id = t.location_id "
+            "FROM troops t "
+            "LEFT JOIN locations l ON l.location_id = t.location_id "
+            "LEFT JOIN characters c ON c.character_id = t.commander_character_id "
             "WHERE t.troop_id = ?",
+            (new_id,),
+        )
+        return _row_to_dict(cur.fetchone())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# WRITE — LIVESTOCK
+# ══════════════════════════════════════════════════════════════════════════════
+
+def add_livestock(
+    animal_type:   str,
+    count:         int,
+    location_name: str,
+    notes:         str | None = None,
+) -> dict:
+    """
+    Insert a new livestock row at a given location. Resolves location_name
+    via case-insensitive prefix match against the locations table; raises
+    ValueError if the location is missing or the count is negative.
+    Returns the new livestock row including the joined location_name.
+    """
+    if not animal_type or not animal_type.strip():
+        raise ValueError("animal_type is required and may not be empty.")
+    try:
+        n = int(count)
+    except (TypeError, ValueError):
+        raise ValueError("count must be an integer.")
+    if n < 0:
+        raise ValueError("Count cannot be negative.")
+
+    notes_val = notes if (notes is not None and notes != "") else None
+
+    with _get_conn(read_only=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT location_id, name FROM locations "
+            "WHERE LOWER(name) LIKE LOWER(?) AND campaign_id = ? LIMIT 1",
+            (f"{(location_name or '').strip()}%", _CAMPAIGN_ID),
+        )
+        row = cur.fetchone()
+    if not row:
+        raise ValueError(f"Location '{location_name}' not found.")
+    loc_id = row["location_id"]
+
+    with _get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO livestock "
+            "(campaign_id, location_id, animal_type, count, notes) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (_CAMPAIGN_ID, loc_id, animal_type.strip(), n, notes_val),
+        )
+        new_id = cur.lastrowid
+
+    with _get_conn(read_only=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT li.livestock_id, li.animal_type, li.count, li.location_id, "
+            "li.notes, l.name AS location_name "
+            "FROM livestock li "
+            "LEFT JOIN locations l ON l.location_id = li.location_id "
+            "WHERE li.livestock_id = ?",
             (new_id,),
         )
         return _row_to_dict(cur.fetchone())
@@ -2340,12 +2448,177 @@ def db_add_construction_project(
     }
 
 
+def _read_income_canon() -> dict | None:
+    """
+    Read the most-recent world_facts row in category 'income_canon' and
+    return a structured income override, or None if absent / unparseable.
+
+    Two storage formats are supported:
+
+    1. JSON (preferred for new campaigns) — fact_text is a JSON object with:
+         {
+           "monthly_gross_gp": 13278,           # required
+           "monthly_net_gp":   9730,            # optional
+           "source":           "free text",     # optional
+           "breakdown": [                       # optional
+             {"label": "Chendl circuit (gross)", "monthly_gp": 5786},
+             ...
+           ]
+         }
+
+    2. Free text (the human-authored canon convention) — fact_text contains
+       a line like 'GROSS MONTHLY INCOME: ~13,278 gp' and optionally
+       'NET MONTHLY SURPLUS ... ~9,730 gp'. The first matched gross figure
+       wins; the net figure is captured if present.
+
+    Returns a dict with at least monthly_gross_gp on success, plus an
+    'income_source' label describing how the figure was obtained.
+    """
+    with _get_conn(read_only=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT world_fact_id, fact_text FROM world_facts "
+            "WHERE campaign_id = ? AND category = 'income_canon' "
+            "ORDER BY world_fact_id DESC LIMIT 1",
+            (_CAMPAIGN_ID,),
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
+
+    text = row["fact_text"] or ""
+    fact_id = row["world_fact_id"]
+
+    # 1. JSON path
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict) and isinstance(
+            data.get("monthly_gross_gp"), (int, float)
+        ):
+            return {
+                "monthly_gross_gp":  int(data["monthly_gross_gp"]),
+                "monthly_net_gp":    (int(data["monthly_net_gp"])
+                                      if isinstance(data.get("monthly_net_gp"),
+                                                    (int, float)) else None),
+                "source":            data.get("source"),
+                "breakdown":         data.get("breakdown") or [],
+                "income_source":     "income_canon (json)",
+                "world_fact_id":     fact_id,
+            }
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    # 2. Free-text regex path
+    gross_pat = re.compile(
+        r"GROSS\s+MONTHLY\s+INCOME[^0-9]*([\d,]+)\s*gp",
+        re.IGNORECASE,
+    )
+    net_pat   = re.compile(
+        r"NET\s+MONTHLY\s+SURPLUS[^0-9]*([\d,]+)\s*gp",
+        re.IGNORECASE,
+    )
+    g = gross_pat.search(text)
+    if not g:
+        # Try a more permissive monthly_gross_gp: 13278 form if someone
+        # wrote a JSON-ish line without wrapping the whole text in JSON.
+        g = re.search(r"monthly[_ ]gross[_ ]gp[^0-9]*([\d,]+)", text, re.IGNORECASE)
+    if not g:
+        return None
+    try:
+        gross = int(g.group(1).replace(",", ""))
+    except ValueError:
+        return None
+    net = None
+    n_m = net_pat.search(text)
+    if n_m:
+        try:
+            net = int(n_m.group(1).replace(",", ""))
+        except ValueError:
+            pass
+    return {
+        "monthly_gross_gp": gross,
+        "monthly_net_gp":   net,
+        "source":           None,
+        "breakdown":        [],
+        "income_source":    "income_canon (text)",
+        "world_fact_id":    fact_id,
+    }
+
+
 def db_collect_income(months: int = 1) -> dict:
     """
-    Roll income for all active holdings for the given number of months.
-    Records each entry in domain_income_expenses.
-    Returns per-holding breakdown and totals.
+    Compute income for the given number of months.
+
+    Resolution order:
+
+    1. world_facts category 'income_canon' is checked first. If present and
+       parseable (JSON or free-text monthly figure), it overrides the
+       per-holding income table — appropriate for trade-circuit-driven
+       economies where _HOLDING_INCOME_RATE underestimates by orders of
+       magnitude. The total is monthly_gross_gp × months and the breakdown
+       is taken from the canon (or a single 'Per income_canon' line if no
+       breakdown is given).
+    2. Otherwise falls back to rolling each active holding's income range
+       from _HOLDING_INCOME_RATE — the original behavior, suitable for
+       Theron-style realms where holdings are the primary income source.
+
+    Records the resulting total in domain_income_expenses either way.
     """
+    canon = _read_income_canon()
+    if canon and canon.get("monthly_gross_gp"):
+        gross_per_month = int(canon["monthly_gross_gp"])
+        total_gp = gross_per_month * max(int(months), 1)
+
+        # Build a per-line breakdown — either from the canon's own breakdown
+        # array, or a single summary line if the canon is gross-only.
+        breakdown: list[dict] = []
+        if canon.get("breakdown"):
+            for line in canon["breakdown"]:
+                if not isinstance(line, dict):
+                    continue
+                line_monthly = int(line.get("monthly_gp", 0) or 0)
+                breakdown.append({
+                    "source":      "income_canon",
+                    "label":       line.get("label", "(unlabeled)"),
+                    "monthly_gp":  line_monthly,
+                    "months":      months,
+                    "total_gp":    line_monthly * max(int(months), 1),
+                })
+        else:
+            breakdown.append({
+                "source":     "income_canon",
+                "label":      "Per income_canon (gross monthly aggregate)",
+                "monthly_gp": gross_per_month,
+                "months":     months,
+                "total_gp":   total_gp,
+            })
+
+        _record_ledger_entry(
+            entry_type="income",
+            amount_gp=total_gp,
+            description=(
+                f"Domain income — {months} month{'s' if months > 1 else ''} "
+                f"per income_canon (world_fact_id={canon['world_fact_id']})"
+            ),
+        )
+
+        return {
+            "months":             months,
+            "income_source":      canon["income_source"],
+            "monthly_gross_gp":   gross_per_month,
+            "monthly_net_gp":     canon.get("monthly_net_gp"),
+            "world_fact_id":      canon["world_fact_id"],
+            "holdings_rolled":    0,
+            "breakdown":          breakdown,
+            "total_gp":           total_gp,
+            "note": (
+                "income_canon overrides per-holding income rates. "
+                "Set credit_treasury=False on the MCP layer if you want "
+                "to review before crediting."
+            ),
+        }
+
+    # ── Fallback: original per-holding income roll ───────────────────────────
     with _get_conn(read_only=True) as conn:
         cur = conn.cursor()
         cur.execute(
@@ -2355,8 +2628,7 @@ def db_collect_income(months: int = 1) -> dict:
         )
         locations = [dict(r) for r in cur.fetchall()]
 
-    # Determine which accounts to credit (use treasury_id=1 as default)
-    breakdown: list[dict] = []
+    breakdown = []
     total_gp = 0
 
     income_active_statuses = {
@@ -2409,6 +2681,7 @@ def db_collect_income(months: int = 1) -> dict:
 
     return {
         "months":          months,
+        "income_source":   "per-holding rolls (_HOLDING_INCOME_RATE)",
         "holdings_rolled": len(breakdown),
         "breakdown":       breakdown,
         "total_gp":        total_gp,

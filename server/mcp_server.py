@@ -27,7 +27,8 @@ Tools exposed:
   add_location             -- Insert a new location into the realm
   update_location_status   -- Change status/notes on an existing location
   update_troop_count       -- Set or adjust count on a troop group
-  add_troop_group          -- Insert a new troop group
+  add_troop_group          -- Insert a new troop group (optionally with commander)
+  add_livestock            -- Insert a new livestock row at a location
   add_item                 -- Create an item and assign it to inventory
   update_world_fact        -- Upsert a campaign fact in world_facts
   update_npc               -- Change notes, status, race, alignment on an NPC
@@ -292,6 +293,7 @@ from engine.db import (
     update_location_status   as db_update_location_status,
     update_troop_count       as db_update_troop_count,
     add_troop_group          as db_add_troop_group,
+    add_livestock            as db_add_livestock,
     add_item                 as db_add_item,
     update_world_fact        as db_update_world_fact,
     update_npc               as db_update_npc,
@@ -1188,6 +1190,18 @@ def add_troop_group(
     count:      Annotated[int, "Initial headcount."],
     location_name: Annotated[str, "Location where this group is based."],
     notes:      Annotated[str, "Equipment, special abilities, or context notes."] = "",
+    commander_character_id: Annotated[
+        int,
+        "Optional character_id of the commanding officer. Validated against "
+        "the characters table. Pass 0 (default) to skip — commander_name "
+        "may be used instead. If both are given, this id wins.",
+    ] = 0,
+    commander_name: Annotated[
+        str,
+        "Optional commander name (case-insensitive prefix match against the "
+        "characters table). Convenient when you don't have the id handy. "
+        "Ignored if commander_character_id is non-zero.",
+    ] = "",
 ) -> dict:
     """
     Add a new troop group to the realm.
@@ -1195,12 +1209,67 @@ def add_troop_group(
     Use this when Theron hires mercenaries, recruits new soldiers, gains allied
     forces, or when a new type of unit needs to be tracked separately.
 
-    Returns the new troop_id and full row as confirmation.
+    A commander can be linked at insert time via commander_character_id (exact
+    id, validated) or commander_name (prefix match against characters). When
+    one is given the troop's commander_character_id FK is set and the
+    commander's name is included in the returned row.
+
+    Returns the new troop_id and full row (with commander, if linked) as
+    confirmation.
     """
     try:
         result = db_add_troop_group(
             group_name=group_name, troop_type=troop_type,
             count=count, location_name=location_name, notes=notes,
+            commander_character_id=(int(commander_character_id) or None),
+            commander_name=(commander_name or None),
+        )
+        return {"created": True, **result}
+    except ValueError as e:
+        return {"error": str(e)}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TOOL: add_livestock
+# ══════════════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def add_livestock(
+    animal_type: Annotated[
+        str,
+        "Type of animal — free text, e.g. 'Sheep', 'Pigs', 'Beef Cattle', "
+        "'Dairy Cattle', 'Chickens', 'Sheepdog', 'Horses', 'Goats'.",
+    ],
+    count: Annotated[int, "Headcount. Must be >= 0."],
+    location_name: Annotated[
+        str,
+        "Location where this stock lives (case-insensitive prefix match "
+        "against the locations table).",
+    ],
+    notes: Annotated[
+        str,
+        "Optional details: breed, productive purpose, working assignments "
+        "(e.g. 'Velyander breed', 'Gran March premium dairy', 'Moss the "
+        "sheepdog working with Dellon'). Free text.",
+    ] = "",
+) -> dict:
+    """
+    Insert a new livestock row at a domain location.
+
+    Use when a farm is acquired, a new herd is purchased, an animal cohort
+    is split off for separate tracking, or when backfilling canon. The
+    livestock table is read by get_realm_state and informs domain
+    bookkeeping (agricultural sales, smokehouse partnerships, etc.).
+
+    Returns the new livestock_id and full row (with the joined location_name)
+    as confirmation. On error returns {"error": "..."}.
+    """
+    try:
+        result = db_add_livestock(
+            animal_type=animal_type,
+            count=count,
+            location_name=location_name,
+            notes=(notes or None),
         )
         return {"created": True, **result}
     except ValueError as e:
@@ -3155,17 +3224,24 @@ def collect_income(
     """
     Roll and record income from all active domain holdings.
 
-    Each active location rolls its monthly income range (based on location_type)
-    independently for each month requested. The total is logged in
-    domain_income_expenses and optionally credited to the primary treasury.
+    INCOME RESOLUTION ORDER:
+      1. world_facts category 'income_canon' (if present) — overrides
+         per-holding rates. Use this for trade-circuit-driven economies
+         where the per-location income table dramatically underestimates
+         actual revenue. Set via update_world_fact(category='income_canon',
+         fact_text=...) — JSON object with monthly_gross_gp, or free text
+         containing 'GROSS MONTHLY INCOME: ~N gp'.
+      2. Per-holding rolls (the default) — each active location rolls its
+         monthly income range from the engine table, independently per
+         month. Income rates by type (monthly, rough range):
+           Keep ~120–220 gp · City ~150–350 gp · District ~70–130 gp
+           Mill ~55–105 gp · Farm ~45–85 gp · Workshop ~25–55 gp
+           Lodge ~15–35 gp · Inn ~25–55 gp · Civic ~10–30 gp
 
-    Income rates by type (monthly, rough range):
-      Keep ~120–220 gp · City ~150–350 gp · District ~70–130 gp
-      Mill ~55–105 gp · Farm ~45–85 gp · Workshop ~25–55 gp
-      Lodge ~15–35 gp · Inn ~25–55 gp · Civic ~10–30 gp
-
-    Call this once per game month or as part of domain_turn() for a full
-    seasonal cycle. Returns a per-holding breakdown with individual rolls.
+    The result includes an 'income_source' field describing which path
+    fired. Call this once per game month or as part of domain_turn().
+    The total is logged in domain_income_expenses regardless of source
+    and optionally credited to the primary treasury.
     """
     result = db_collect_income(months=months)
 
@@ -3181,10 +3257,19 @@ def collect_income(
             "Treasury NOT updated. Call update_treasury() to credit manually."
         )
 
-    result["note"] = (
-        f"Income collected: {result['total_gp']:,} gp from "
-        f"{result['holdings_rolled']} holdings over {months} month(s)."
-    )
+    src = result.get("income_source", "per-holding rolls")
+    if "income_canon" in src:
+        result["note"] = (
+            f"Income collected: {result['total_gp']:,} gp over {months} "
+            f"month(s) per income_canon "
+            f"(world_fact_id={result.get('world_fact_id')})."
+        )
+    else:
+        result["note"] = (
+            f"Income collected: {result['total_gp']:,} gp from "
+            f"{result['holdings_rolled']} holdings over {months} month(s) "
+            f"(per-holding rolls — no income_canon set)."
+        )
     return result
 
 
@@ -3418,9 +3503,12 @@ def domain_turn(
         domain_turn_id = turn_id,
     )
     report["income"] = {
-        "total_gp":        income["total_gp"],
-        "holdings_rolled": income["holdings_rolled"],
-        "breakdown":       income["breakdown"],
+        "total_gp":         income["total_gp"],
+        "income_source":    income.get("income_source"),
+        "holdings_rolled":  income["holdings_rolled"],
+        "monthly_gross_gp": income.get("monthly_gross_gp"),
+        "monthly_net_gp":   income.get("monthly_net_gp"),
+        "breakdown":        income["breakdown"],
     }
 
     # ── Step 3: Pay upkeep ─────────────────────────────────────────────────────
