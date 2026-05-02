@@ -22,6 +22,8 @@ Tools exposed:
   save_turn             -- Write player action + DM narrative to the database
   update_character_status  -- Change HP, AC, status notes on Theron
   update_treasury          -- Add/subtract coins or gems from a treasury account
+  add_treasury_account     -- Insert a new treasury account (vault, cache, hoard)
+  list_treasury_accounts   -- Discovery: every treasury account with balances and location
   add_location             -- Insert a new location into the realm
   update_location_status   -- Change status/notes on an existing location
   update_troop_count       -- Set or adjust count on a troop group
@@ -351,6 +353,9 @@ from engine.db import (
     # Phase 9 — aerial encounters & reaction rolls
     db_check_aerial_encounter,
     db_roll_reaction,
+    # Phase 10 — treasury account create/list
+    db_add_treasury_account,
+    db_list_treasury_accounts,
     # Phase 4 — domain
     get_full_domain_state,
     db_add_construction_project,
@@ -967,6 +972,88 @@ def update_treasury(
         return {"updated": True, **result}
     except ValueError as e:
         return {"error": str(e)}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TOOL: add_treasury_account
+# ══════════════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def add_treasury_account(
+    account_name: Annotated[
+        str,
+        "Name of the new treasury account. Must be unique within the "
+        "campaign (case-insensitive); duplicate names are rejected. "
+        "Examples: 'Moathouse Vault', 'Saltmarsh Cellar', "
+        "'Dragon Hoard - Cinderpeak'.",
+    ],
+    location_name: Annotated[
+        str,
+        "Optional location to link this treasury to (case-insensitive "
+        "prefix match against the locations table). Use for vaults that "
+        "physically sit in a keep, cellar, lair, or settlement. Leave "
+        "blank for an unsited account (e.g. coin a henchman is carrying).",
+    ] = "",
+    gp: Annotated[int, "Starting gold pieces. Default 0."] = 0,
+    sp: Annotated[int, "Starting silver pieces. Default 0."] = 0,
+    cp: Annotated[int, "Starting copper pieces. Default 0."] = 0,
+    pp: Annotated[int, "Starting platinum pieces. Default 0."] = 0,
+    gems_gp_value: Annotated[
+        int,
+        "Total gem value in GP (sum of all gems stored). Default 0.",
+    ] = 0,
+    notes: Annotated[
+        str,
+        "Free-text description: contents beyond coins/gems, security, "
+        "who knows about it, access conditions. Optional.",
+    ] = "",
+) -> dict:
+    """
+    Create a new treasury account.
+
+    Use this when the party establishes a new vault, claims a hoard, or
+    splits an existing pile into a separately-tracked stash. The new
+    account immediately becomes a valid target for update_treasury.
+
+    Validates:
+      - account_name is non-empty and unique in the campaign
+      - location_name (if given) resolves to a real location row
+
+    Returns the new treasury_id and the full row (with linked location
+    name) as confirmation. On error returns {"error": "..."}.
+    """
+    try:
+        result = db_add_treasury_account(
+            account_name=account_name,
+            location_name=(location_name or None),
+            gp=gp, sp=sp, cp=cp, pp=pp,
+            gems_gp_value=gems_gp_value,
+            notes=(notes or None),
+        )
+        return {"created": True, **result}
+    except ValueError as e:
+        return {"error": str(e)}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TOOL: list_treasury_accounts
+# ══════════════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def list_treasury_accounts() -> dict:
+    """
+    Return every treasury account in the active campaign.
+
+    Discovery tool: each entry includes treasury_id, account_name, all
+    coin balances (gp/sp/cp/pp), gems_gp_value, linked location (if any),
+    and notes (with a 120-char preview). Also returns the campaign-wide
+    GP total across all accounts.
+
+    Use at session start to see what vaults exist, before calling
+    update_treasury when you don't remember exact account names, or when
+    auditing total wealth across multiple stashes.
+    """
+    return db_list_treasury_accounts()
 
 
 # ══════════════════════════════════════════════════════════════════════════════

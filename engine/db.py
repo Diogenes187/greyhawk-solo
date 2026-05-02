@@ -8759,3 +8759,147 @@ def db_roll_reaction(
         "breakdown":          breakdown,
         "logged":             persisted,
     }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TREASURY ACCOUNTS — CREATE / LIST
+# Companion to update_treasury (which mutates balances on existing accounts).
+# ══════════════════════════════════════════════════════════════════════════════
+
+def db_add_treasury_account(
+    account_name:   str,
+    location_name:  str | None = None,
+    gp:             int = 0,
+    sp:             int = 0,
+    cp:             int = 0,
+    pp:             int = 0,
+    gems_gp_value:  int = 0,
+    notes:          str | None = None,
+) -> dict:
+    """
+    Insert a new treasury account into the active campaign.
+
+    Validates that account_name is not already taken (case-insensitive exact
+    match) — raises ValueError on duplicate. If location_name is provided,
+    looks up the location_id by case-insensitive prefix match and raises
+    ValueError if no match is found. Returns the new account row including
+    the resolved location_name.
+    """
+    name = (account_name or "").strip()
+    if not name:
+        raise ValueError("account_name is required and may not be empty.")
+
+    notes_val = notes if (notes is not None and notes != "") else None
+
+    # Resolve location_name -> location_id (if provided).
+    loc_id: int | None = None
+    resolved_loc_name: str | None = None
+    if location_name and location_name.strip():
+        with _get_conn(read_only=True) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT location_id, name FROM locations "
+                "WHERE LOWER(name) LIKE LOWER(?) AND campaign_id = ? LIMIT 1",
+                (f"{location_name.strip()}%", _CAMPAIGN_ID),
+            )
+            row = cur.fetchone()
+        if not row:
+            raise ValueError(
+                f"Location '{location_name}' not found — cannot link "
+                f"treasury account '{name}'."
+            )
+        loc_id = row["location_id"]
+        resolved_loc_name = row["name"]
+
+    # Reject duplicate account_name (case-insensitive exact match).
+    with _get_conn(read_only=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT treasury_id, account_name FROM treasury_accounts "
+            "WHERE LOWER(account_name) = LOWER(?) AND campaign_id = ?",
+            (name, _CAMPAIGN_ID),
+        )
+        existing = cur.fetchone()
+    if existing:
+        raise ValueError(
+            f"Treasury account '{existing['account_name']}' already exists "
+            f"(treasury_id={existing['treasury_id']}). Use update_treasury "
+            f"to change its balances or pick a different name."
+        )
+
+    with _get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO treasury_accounts "
+            "(campaign_id, account_name, location_id, gp, sp, cp, pp, "
+            " gems_gp_value, notes) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (_CAMPAIGN_ID, name, loc_id,
+             int(gp or 0), int(sp or 0), int(cp or 0), int(pp or 0),
+             int(gems_gp_value or 0), notes_val),
+        )
+        new_id = cur.lastrowid
+
+    with _get_conn(read_only=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT ta.treasury_id, ta.account_name, ta.location_id, "
+            "ta.gp, ta.sp, ta.cp, ta.pp, ta.gems_gp_value, ta.notes, "
+            "l.name AS location_name "
+            "FROM treasury_accounts ta "
+            "LEFT JOIN locations l ON ta.location_id = l.location_id "
+            "WHERE ta.treasury_id = ?",
+            (new_id,),
+        )
+        row = _row_to_dict(cur.fetchone())
+
+    if resolved_loc_name and not row.get("location_name"):
+        row["location_name"] = resolved_loc_name
+    return row
+
+
+def db_list_treasury_accounts() -> dict:
+    """
+    Return every treasury account in the active campaign with id, name,
+    balances, linked location (if any), and notes — plus a campaign-wide
+    GP total. Mirrors the discovery shape of db_list_characters.
+    """
+    with _get_conn(read_only=True) as conn:
+        rows = conn.execute(
+            "SELECT ta.treasury_id, ta.account_name, ta.location_id, "
+            "ta.gp, ta.sp, ta.cp, ta.pp, ta.gems_gp_value, ta.notes, "
+            "l.name AS location_name "
+            "FROM treasury_accounts ta "
+            "LEFT JOIN locations l ON ta.location_id = l.location_id "
+            "WHERE ta.campaign_id = ? "
+            "ORDER BY ta.treasury_id",
+            (_CAMPAIGN_ID,),
+        ).fetchall()
+
+    accounts: list[dict] = []
+    total_gp = 0
+    for r in rows:
+        gp_val = r["gp"] or 0
+        total_gp += gp_val
+        notes_preview = r["notes"] or ""
+        if len(notes_preview) > 120:
+            notes_preview = notes_preview[:117].rstrip() + "..."
+        accounts.append({
+            "treasury_id":    r["treasury_id"],
+            "account_name":   r["account_name"],
+            "location_id":    r["location_id"],
+            "location_name":  r["location_name"],
+            "gp":             gp_val,
+            "sp":             r["sp"] or 0,
+            "cp":             r["cp"] or 0,
+            "pp":             r["pp"] or 0,
+            "gems_gp_value":  r["gems_gp_value"] or 0,
+            "notes":          r["notes"],
+            "notes_preview":  notes_preview,
+        })
+
+    return {
+        "count":             len(accounts),
+        "treasury_total_gp": total_gp,
+        "accounts":          accounts,
+    }
