@@ -1,0 +1,7 @@
+# Windows batch files require CRLF line endings or cmd.exe's parser breaks
+# on multi-line constructs (for /d ... do (...), setlocal enabledelayedexpansion).
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# POSIX shell scripts require LF line endings.
+*.sh text eol=lf
