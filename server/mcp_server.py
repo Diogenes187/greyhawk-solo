@@ -30,6 +30,7 @@ Tools exposed:
   add_troop_group          -- Insert a new troop group (optionally with commander)
   add_livestock            -- Insert a new livestock row at a location
   remove_livestock         -- Delete a livestock row entirely (audit-logged)
+  restore_from_edit_log    -- Inverse of any audit-logged edit; revives deleted rows or reverts updates
   add_item                 -- Create an item and assign it to inventory (with combat fields, character_target)
   equip_item               -- Set a character's inventory item into a slot
   list_equipped            -- Compact slot-by-slot loadout for mid-combat reference
@@ -6242,6 +6243,388 @@ def direct_db_edit(
         }
     finally:
         conn.close()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TOOL: restore_from_edit_log
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Inverse of direct_db_edit / remove_inventory_item / remove_livestock /
+# update_inventory_item / update_class_level / any tool that calls
+# _log_edit. Reads the original edit_log entry's source_note JSON, figures
+# out whether it was a DELETE (single change, field='__row__') or an
+# UPDATE (per-field changes), and re-applies the prior state. The
+# restoration itself is recorded in edit_log so it can be unwound, and
+# every step happens inside a single transaction so a partial failure
+# can't leave the DB inconsistent.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Tables that restore_from_edit_log refuses to touch — would cascade in
+# unpredictable ways or undo schema/audit infrastructure itself.
+_RESTORE_FORBIDDEN_TABLES = {
+    "world_facts",        # would let you re-write the audit trail
+    "ai_turns",           # historical record, never restore
+    "current_scene_state",
+    "domain_income_expenses",
+    "sqlite_master", "sqlite_sequence",
+}
+
+
+def _resolve_pk_column(conn: sqlite3.Connection, table: str) -> str | None:
+    """Return the single primary-key column name, or None if not exactly one."""
+    cols = _table_columns(conn, table)
+    pks = [c["name"] for c in cols if c.get("pk")]
+    if len(pks) == 1:
+        return pks[0]
+    return None
+
+
+@mcp.tool()
+def restore_from_edit_log(
+    edit_log_id: Annotated[
+        int,
+        "world_fact_id of the edit_log entry to invert. Use "
+        "get_world_facts(category='edit_log') or query world_facts "
+        "directly to find candidates. The entry's source_note JSON is "
+        "what gets parsed.",
+    ],
+    reason: Annotated[
+        str,
+        "Why the row is being restored (written to the new edit_log "
+        "entry). Strongly recommended — restoration is the kind of "
+        "operation that always benefits from explanation.",
+    ] = "",
+) -> dict:
+    """
+    Restore a row from a prior edit_log entry.
+
+    Promotes the edit_log from a forensics-only artifact into a usable
+    safety net. Routes by the structure of the original entry's
+    `changes` array:
+
+      DELETE-style — exactly one change with field='__row__' and
+      new=None. Re-INSERTs the snapshot. Tries the original primary
+      key first; on PK collision falls back to inserting without the
+      PK column (the DB picks a new id, returned as `restored_pk` so
+      the caller can update any references).
+
+      UPDATE-style — per-field changes with `old` / `new` values.
+      Reverts each field to its `old` value via UPDATE on the original
+      row_id. Errors if the row no longer exists (an UPDATE-restore
+      can't recreate a row that was subsequently deleted — chain by
+      restoring the DELETE first).
+
+    The restoration writes its own edit_log entry (tool name
+    'restore_from_edit_log') with the inverse changes recorded, so the
+    restore itself can be unwound by another restore_from_edit_log
+    call if needed.
+
+    Refused tables (would corrupt audit/history): world_facts,
+    ai_turns, current_scene_state, domain_income_expenses, sqlite_*.
+
+    Returns one of:
+      {"ok": True, "mode": "update_revert", "table": ..., "row_id": ..., "fields_restored": [...]}
+      {"ok": True, "mode": "delete_reinsert", "table": ..., "row_id": ..., "restored_pk": ...}
+      {"ok": True, "unchanged": True, ...}   # row already matches snapshot
+      {"error": "..."}                        # any failure, transactional rollback
+    """
+    try:
+        conn = _open_writable_active()
+    except RuntimeError as e:
+        return {"error": str(e)}
+
+    try:
+        # ── Read the original edit_log entry ────────────────────────────────
+        log_row = conn.execute(
+            "SELECT world_fact_id, category, source_note "
+            "FROM world_facts WHERE world_fact_id = ?",
+            (edit_log_id,),
+        ).fetchone()
+        if not log_row:
+            return {"error": f"No world_facts row with id={edit_log_id}."}
+        if log_row["category"] != "edit_log":
+            return {
+                "error": f"world_fact_id={edit_log_id} is in category "
+                         f"{log_row['category']!r}, not 'edit_log'.",
+            }
+        source_note = log_row["source_note"]
+        if not source_note:
+            return {
+                "error": (
+                    f"edit_log entry {edit_log_id} has no source_note JSON "
+                    "— probably a pre-Phase-15 entry written by a tool that "
+                    "didn't save the structured payload. Cannot restore."
+                ),
+            }
+        try:
+            payload = json.loads(source_note)
+        except (json.JSONDecodeError, TypeError) as e:
+            return {
+                "error": f"edit_log {edit_log_id} source_note is not valid "
+                         f"JSON: {e}",
+            }
+
+        table     = payload.get("table")
+        row_id    = payload.get("row_id")
+        changes   = payload.get("changes") or []
+        prior_tool = payload.get("tool", "(unknown)")
+        if not table:
+            return {"error": f"edit_log {edit_log_id} has no table field."}
+        if table.startswith("sqlite_") or table in _RESTORE_FORBIDDEN_TABLES:
+            return {
+                "error": f"Refusing to restore into table {table!r}: in the "
+                         "forbidden set (would corrupt audit/history).",
+                "forbidden_tables": sorted(_RESTORE_FORBIDDEN_TABLES),
+            }
+
+        # ── Validate table still exists ─────────────────────────────────────
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?",
+            (table,),
+        ).fetchone()
+        if not exists:
+            return {"error": f"Table {table!r} no longer exists."}
+
+        pk_col = _resolve_pk_column(conn, table)
+        if not pk_col:
+            return {
+                "error": f"Table {table!r} has no single primary-key column "
+                         "— restore needs an unambiguous PK to target.",
+            }
+
+        col_names = {c["name"] for c in _table_columns(conn, table)}
+
+        # ── Branch: DELETE-style snapshot vs UPDATE-style per-field ─────────
+        is_delete = (
+            len(changes) == 1
+            and isinstance(changes[0], dict)
+            and changes[0].get("field") == "__row__"
+            and changes[0].get("new") is None
+            and isinstance(changes[0].get("old"), dict)
+        )
+
+        if is_delete:
+            return _restore_delete(
+                conn, table, pk_col, row_id, changes[0]["old"],
+                col_names, edit_log_id, prior_tool, reason,
+            )
+        else:
+            return _restore_update(
+                conn, table, pk_col, row_id, changes,
+                col_names, edit_log_id, prior_tool, reason,
+            )
+    finally:
+        conn.close()
+
+
+def _restore_delete(
+    conn:        sqlite3.Connection,
+    table:       str,
+    pk_col:      str,
+    row_id,
+    snapshot:    dict,
+    col_names:   set,
+    edit_log_id: int,
+    prior_tool:  str,
+    reason:      str,
+) -> dict:
+    """Re-INSERT a row from a delete-style snapshot."""
+    # Drop snapshot keys that aren't real columns (schema drift defense).
+    insert_cols = [c for c in snapshot.keys() if c in col_names]
+    if not insert_cols:
+        return {
+            "error": f"Snapshot has no columns matching {table!r}'s current "
+                     "schema. The table may have been recreated.",
+        }
+
+    # Check if a row with this PK already exists.
+    existing = conn.execute(
+        f"SELECT * FROM {table} WHERE {pk_col} = ?",
+        (row_id,),
+    ).fetchone()
+
+    if existing:
+        # Compare values — if everything matches, no-op.
+        existing_d = dict(existing)
+        if all(existing_d.get(c) == snapshot.get(c) for c in insert_cols):
+            return {
+                "ok":          True,
+                "unchanged":   True,
+                "mode":        "delete_reinsert",
+                "table":       table,
+                "row_id":      row_id,
+                "note":        "Row already exists with snapshot values.",
+            }
+        # PK collision with a different row — re-insert without PK.
+        cols_for_insert = [c for c in insert_cols if c != pk_col]
+        placeholders    = ", ".join("?" for _ in cols_for_insert)
+        col_list        = ", ".join(cols_for_insert)
+        values          = [snapshot[c] for c in cols_for_insert]
+        try:
+            with conn:
+                cur = conn.execute(
+                    f"INSERT INTO {table} ({col_list}) VALUES ({placeholders})",
+                    values,
+                )
+                new_pk = cur.lastrowid
+                _log_edit(conn, "restore_from_edit_log", table, new_pk, [{
+                    "field":   "__row__",
+                    "old":     None,
+                    "new":     dict(snapshot, **{pk_col: new_pk}),
+                }], (
+                    f"Restored from edit_log#{edit_log_id} (originally "
+                    f"{prior_tool}); PK collision on {pk_col}={row_id} "
+                    f"forced new PK {pk_col}={new_pk}. {reason}"
+                ).strip())
+        except sqlite3.Error as e:
+            return {"error": f"INSERT failed: {e}"}
+        return {
+            "ok":               True,
+            "mode":             "delete_reinsert",
+            "table":            table,
+            "original_row_id":  row_id,
+            "restored_pk":      new_pk,
+            "pk_collision":     True,
+            "note": (
+                f"Original {pk_col}={row_id} was occupied by a different "
+                f"row; restored as {pk_col}={new_pk} instead. References "
+                f"to the old PK in other tables will need fix-up."
+            ),
+        }
+
+    # Clean re-insert at the original PK.
+    placeholders = ", ".join("?" for _ in insert_cols)
+    col_list     = ", ".join(insert_cols)
+    values       = [snapshot[c] for c in insert_cols]
+    try:
+        with conn:
+            conn.execute(
+                f"INSERT INTO {table} ({col_list}) VALUES ({placeholders})",
+                values,
+            )
+            _log_edit(conn, "restore_from_edit_log", table, row_id, [{
+                "field": "__row__",
+                "old":   None,
+                "new":   snapshot,
+            }], (
+                f"Restored from edit_log#{edit_log_id} (originally "
+                f"{prior_tool}). {reason}"
+            ).strip())
+    except sqlite3.Error as e:
+        return {"error": f"INSERT failed: {e}"}
+    return {
+        "ok":            True,
+        "mode":          "delete_reinsert",
+        "table":         table,
+        "row_id":        row_id,
+        "restored_pk":   row_id,
+        "pk_collision":  False,
+        "restored_row":  snapshot,
+    }
+
+
+def _restore_update(
+    conn:        sqlite3.Connection,
+    table:       str,
+    pk_col:      str,
+    row_id,
+    changes:     list,
+    col_names:   set,
+    edit_log_id: int,
+    prior_tool:  str,
+    reason:      str,
+) -> dict:
+    """Revert per-field changes by writing the `old` values back to the row."""
+    existing = conn.execute(
+        f"SELECT * FROM {table} WHERE {pk_col} = ?",
+        (row_id,),
+    ).fetchone()
+    if not existing:
+        return {
+            "error": (
+                f"Row {pk_col}={row_id} no longer exists in {table!r} — "
+                "cannot revert an update on a deleted row. If the row was "
+                "later deleted, restore the DELETE-style edit_log entry "
+                "first, then chain into this UPDATE restore."
+            ),
+        }
+
+    # Filter to changes that actually have a writable column + old value.
+    effective: list[dict] = []
+    skipped:   list[dict] = []
+    for c in changes:
+        if not isinstance(c, dict):
+            continue
+        field = c.get("field")
+        if field not in col_names:
+            skipped.append({"field": field, "reason": "not a column"})
+            continue
+        if field == pk_col:
+            skipped.append({"field": field, "reason": "primary key"})
+            continue
+        if "old" not in c:
+            skipped.append({"field": field, "reason": "no 'old' value"})
+            continue
+        effective.append(c)
+
+    if not effective:
+        return {
+            "error":   "No revertible field changes in this edit_log entry.",
+            "skipped": skipped,
+        }
+
+    # Inverse changes for the new edit_log entry: what we're writing now
+    # is `old` becoming `new` from the restoration's point of view.
+    inverse_changes = []
+    actual_writes  = []
+    for c in effective:
+        current = existing[c["field"]]
+        if current == c["old"]:
+            # Already at the old value — skip without a write but record it
+            # in inverse for completeness.
+            continue
+        inverse_changes.append({
+            "field": c["field"],
+            "old":   current,        # the just-now value pre-restore
+            "new":   c["old"],       # the restored value
+        })
+        actual_writes.append(c)
+
+    if not actual_writes:
+        return {
+            "ok":          True,
+            "unchanged":   True,
+            "mode":        "update_revert",
+            "table":       table,
+            "row_id":      row_id,
+            "note":        "Row already at the snapshot's prior values.",
+        }
+
+    set_clause = ", ".join(f"{c['field']} = ?" for c in actual_writes)
+    params     = [c["old"] for c in actual_writes] + [row_id]
+    try:
+        with conn:
+            conn.execute(
+                f"UPDATE {table} SET {set_clause} WHERE {pk_col} = ?",
+                params,
+            )
+            _log_edit(conn, "restore_from_edit_log", table, row_id,
+                      inverse_changes, (
+                          f"Restored from edit_log#{edit_log_id} (originally "
+                          f"{prior_tool}). {reason}"
+                      ).strip())
+    except sqlite3.Error as e:
+        return {"error": f"UPDATE failed: {e}"}
+
+    return {
+        "ok":              True,
+        "mode":            "update_revert",
+        "table":           table,
+        "row_id":          row_id,
+        "fields_restored": [c["field"] for c in actual_writes],
+        "skipped":         skipped,
+        "changes":         inverse_changes,
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
