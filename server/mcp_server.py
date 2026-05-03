@@ -2679,38 +2679,62 @@ def end_combat(
 # ══════════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
-def get_spell_slots() -> dict:
+def get_spell_slots(
+    character_target: Annotated[
+        str,
+        "Optional name (case-insensitive prefix match) or numeric "
+        "character_id of the spellcaster. Leave blank to default to the "
+        "PC. Each character has independent spell memory keyed by "
+        "character_id under world_facts category 'spell_memory' (PC) or "
+        "'spell_memory_<id>' (others).",
+    ] = "",
+) -> dict:
     """
-    Return the character's memorized spells and slot availability for today.
+    Return a character's memorized spells and slot availability for today.
+
+    Defaults to the PC. Pass character_target to inspect any other
+    spellcasting character's slots (multi-class henchmen, hireling
+    magic-users, etc.). Returns an error if the target doesn't resolve
+    or has no spellcasting class.
 
     Reads the character's current class levels, computes total spell slots
     from classes.json (AD&D 1e tables), then cross-references with the
-    spell_memory world_fact to show which slots are expended.
+    per-character spell_memory world_fact to show which slots are expended.
 
     Returns:
+      character_id  -- the resolved character_id (PC or henchman)
       slots_total   -- slots available per class per spell level at current level
       memorized     -- full list of memorized spells with expended status
       available     -- only the non-expended memorized spells (ready to cast)
       expended      -- spells already cast this day
       has_unmemorized_slots -- True if any available slot has no spell assigned
-
-    Call memorize_spells() after a rest to set today's spell list.
     """
     import json as _json
-    from pathlib import Path as _Path
+
+    # Resolve character_target → character_id
+    cid: int | None = None
+    if (character_target or "").strip():
+        cid = _resolve_character(character_target)
+        if cid is None:
+            return {
+                "error": (
+                    f"character_target {character_target!r} did not resolve "
+                    "— use list_characters to discover available names/ids."
+                ),
+            }
+    from engine.db import _get_conn as _ec, _PC_CHARACTER_ID as _pc_id
+    target_id = cid if cid is not None else _pc_id
 
     # Load classes.json for spell slot tables
     classes_data_path = _ROOT / "data" / "classes.json"
     with open(classes_data_path, encoding="utf-8") as f:
         classes_data = _json.load(f)
 
-    # Load PC class levels
-    from engine.db import _get_conn as _ec, _PC_CHARACTER_ID as _pc_id
     with _ec(read_only=True) as conn:
         cur = conn.cursor()
         cur.execute(
             "SELECT class_name, level FROM class_levels WHERE character_id = ?",
-            (_pc_id,),
+            (target_id,),
         )
         class_levels = {r["class_name"]: r["level"] for r in cur.fetchall()}
 
@@ -2720,7 +2744,7 @@ def get_spell_slots() -> dict:
         cls_data = classes_data.get(cls_name, {})
         slot_table = cls_data.get("spell_slots", {})
         if not slot_table:
-            continue  # Fighters etc. have no spell slots
+            continue  # Fighters / Thieves etc. have no spell slots
         lvl_key = str(lvl)
         if lvl_key not in slot_table:
             # Find closest level <= current
@@ -2735,8 +2759,8 @@ def get_spell_slots() -> dict:
             if row[i] > 0
         }
 
-    # Load spell memory
-    memory = get_spell_memory()
+    # Load spell memory for THIS character
+    memory = get_spell_memory(character_id=target_id)
     memorized = memory.get("memorized", [])
 
     available = [s for s in memorized if not s.get("expended", False)]
@@ -2762,6 +2786,7 @@ def get_spell_slots() -> dict:
                 has_unmemorized = True
 
     return {
+        "character_id":          target_id,
         "slots_total":           slots_total,
         "memorized":             memorized,
         "available":             available,
@@ -2788,9 +2813,20 @@ def memorize_spells(
         "Class these spells belong to — 'magic_user', 'cleric', 'illusionist', "
         "'druid'. Required if the character has multiple spellcasting classes.",
     ] = "",
+    character_target: Annotated[
+        str,
+        "Optional name (case-insensitive prefix match) or numeric "
+        "character_id of the spellcaster. Leave blank to default to the "
+        "PC. Each character maintains independent memorized spells.",
+    ] = "",
 ) -> dict:
     """
     Set today's memorized spell list for one spellcasting class.
+
+    Defaults to the PC. Pass character_target to memorize spells for any
+    other tracked spellcaster (henchman magic-user, hireling cleric).
+    Spell memory is stored per-character — memorizing for Caiya does not
+    affect the PC's spell list.
 
     Looks up each spell name in the database to confirm it exists and
     retrieve its level. Validates that the memorized list does not exceed
@@ -2812,6 +2848,20 @@ def memorize_spells(
     except _json.JSONDecodeError as e:
         return {"error": f"Invalid spells JSON: {e}"}
 
+    # Resolve character_target → character_id
+    cid: int | None = None
+    if (character_target or "").strip():
+        cid = _resolve_character(character_target)
+        if cid is None:
+            return {
+                "error": (
+                    f"character_target {character_target!r} did not resolve "
+                    "— use list_characters to discover available names/ids."
+                ),
+            }
+    from engine.db import _get_conn as _ec, _PC_CHARACTER_ID as _pc_id
+    target_id = cid if cid is not None else _pc_id
+
     # Resolve class name
     cls_raw  = class_name.lower().replace("-", "_").replace(" ", "_") if class_name else ""
 
@@ -2820,12 +2870,11 @@ def memorize_spells(
     with open(classes_data_path, encoding="utf-8") as f:
         classes_data = _json.load(f)
 
-    from engine.db import _get_conn as _ec, _PC_CHARACTER_ID as _pc_id
     with _ec(read_only=True) as conn:
         cur = conn.cursor()
         cur.execute(
             "SELECT class_name, level FROM class_levels WHERE character_id = ?",
-            (_pc_id,),
+            (target_id,),
         )
         class_levels = {r["class_name"]: r["level"] for r in cur.fetchall()}
 
@@ -2898,17 +2947,18 @@ def memorize_spells(
     if errors:
         return {"error": errors, "resolved_before_error": resolved}
 
-    # Merge with existing memory (keep other classes)
-    memory    = get_spell_memory()
+    # Merge with existing memory (keep other classes); per-character.
+    memory    = get_spell_memory(character_id=target_id)
     existing  = [
         s for s in memory.get("memorized", [])
         if s.get("class_name", "").replace("-", "_") != db_class_name
     ]
     memory["memorized"] = existing + resolved
-    set_spell_memory(memory)
+    set_spell_memory(memory, character_id=target_id)
 
     return {
         "memorized":       resolved,
+        "character_id":    target_id,
         "class":           target_cls_key,
         "level":           cls_level,
         "total_memorized": len(resolved),
@@ -2932,25 +2982,50 @@ def cast_spell(
         str,
         "Any notes about how the spell is being used or conditions that apply.",
     ] = "",
+    character_target: Annotated[
+        str,
+        "Optional name (case-insensitive prefix match) or numeric "
+        "character_id of the caster. Leave blank to default to the PC. "
+        "The caster's spell memory is consulted (per-character), and the "
+        "expended flag is written back to that same per-character store.",
+    ] = "",
 ) -> dict:
     """
     Expend one memorized spell slot and return the spell's full description.
 
-    Finds the first non-expended slot in the memorized list that matches
-    spell_name. Marks it as expended. Retrieves the complete spell record
-    from the spells table including range, duration, area of effect, saving
-    throw, and description.
+    Defaults to the PC. Pass character_target to cast from any other
+    spellcaster's memorized list (henchman / hireling magic-user, etc.).
+    Each character has independent spell memory.
+
+    Finds the first non-expended slot in the caster's memorized list that
+    matches spell_name. Marks it as expended. Retrieves the complete spell
+    record from the spells table including range, duration, area of
+    effect, saving throw, and description.
 
     Returns everything needed to narrate the spell effect:
-      spell_name, level, school, range, duration, area, saving_throw,
-      summary_text, combat_use_text, description.
+      caster character_id, spell_name, level, school, range, duration,
+      area, saving_throw, summary_text, combat_use_text, description.
 
     After casting, check if any mechanical results need to be resolved:
       - If saving_throw is not empty, prompt the DM/player for a save roll
       - If the spell deals damage, use roll_dice() for the damage expression
       - If the spell affects HP, call update_character_status()
     """
-    memory    = get_spell_memory()
+    # Resolve character_target → character_id
+    cid: int | None = None
+    if (character_target or "").strip():
+        cid = _resolve_character(character_target)
+        if cid is None:
+            return {
+                "error": (
+                    f"character_target {character_target!r} did not resolve "
+                    "— use list_characters to discover available names/ids."
+                ),
+            }
+    from engine.db import _PC_CHARACTER_ID as _pc_id
+    target_id = cid if cid is not None else _pc_id
+
+    memory    = get_spell_memory(character_id=target_id)
     memorized = memory.get("memorized", [])
 
     # Find first matching non-expended slot
@@ -2966,14 +3041,15 @@ def cast_spell(
     if target_slot is None:
         available_names = [s["name"] for s in memorized if not s.get("expended", False)]
         return {
-            "error": f"No available slot for '{spell_name}'. "
-                     f"Available spells: {available_names or ['(none — all expended or none memorized)']}"
+            "error": f"No available slot for '{spell_name}' on character_id={target_id}. "
+                     f"Available spells: {available_names or ['(none — all expended or none memorized)']}",
+            "character_id": target_id,
         }
 
-    # Mark expended
+    # Mark expended (per-character write)
     memorized[slot_index]["expended"] = True
     memory["memorized"] = memorized
-    set_spell_memory(memory)
+    set_spell_memory(memory, character_id=target_id)
 
     # Retrieve full spell data from DB
     spell_data = lookup_spell(
@@ -2985,6 +3061,7 @@ def cast_spell(
 
     result = {
         "cast":        True,
+        "character_id": target_id,
         "spell_name":  target_slot["name"],
         "spell_level": target_slot.get("spell_level"),
         "class_name":  target_slot.get("class_name"),
@@ -3036,14 +3113,31 @@ def rest(
         "Current in-game date/time to record (e.g. '576 CY Fireseek 5, dusk'). "
         "Leave blank to auto-increment based on last recorded time.",
     ] = "",
+    character_target: Annotated[
+        str,
+        "Optional name (case-insensitive prefix match) or numeric "
+        "character_id of the resting character. Leave blank to default "
+        "to the PC. HP recovery and spell-slot restoration both flow "
+        "through the resolved character_id, so each party member rests "
+        "independently. The calendar advance is global (one shared "
+        "calendar) so calling rest once for the whole party works fine "
+        "if each member calls it in turn — calendar only advances on "
+        "the first call's calendar_note.",
+    ] = "",
 ) -> dict:
     """
     Advance time and restore resources after a rest.
 
+    Defaults to the PC. Pass character_target to rest any other tracked
+    spellcaster / HP-tracked character. Each character's spell memory is
+    independent; resting Caiya restores HER expended slots, not the PC's.
+
     Long rest (8 hours):
-      - Restores all spell slots (clears all expended flags in spell_memory).
-      - Recovers HP: 1 HP per character level (campaign ruling — fast enough
-        for solo play without being trivially instant). HP cannot exceed max.
+      - Restores all spell slots (clears all expended flags in
+        spell_memory for the target character).
+      - Recovers HP: 1 HP per character level (campaign ruling — fast
+        enough for solo play without being trivially instant). HP
+        cannot exceed max.
       - Advances the in-game calendar by 8 hours (stored in world_facts
         category 'calendar').
 
@@ -3056,13 +3150,27 @@ def rest(
     """
     import datetime as _dt
 
-    # ── Load PC status ─────────────────────────────────────────────────────────
+    # Resolve character_target → character_id
+    cid: int | None = None
+    if (character_target or "").strip():
+        cid = _resolve_character(character_target)
+        if cid is None:
+            return {
+                "error": (
+                    f"character_target {character_target!r} did not resolve "
+                    "— use list_characters to discover available names/ids."
+                ),
+            }
+
     from engine.db import _get_conn as _ec, _PC_CHARACTER_ID as _pc_id, _CAMPAIGN_ID as _cid
+    target_id = cid if cid is not None else _pc_id
+
+    # ── Load target character status ──────────────────────────────────────────
     with _ec(read_only=True) as conn:
         cur = conn.cursor()
         cur.execute(
             "SELECT hp_current, hp_max FROM character_status WHERE character_id = ?",
-            (_pc_id,),
+            (target_id,),
         )
         row = cur.fetchone()
 
@@ -3074,29 +3182,29 @@ def rest(
         cur = conn.cursor()
         cur.execute(
             "SELECT SUM(level) as total FROM class_levels WHERE character_id = ?",
-            (_pc_id,),
+            (target_id,),
         )
         lrow = cur.fetchone()
     total_levels = (lrow["total"] or 1) if lrow else 1
 
-    result: dict = {"rest_type": rest_type}
+    result: dict = {"rest_type": rest_type, "character_id": target_id}
 
     if rest_type.lower().startswith("long"):
-        # ── HP recovery ───────────────────────────────────────────────────────
+        # ── HP recovery (per-character) ───────────────────────────────────────
         hp_gained  = min(total_levels, hp_max - hp_cur)
         new_hp     = hp_cur + hp_gained
         with _ec() as conn:
             conn.execute(
                 "UPDATE character_status SET hp_current = ? WHERE character_id = ?",
-                (new_hp, _pc_id),
+                (new_hp, target_id),
             )
 
-        # ── Spell slot restoration ────────────────────────────────────────────
-        memory = get_spell_memory()
+        # ── Spell slot restoration (per-character) ────────────────────────────
+        memory = get_spell_memory(character_id=target_id)
         for slot in memory.get("memorized", []):
             slot["expended"] = False
         memory["last_rest"] = calendar_note or "after long rest"
-        set_spell_memory(memory)
+        set_spell_memory(memory, character_id=target_id)
 
         restored_slots = sum(
             1 for s in memory.get("memorized", [])

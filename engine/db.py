@@ -1844,14 +1844,32 @@ def get_attack_target_roll(matrix_code: str, level: int, target_ac: int) -> int:
 # PHASE 2 — SPELL MEMORY
 # ══════════════════════════════════════════════════════════════════════════════
 
-def get_spell_memory() -> dict:
-    """Return the current spell memory state, or an empty default."""
+def _spell_memory_category(character_id: int) -> str:
+    """
+    Per-character spell_memory storage key.
+      PC (character_id == _PC_CHARACTER_ID) → 'spell_memory'  (back-compat,
+        existing data lives at this key and is not migrated)
+      Any other character → 'spell_memory_<character_id>'
+    """
+    if int(character_id) == int(_PC_CHARACTER_ID):
+        return "spell_memory"
+    return f"spell_memory_{int(character_id)}"
+
+
+def get_spell_memory(character_id: int = _PC_CHARACTER_ID) -> dict:
+    """
+    Return the spell memory state for the given character_id, or an empty
+    default. Defaults to the PC. Other characters' state is stored under
+    'spell_memory_<character_id>' so each spellcaster maintains an
+    independent memorized list.
+    """
+    category = _spell_memory_category(character_id)
     with _get_conn(read_only=True) as conn:
         cur = conn.cursor()
         cur.execute(
             "SELECT fact_text FROM world_facts "
-            "WHERE campaign_id = ? AND category = 'spell_memory' LIMIT 1",
-            (_CAMPAIGN_ID,),
+            "WHERE campaign_id = ? AND category = ? LIMIT 1",
+            (_CAMPAIGN_ID, category),
         )
         row = cur.fetchone()
     if not row:
@@ -1862,19 +1880,24 @@ def get_spell_memory() -> dict:
         return {"memorized": [], "last_rest": None}
 
 
-def set_spell_memory(state: dict) -> None:
-    """Persist the spell memory state to world_facts (replaces previous)."""
+def set_spell_memory(state: dict, character_id: int = _PC_CHARACTER_ID) -> None:
+    """
+    Persist a character's spell memory state to world_facts (replaces
+    any previous record). Defaults to the PC. Routes to the same
+    per-character category as get_spell_memory.
+    """
+    category = _spell_memory_category(character_id)
     with _get_conn() as conn:
         conn.execute(
             "DELETE FROM world_facts "
-            "WHERE campaign_id = ? AND category = 'spell_memory'",
-            (_CAMPAIGN_ID,),
+            "WHERE campaign_id = ? AND category = ?",
+            (_CAMPAIGN_ID, category),
         )
         conn.execute(
             "INSERT INTO world_facts "
             "(campaign_id, category, fact_text, source_note) "
-            "VALUES (?, 'spell_memory', ?, 'spell_system')",
-            (_CAMPAIGN_ID, json.dumps(state)),
+            "VALUES (?, ?, ?, 'spell_system')",
+            (_CAMPAIGN_ID, category, json.dumps(state)),
         )
 
 
