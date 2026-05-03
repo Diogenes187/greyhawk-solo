@@ -30,7 +30,8 @@ Tools exposed:
   add_troop_group          -- Insert a new troop group (optionally with commander)
   add_livestock            -- Insert a new livestock row at a location
   remove_livestock         -- Delete a livestock row entirely (audit-logged)
-  restore_from_edit_log    -- Inverse of any audit-logged edit; revives deleted rows or reverts updates
+  insert_row               -- Generic INSERT into any user table (companion to direct_db_edit)
+  restore_from_edit_log    -- Inverse of any audit-logged edit; revives, reverts, or undoes inserts
   add_item                 -- Create an item and assign it to inventory (with combat fields, character_target)
   equip_item               -- Set a character's inventory item into a slot
   list_equipped            -- Compact slot-by-slot loadout for mid-combat reference
@@ -6246,6 +6247,196 @@ def direct_db_edit(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# TOOL: insert_row
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Generic INSERT primitive — companion to direct_db_edit. Lets callers
+# populate any table without waiting on a bespoke add_* tool. Mirrors
+# direct_db_edit's validation harness (real table, real columns, no
+# system tables) and writes a `__row__` snapshot to edit_log so
+# restore_from_edit_log can DELETE the row to undo.
+#
+# Tables with dedicated, semantically-rich add_* helpers (add_npc,
+# add_location, add_item, add_troop_group, add_livestock,
+# add_treasury_account, add_construction_project) should still go
+# through those tools — they handle FK resolution, validation, and
+# auto-vacate behaviors that this primitive doesn't replicate. Use
+# insert_row for new tables, one-off backfills, or canon corrections
+# that don't fit any existing add_* shape.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Tables insert_row refuses to touch — written by dedicated audit/
+# history paths or by other primitives that maintain invariants this
+# tool can't see (the inventory CHECK constraint is the obvious case
+# but DOES go through here since it's a real, useful table — caller
+# sees the SQLite IntegrityError if they violate it).
+_INSERT_FORBIDDEN_TABLES = {
+    "world_facts",         # use update_world_fact
+    "ai_turns",            # use save_turn
+    "current_scene_state", # use save_turn
+    "domain_income_expenses",
+    "sqlite_master", "sqlite_sequence",
+}
+
+
+@mcp.tool()
+def insert_row(
+    table: Annotated[
+        str,
+        "Target table name. Must be a real, non-system table. Tables "
+        "owned by dedicated audit/history paths (world_facts, ai_turns, "
+        "current_scene_state, domain_income_expenses, sqlite_*) are "
+        "refused — use the matching dedicated tool instead.",
+    ],
+    fields_json: Annotated[
+        str,
+        "JSON-encoded object mapping column names to values, e.g. "
+        '\'{"name": "Goat", "count": 4, "location_id": 13}\'. Every key '
+        "must be a real column of the target table. Pass the primary "
+        "key explicitly to control the assigned id; omit it to let the "
+        "DB auto-assign and read it back from `inserted_pk` in the "
+        "response. Unknown columns are rejected up front (with the full "
+        "column list returned) so a typo doesn't reach the INSERT.",
+    ],
+    reason: Annotated[
+        str,
+        "Short reason for the insert, written to the edit_log. Strongly "
+        "recommended for any canon backfill or correction so the "
+        "operation can be unwound by restore_from_edit_log later.",
+    ] = "",
+) -> dict:
+    """
+    Generic INSERT into any user table.
+
+    Companion to direct_db_edit (UPDATE) and remove_inventory_item /
+    remove_livestock (DELETE). Closes the CRUD primitive set so a new
+    table no longer requires a bespoke add_* tool to populate.
+
+    Validation runs before the write:
+      1. fields_json parses to a non-empty object.
+      2. table exists, is not a system table, is not in the
+         _INSERT_FORBIDDEN_TABLES set.
+      3. Every key in fields_json is a real column of that table.
+
+    Notably NOT enforced (intentionally let through to the DB):
+      - NOT NULL constraints — surfaces as a SQLite IntegrityError so
+        the caller learns which column they missed.
+      - CHECK constraints (e.g. inventory's exactly-one-FK rule) —
+        same.
+      - FK references — same.
+    All such failures roll back the transaction and return
+    {"error": "..."} with the SQLite message intact.
+
+    The successful insert writes an edit_log entry of shape
+    [{"field":"__row__", "old":None, "new":{...inserted_fields...}}]
+    so restore_from_edit_log can DELETE the row to undo the operation.
+
+    Returns:
+      {"ok": True, "table": ..., "inserted_pk": <new_id>,
+       "inserted_fields": {...}, "edit_log_id": <log id>}
+      {"error": "..."} on any validation or constraint failure.
+    """
+    # Parse fields_json first (cheapest failure).
+    try:
+        fields = json.loads(fields_json)
+    except Exception as e:
+        return {"error": f"fields_json is not valid JSON: {e}"}
+    if not isinstance(fields, dict) or not fields:
+        return {"error": "fields_json must decode to a non-empty object."}
+
+    if not table or table.startswith("sqlite_"):
+        return {"error": f"Refusing to insert into {table!r}."}
+    if table in _INSERT_FORBIDDEN_TABLES:
+        return {
+            "error": f"Refusing to insert into {table!r}: it is owned "
+                     "by a dedicated audit/history tool. Use the "
+                     "matching dedicated tool instead.",
+            "forbidden_tables": sorted(_INSERT_FORBIDDEN_TABLES),
+        }
+
+    try:
+        conn = _open_writable_active()
+    except RuntimeError as e:
+        return {"error": str(e)}
+
+    try:
+        # Validate table exists.
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?",
+            (table,),
+        ).fetchone()
+        if not exists:
+            return {"error": f"Table {table!r} does not exist."}
+
+        # Validate every field is a real column.
+        cols_info = _table_columns(conn, table)
+        col_names = {c["name"] for c in cols_info}
+        unknown   = [k for k in fields if k not in col_names]
+        if unknown:
+            return {
+                "error":   f"Unknown column(s) for {table!r}: {unknown}",
+                "columns": sorted(col_names),
+            }
+
+        # Build the INSERT.
+        ins_cols   = list(fields.keys())
+        col_list   = ", ".join(ins_cols)
+        placeholders = ", ".join("?" for _ in ins_cols)
+        values     = [fields[c] for c in ins_cols]
+
+        try:
+            with conn:
+                cur = conn.execute(
+                    f"INSERT INTO {table} ({col_list}) VALUES ({placeholders})",
+                    values,
+                )
+                # Resolve the new PK so callers can chain operations.
+                pk_col = _resolve_pk_column(conn, table)
+                inserted_pk = (
+                    fields[pk_col] if (pk_col and pk_col in fields)
+                    else cur.lastrowid
+                )
+                # Snapshot includes the resolved PK so a subsequent
+                # restore can re-insert at the same id.
+                snapshot = dict(fields)
+                if pk_col and pk_col not in snapshot:
+                    snapshot[pk_col] = inserted_pk
+                _log_edit(conn, "insert_row", table, inserted_pk, [{
+                    "field": "__row__",
+                    "old":   None,
+                    "new":   snapshot,
+                }], reason)
+                # Recover the just-written edit_log id for the response.
+                edit_log_id = conn.execute(
+                    "SELECT MAX(world_fact_id) FROM world_facts "
+                    "WHERE category = 'edit_log'"
+                ).fetchone()[0]
+        except sqlite3.IntegrityError as e:
+            return {
+                "error": f"INSERT failed: {e}",
+                "hint": (
+                    "Likely a NOT NULL / CHECK / FOREIGN KEY constraint. "
+                    "Pass all required columns and confirm referenced "
+                    "FKs exist. Inspect the table schema with "
+                    "PRAGMA table_info or use a dedicated add_* tool "
+                    "if one exists."
+                ),
+            }
+        except sqlite3.Error as e:
+            return {"error": f"INSERT failed: {e}"}
+
+        return {
+            "ok":              True,
+            "table":           table,
+            "inserted_pk":     inserted_pk,
+            "inserted_fields": snapshot,
+            "edit_log_id":     edit_log_id,
+        }
+    finally:
+        conn.close()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # TOOL: restore_from_edit_log
 # ══════════════════════════════════════════════════════════════════════════════
 #
@@ -6394,19 +6585,39 @@ def restore_from_edit_log(
 
         col_names = {c["name"] for c in _table_columns(conn, table)}
 
-        # ── Branch: DELETE-style snapshot vs UPDATE-style per-field ─────────
-        is_delete = (
+        # ── Branch: DELETE-style snapshot vs INSERT-style snapshot vs
+        #            UPDATE-style per-field changes ─────────────────────────
+        # DELETE-style:  one change, field='__row__', new=None, old=snapshot
+        #                (written by remove_inventory_item / remove_livestock /
+        #                 a remove via direct_db_edit). Restore re-INSERTs.
+        # INSERT-style:  one change, field='__row__', old=None, new=snapshot
+        #                (written by insert_row). Restore DELETEs the row.
+        # UPDATE-style:  per-field changes with old/new. Restore reverts.
+        is_row_snapshot = (
             len(changes) == 1
             and isinstance(changes[0], dict)
             and changes[0].get("field") == "__row__"
+        )
+        is_delete = (
+            is_row_snapshot
             and changes[0].get("new") is None
             and isinstance(changes[0].get("old"), dict)
+        )
+        is_insert = (
+            is_row_snapshot
+            and changes[0].get("old") is None
+            and isinstance(changes[0].get("new"), dict)
         )
 
         if is_delete:
             return _restore_delete(
                 conn, table, pk_col, row_id, changes[0]["old"],
                 col_names, edit_log_id, prior_tool, reason,
+            )
+        elif is_insert:
+            return _restore_insert_undo(
+                conn, table, pk_col, row_id, changes[0]["new"],
+                edit_log_id, prior_tool, reason,
             )
         else:
             return _restore_update(
@@ -6520,6 +6731,90 @@ def _restore_delete(
         "restored_pk":   row_id,
         "pk_collision":  False,
         "restored_row":  snapshot,
+    }
+
+
+def _restore_insert_undo(
+    conn:        sqlite3.Connection,
+    table:       str,
+    pk_col:      str,
+    row_id,
+    snapshot:    dict,
+    edit_log_id: int,
+    prior_tool:  str,
+    reason:      str,
+) -> dict:
+    """
+    Undo an insert_row entry by DELETing the row at the original PK.
+
+    Idempotent: if the row is already gone, returns unchanged. Verifies
+    the current row's columns still match the snapshot before deleting
+    (defensive — refuses to delete a row that's been edited since the
+    original insert, since that would lose data the snapshot doesn't
+    have a copy of).
+    """
+    existing = conn.execute(
+        f"SELECT * FROM {table} WHERE {pk_col} = ?",
+        (row_id,),
+    ).fetchone()
+
+    if not existing:
+        return {
+            "ok":         True,
+            "unchanged":  True,
+            "mode":       "insert_undo",
+            "table":      table,
+            "row_id":     row_id,
+            "note":       "Row already absent — insert was previously undone or the row was deleted by another path.",
+        }
+
+    existing_d = dict(existing)
+    drift_fields = []
+    for col, val in snapshot.items():
+        if col not in existing_d:
+            continue   # column was dropped from the schema, skip
+        if existing_d.get(col) != val:
+            drift_fields.append({
+                "field":     col,
+                "snapshot":  val,
+                "current":   existing_d.get(col),
+            })
+    if drift_fields:
+        return {
+            "error": (
+                f"Refusing to undo insert: row {pk_col}={row_id} in "
+                f"{table!r} has drifted from the original snapshot. "
+                "Inspect the differences (in `drift`) and either revert "
+                "the intervening edits first or delete the row "
+                "explicitly via remove_inventory_item / remove_livestock / "
+                "direct SQL if you accept the data loss."
+            ),
+            "drift": drift_fields,
+        }
+
+    try:
+        with conn:
+            conn.execute(
+                f"DELETE FROM {table} WHERE {pk_col} = ?",
+                (row_id,),
+            )
+            _log_edit(conn, "restore_from_edit_log", table, row_id, [{
+                "field": "__row__",
+                "old":   existing_d,
+                "new":   None,
+            }], (
+                f"Undid insert_row from edit_log#{edit_log_id} "
+                f"(originally {prior_tool}). {reason}"
+            ).strip())
+    except sqlite3.Error as e:
+        return {"error": f"DELETE failed: {e}"}
+
+    return {
+        "ok":         True,
+        "mode":       "insert_undo",
+        "table":      table,
+        "row_id":     row_id,
+        "deleted_row": existing_d,
     }
 
 
