@@ -116,19 +116,30 @@ from pydantic import BeforeValidator, Field
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PHASE 14 — MARKERS INSTRUMENTATION
+# MCP DEBUG LOGGING
 #
-# Investigating a long-standing bug where non-empty `markers` arrays passed
-# to save_turn arrive as None (or empty), while empty arrays arrive
-# correctly. Multiple prior investigations have not pinpointed where the
-# value gets dropped — Pydantic BeforeValidator? FastMCP transport? Client
-# serialization? This pass instruments every entry point in the path so we
-# can see, post-hoc, exactly what each layer received.
+# Persistent observability for the MCP request path. Originally added in
+# Phase 14 to chase a long-standing rumor that non-empty `markers` arrays
+# arrived at save_turn as None. Day 1141 live testing on three parallel
+# ingress formats (markers / markers_json / markers_str) proved the array
+# survives intact in the production client/transport — the "drop" was
+# upstream and was no longer reproducible. Phase 15 locked the array as
+# the only ingress path and demoted this to standard logging.
 #
-# Logs land in <project_root>/logs/mcp_debug.log as one-JSON-object-per-line.
-# That format is tail-friendly, grep-friendly, and easy to ingest into a
-# script for later analysis. Logging is best-effort: any IO failure is
-# caught silently so a broken log file can never break a save_turn call.
+# Two channels are still wired:
+#   normalize_markers — every Pydantic BeforeValidator call: raw_type,
+#                       raw_length, raw_repr, normalized result. Cheap
+#                       insurance against a regression of the array-drop
+#                       bug; if it ever resurfaces we'll have the data
+#                       immediately rather than burning another
+#                       investigation cycle.
+#   save_turn         — one line per save_turn call: markers_type, count,
+#                       clean_count, scene metadata.
+#
+# Logs land in <project_root>/logs/mcp_debug.log as one JSON object per
+# line — tail-friendly, grep-friendly, easy to script. The logger is
+# best-effort: any IO failure is caught silently so a broken log file
+# can never break a tool call.
 # ══════════════════════════════════════════════════════════════════════════════
 
 _DEBUG_LOG_PATH = Path(__file__).parent.parent / "logs" / "mcp_debug.log"
@@ -324,14 +335,14 @@ def _normalize_markers(raw: Any) -> list[str]:
       anything else          → ValueError (surfaces to the AI as a
                                 Pydantic validation error — never silent)
 
-    Phase 14 instrumentation: every invocation logs the raw input value
-    and resulting normalized list to logs/mcp_debug.log under channel
+    Standard logging: every invocation logs the raw input value and
+    resulting normalized list to logs/mcp_debug.log under channel
     'normalize_markers'. This is the EARLIEST point in the pipeline that
     user code can intercept the markers parameter — Pydantic calls a
-    BeforeValidator before doing any type coercion. If the value is
-    None/empty here while the wire payload was non-empty, the bug is
-    upstream of Pydantic (FastMCP transport, MCP client, or the model's
-    serialization).
+    BeforeValidator before doing any type coercion. If a future session
+    ever shows None/empty here while the wire payload was non-empty,
+    the bug is upstream of Pydantic (FastMCP transport, MCP client, or
+    the model's serialization) and we have the data to prove it.
     """
     raw_type     = type(raw).__name__
     raw_repr     = _debug_repr(raw)
@@ -831,32 +842,6 @@ def save_turn(
         "parameter for state changes.",
     ] = "",
     markers: MarkersField = [],
-    markers_str: Annotated[
-        str,
-        Field(description=(
-            "Pipe-delimited markers string fallback. Use when the markers "
-            "array path is broken in your client, e.g. markers_str="
-            '"cast:Charm Person|hp:41>38|item_added:Bone token". Each piece '
-            "between pipes is one marker using one of the canonical "
-            "prefixes (cast:, item_added:, item_used:, hp:, spent:, gained:, "
-            "npc_added:, location_changed:, troop_change:). Apostrophes and "
-            "other special characters are safe inside the value. Pass an "
-            "empty string when nothing changed."
-        )),
-    ] = "",
-    markers_json: Annotated[
-        str,
-        Field(description=(
-            "Pre-serialized JSON array string fallback for the markers "
-            'parameter, e.g. markers_json=\'["cast:Fireball","hp:41>38"]\'. '
-            "Bypasses Pydantic's BeforeValidator entirely — useful while "
-            "investigating whether the markers-array drop is a Pydantic "
-            "issue or a transport issue. The handler does json.loads() "
-            "internally and falls back to the same _normalize_markers "
-            "splitter on parse failure. Pass an empty string when nothing "
-            "changed."
-        )),
-    ] = "",
     model_name: Annotated[
         str,
         "Model that generated this turn. Default 'claude'.",
@@ -883,27 +868,26 @@ def save_turn(
     (silence ≠ verified).
 
     ┌──────────────────────────────────────────────────────────────────────┐
-    │ HOW TO PASS MARKERS — three formats accepted, first non-empty wins   │
+    │ HOW TO PASS MARKERS — single canonical format                        │
     ├──────────────────────────────────────────────────────────────────────┤
-    │ Phase 14 instrumentation pass — three ingress paths logged for       │
-    │ comparison (logs/mcp_debug.log) so we can pin down which one         │
-    │ survives the MCP transport reliably:                                 │
+    │ markers = array of strings, one marker per state change.             │
     │                                                                      │
-    │ 1. markers (array of strings) — canonical interface                  │
-    │      markers=["cast:Charm Person", "hp:41>38",                       │
-    │               "item_added:Bone token"]                               │
+    │   markers=["cast:Charm Person", "hp:41>38",                          │
+    │            "item_added:Bone token"]                                  │
     │                                                                      │
-    │ 2. markers_json (raw JSON-array string) — bypasses Pydantic          │
-    │      markers_json='["cast:Charm Person","hp:41>38",                  │
-    │                     "item_added:Bone token"]'                        │
+    │ Phase 14 instrumented three formats (markers, markers_json,          │
+    │ markers_str) to chase a long-standing bug where non-empty arrays     │
+    │ were rumored to drop in transport. Live testing on Day 1141          │
+    │ proved the array survives intact in this client/transport — the     │
+    │ "drop" was upstream and is no longer reproducible. Phase 15 locks   │
+    │ the array as the only ingress path and removes the workarounds      │
+    │ to eliminate the silent-precedence data-loss risk that arose when    │
+    │ both formats were passed in the same call.                           │
     │                                                                      │
-    │ 3. markers_str (pipe-delimited string) — loosest, always arrived     │
-    │      markers_str="cast:Charm Person|hp:41>38|item_added:Bone token"  │
-    │                                                                      │
-    │ Precedence on merge: markers > markers_json > markers_str. The       │
-    │ response payload reports which one won via the `markers_source`      │
-    │ field and includes raw_type/length on each so a single live turn     │
-    │ tells us which path the model + transport actually deliver.          │
+    │ The Pydantic BeforeValidator is still tolerant of single strings,    │
+    │ JSON-array literals, and Python repr — passed through to the same    │
+    │ _normalize_markers splitter — so an off-format value still has a     │
+    │ chance to land. Empty array (or omitted) means nothing changed.      │
     └──────────────────────────────────────────────────────────────────────┘
 
     One marker per state change. Use these exact prefixes:
@@ -941,91 +925,27 @@ def save_turn(
     is the *write*. verify_turn checks the claim against the write.
     ════════════════════════════════════════════════════════════════════════
     """
-    # ── Phase 14: log raw entry-point state for the markers bug hunt ──────────
-    # See logs/mcp_debug.log under channel 'save_turn.entry'. This is the
-    # earliest point in user code that all three ingress paths are visible
-    # together. Cross-reference with 'normalize_markers' entries (logged
-    # by the BeforeValidator) to see whether the markers array survived
-    # Pydantic intact.
-    _log_mcp_debug("save_turn.entry", {
-        "markers_type":         type(markers).__name__,
-        "markers_count":        len(markers or []),
-        "markers_repr":         _debug_repr(markers),
-        "markers_str_type":     type(markers_str).__name__,
-        "markers_str_length":   len(markers_str or ""),
-        "markers_str_repr":     _debug_repr(markers_str),
-        "markers_json_type":    type(markers_json).__name__,
-        "markers_json_length":  len(markers_json or ""),
-        "markers_json_repr":    _debug_repr(markers_json),
-        "scene_location_set":   bool(scene_location),
-        "scene_notes_length":   len(scene_notes or ""),
-    })
-
-    # ── Markers normalization ─────────────────────────────────────────────────
-    # Three ingress paths while the markers-array bug is under investigation:
-    #   1. markers       — list[str], normalized by Pydantic BeforeValidator
-    #   2. markers_str   — pipe/newline-delimited string fallback
-    #   3. markers_json  — pre-serialized JSON array string (bypasses
-    #                      Pydantic; the handler does json.loads itself)
-    #
-    # Precedence: first non-empty source wins. Order is markers > markers_json
-    # > markers_str (array first since it's the canonical interface; json
-    # second because it's the explicit-format fallback; pipe-string last
-    # because it's the loosest format).
+    # ── Markers normalization (Phase 15: single ingress path) ─────────────
+    # The Pydantic BeforeValidator (_normalize_markers) has already done
+    # the heavy lifting — it accepts list[str], a single string, JSON
+    # array literals, Python repr, newline/comma-separated strings, and
+    # None, and produces a clean list[str]. All we do here is filter
+    # empties and pass the rest to verify_turn.
     clean_markers = [
         m.strip() for m in (markers or [])
         if isinstance(m, str) and m.strip()
     ]
-    markers_source = "markers" if clean_markers else None
 
-    # ── markers_json: parse JSON, fall back to the same splitter on error ──
-    markers_json_parsed: list[str] = []
-    markers_json_parse_error: str | None = None
-    if not clean_markers and markers_json:
-        try:
-            decoded = json.loads(markers_json)
-            if isinstance(decoded, list):
-                for item in decoded:
-                    if isinstance(item, str) and item.strip():
-                        markers_json_parsed.append(item.strip())
-            elif isinstance(decoded, str) and decoded.strip():
-                # JSON string-of-string — treat as a single marker.
-                markers_json_parsed.append(decoded.strip())
-            else:
-                markers_json_parse_error = (
-                    f"markers_json decoded to {type(decoded).__name__} — "
-                    "expected an array of strings."
-                )
-        except (json.JSONDecodeError, TypeError) as e:
-            # Fall back to recovery heuristics so a sloppy JSON-ish value
-            # still has a chance to land. Try pipe-split first (most
-            # likely model mistake), then the universal splitter.
-            markers_json_parse_error = f"json.loads failed: {e}"
-            if "|" in markers_json:
-                markers_json_parsed = [
-                    p.strip() for p in markers_json.split("|") if p.strip()
-                ]
-            else:
-                markers_json_parsed = _normalize_markers(markers_json)
-
-        if markers_json_parsed:
-            clean_markers = markers_json_parsed
-            markers_source = "markers_json"
-
-    # ── markers_str: pipe-delimited fallback ────────────────────────────────
-    if not clean_markers and markers_str:
-        clean_markers = [
-            p.strip() for p in markers_str.split("|") if p.strip()
-        ]
-        if clean_markers:
-            markers_source = "markers_str"
-
-    # ── Phase 14: log the merge outcome ──────────────────────────────────────
-    _log_mcp_debug("save_turn.merged", {
-        "markers_source":           markers_source,    # which path won, or None
-        "clean_markers_count":      len(clean_markers),
-        "clean_markers":            clean_markers,
-        "markers_json_parse_error": markers_json_parse_error,
+    # Standard logging: one line per save_turn so we can spot a
+    # regression of the "non-empty array arrives as None" bug
+    # immediately if it ever resurfaces. Cross-reference with the
+    # 'normalize_markers' channel entries to confirm what Pydantic saw.
+    _log_mcp_debug("save_turn", {
+        "markers_type":       type(markers).__name__,
+        "markers_count":      len(markers or []),
+        "clean_count":        len(clean_markers),
+        "scene_location_set": bool(scene_location),
+        "scene_notes_length": len(scene_notes or ""),
     })
 
     structured: dict = {}
@@ -1060,23 +980,15 @@ def save_turn(
         "location":     scene_location or "(unchanged)",
         "notes_stored": bool(scene_notes),
         "verification": verification,
-        # Debug fields the AI can read to confirm markers actually arrived.
-        # The `*_raw_type` fields show what each ingress path produced:
-        # "list" / "str" — value reached the handler intact.
-        # "NoneType"     — parameter was dropped before the handler.
-        # markers_source names which path won the merge (or null if all
-        # three were empty).
-        "markers_received_raw_type":     type(markers).__name__,
-        "markers_received_count":        len(markers or []),
-        "markers_str_received_raw_type": type(markers_str).__name__,
-        "markers_str_received_length":   len(markers_str or ""),
-        "markers_str_pieces_after_split":
-            len([p for p in (markers_str or "").split("|") if p.strip()]),
-        "markers_json_received_raw_type": type(markers_json).__name__,
-        "markers_json_received_length":   len(markers_json or ""),
-        "markers_json_parse_error":       markers_json_parse_error,
-        "markers_source":                 markers_source,
-        "markers_normalized":             clean_markers,
+        # Cheap diagnostics so the DM can confirm markers arrived. If
+        # markers_received_raw_type ever shows "NoneType" with a
+        # markers_received_count of 0 on a turn the model claims to
+        # have populated, the Phase-14-era array-drop bug has
+        # resurfaced — pull logs/mcp_debug.log channel
+        # 'normalize_markers' for the raw input the validator saw.
+        "markers_received_raw_type": type(markers).__name__,
+        "markers_received_count":    len(markers or []),
+        "markers_normalized":        clean_markers,
         "world_fact_reminder": (
             "Check this turn for anything that should be written to the database "
             "immediately — do not let it live only in chat history. Call "
@@ -1087,10 +999,11 @@ def save_turn(
         ),
     }
 
-    # If either ingress path had content but nothing landed in clean_markers,
-    # surface the canonical format help so the AI knows how to retry without
+    # If markers came in with content but everything got filtered out
+    # (whitespace-only strings, non-string members), surface the
+    # canonical format help so the AI knows how to retry without
     # burning another turn.
-    if (markers or markers_str) and not clean_markers:
+    if markers and not clean_markers:
         result["markers_format_help"] = CANONICAL_MARKER_FORMAT_HELP
 
     # Surface conflicts prominently so the DM sees them immediately
