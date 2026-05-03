@@ -1149,22 +1149,54 @@ def update_character_status(
     status_notes: Annotated[str | None,
         "Replace the status notes field (gear worn, conditions, etc.). Omit to leave unchanged."
     ] = None,
+    character_target: Annotated[
+        str,
+        "Optional name (case-insensitive prefix match) or numeric "
+        "character_id of the target character. Leave blank to default "
+        "to the PC. Lets henchmen / hirelings / NPC party members have "
+        "their HP / AC / status updated through the same tool — "
+        "previously the only path was direct_db_edit on character_status.",
+    ] = "",
 ) -> dict:
     """
-    Update Theron's mutable combat status in the database.
+    Update a character's mutable combat status in the database.
 
     Call this whenever HP changes (combat damage, healing, rest), AC changes
-    (armor removed, magical effects), or status conditions change. Only fields
-    you provide are written — all others remain untouched.
+    (armor removed, magical effects), or status conditions change. Only
+    fields you provide are written — all others remain untouched.
+
+    Defaults to the PC. Pass character_target='Caiya' (or any tracked
+    henchman / hireling name, or a numeric character_id) to update a
+    different character. Errors clearly if the name doesn't resolve.
 
     Returns the full updated status row as confirmation.
     """
     try:
-        result = db_update_character_status(
-            hp_current=hp_current, hp_max=hp_max,
-            ac=ac, status_notes=status_notes,
-        )
-        return {"updated": True, **result}
+        cid: int | None = None
+        if (character_target or "").strip():
+            cid = _resolve_character(character_target)
+            if cid is None:
+                return {
+                    "error": (
+                        f"character_target {character_target!r} did not "
+                        "resolve — use list_characters to discover "
+                        "available names/ids."
+                    ),
+                }
+        # db_update_character_status defaults character_id to the PC when
+        # we pass nothing.
+        if cid is None:
+            result = db_update_character_status(
+                hp_current=hp_current, hp_max=hp_max,
+                ac=ac, status_notes=status_notes,
+            )
+        else:
+            result = db_update_character_status(
+                character_id=cid,
+                hp_current=hp_current, hp_max=hp_max,
+                ac=ac, status_notes=status_notes,
+            )
+        return {"updated": True, "character_id": cid, **result}
     except ValueError as e:
         return {"error": str(e)}
 
@@ -4436,9 +4468,23 @@ def recovery(
         "In-game date after recovery, e.g. 'Planting 5, 576 CY'. "
         "If omitted, '+N days' appended to existing calendar.",
     ] = "",
+    character_target: Annotated[
+        str,
+        "Optional name (case-insensitive prefix match) or numeric "
+        "character_id of the recovering character. Leave blank to default "
+        "to the PC. Lets henchmen / hirelings / NPC party members run "
+        "their own bed-rest recovery — Caiya patching up after a moathouse "
+        "fight, a hireling laid up with mummy rot, etc. The 5xp/day "
+        "symbolic award is PC-only; non-PC targets can be granted XP "
+        "explicitly via grant_xp.",
+    ] = "",
 ) -> dict:
     """
     Extended rest for serious injuries or magical ailments beyond normal healing.
+
+    Defaults to the PC. Pass character_target to recover any tracked
+    character (henchman, hireling, NPC party member). Errors clearly
+    if the target name/id can't be resolved or has no character_status row.
 
     Normal rest: 1 HP per character level per night.
     Recovery rest: 2 HP per character level per week (bed rest, no strenuous activity).
@@ -4454,16 +4500,38 @@ def recovery(
     require Remove Curse / Cure Disease / Restoration — bed rest alone cannot
     cure them, but rest IS still required for HP recovery.
 
-    XP: 5 per day (time-cost only — the character is not adventuring).
+    XP: 5 per day for the PC only (time-cost). Non-PC targets get
+    xp_awarded=0 with an xp_note explaining how to award via grant_xp.
 
-    Returns: injury_description, days_resting, hp_before, hp_after, hp_recovered,
-    ailments_cleared, recovery_note, xp_awarded, calendar, dm_note.
+    Returns: character_id, injury_description, days_resting, hp_before,
+    hp_after, hp_recovered, ailments_cleared, recovery_note, xp_awarded,
+    xp_note (when applicable), calendar, dm_note.
     """
-    return db_recovery(
-        injury_description=injury_description,
-        days_resting=days_resting,
-        calendar_note=calendar_note,
-    )
+    cid: int | None = None
+    if (character_target or "").strip():
+        cid = _resolve_character(character_target)
+        if cid is None:
+            return {
+                "error": (
+                    f"character_target {character_target!r} did not resolve "
+                    "— use list_characters to discover available names/ids."
+                ),
+            }
+    try:
+        if cid is None:
+            return db_recovery(
+                injury_description=injury_description,
+                days_resting=days_resting,
+                calendar_note=calendar_note,
+            )
+        return db_recovery(
+            injury_description=injury_description,
+            days_resting=days_resting,
+            calendar_note=calendar_note,
+            character_id=cid,
+        )
+    except ValueError as e:
+        return {"error": str(e)}
 
 
 @mcp.tool()

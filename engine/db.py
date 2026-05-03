@@ -4766,30 +4766,42 @@ def db_recovery(
     injury_description: str,
     days_resting:       int,
     calendar_note:      str = "",
+    character_id:       int = _PC_CHARACTER_ID,
 ) -> dict:
     """
     Extended rest for serious injuries or magical ailments beyond normal healing.
     Enhanced HP recovery: 2 HP per character level per week (vs 1/level/night).
     7+ days clears minor ailments; 30+ days clears all ailments (status_notes reset).
+
+    Defaults to the PC. Pass character_id to recover any tracked character
+    (henchman, hireling, NPC). When the target is NOT the PC, the
+    symbolic 5xp/day is skipped (henchmen earn XP via grant_xp instead);
+    the result's xp_awarded reflects what was actually written.
     """
     days_resting = max(1, min(90, days_resting))
 
-    # Get current HP and status
+    # Get current HP and status (per-character).
     with _get_conn(read_only=True) as conn:
         cur = conn.cursor()
         cur.execute(
             "SELECT hp_current, hp_max, status_notes "
             "FROM character_status WHERE character_id = ?",
-            (_PC_CHARACTER_ID,),
+            (character_id,),
         )
-        status = dict(cur.fetchone())
+        status_row = cur.fetchone()
+        if status_row is None:
+            raise ValueError(
+                f"character_id={character_id} has no character_status row "
+                "— cannot run recovery on a character without HP tracking."
+            )
+        status = dict(status_row)
 
-    # Get total character levels for recovery rate
+    # Get total character levels for the recovery rate (per-character).
     with _get_conn(read_only=True) as conn:
         cur = conn.cursor()
         cur.execute(
             "SELECT SUM(level) FROM class_levels WHERE character_id = ?",
-            (_PC_CHARACTER_ID,),
+            (character_id,),
         )
         lv_row = cur.fetchone()
     total_levels = int(lv_row[0]) if lv_row and lv_row[0] else 1
@@ -4829,16 +4841,31 @@ def db_recovery(
         conn.execute(
             "UPDATE character_status SET hp_current = ?, status_notes = ? "
             "WHERE character_id = ?",
-            (new_hp, new_notes, _PC_CHARACTER_ID),
+            (new_hp, new_notes, character_id),
         )
 
-    # XP: 5 per day (representing time cost, not merit)
-    xp_award  = days_resting * 5
-    xp_result = _award_pc_xp(xp_award)
-    cal       = _downtime_advance_calendar(days_resting, calendar_note)
+    # XP: 5 per day (symbolic time-cost). PC-only — henchmen / NPCs earn
+    # XP through grant_xp via the DM's discretion, not as a side effect
+    # of a downtime tool. Surface the skip in the result for transparency.
+    is_pc = (int(character_id) == int(_PC_CHARACTER_ID))
+    if is_pc:
+        xp_award  = days_resting * 5
+        xp_result = _award_pc_xp(xp_award)
+        xp_awards = xp_result.get("xp_awards", [])
+        xp_note   = None
+    else:
+        xp_award  = 0
+        xp_awards = []
+        xp_note   = (
+            f"5 xp/day skipped for non-PC character_id={character_id}. "
+            "Use grant_xp() to award XP to henchmen / hirelings explicitly."
+        )
+
+    cal = _downtime_advance_calendar(days_resting, calendar_note)
 
     result = {
         "activity":           "recovery",
+        "character_id":       character_id,
         "injury_description": injury_description,
         "days_resting":       days_resting,
         "hp_before":          hp_cur,
@@ -4848,7 +4875,8 @@ def db_recovery(
         "ailments_cleared":   ailments_cleared,
         "recovery_note":      recovery_note,
         "xp_awarded":         xp_award,
-        "xp_details":         xp_result.get("xp_awards", []),
+        "xp_details":         xp_awards,
+        "xp_note":            xp_note,
         "calendar":           cal,
         "dm_note": (
             "30 days automatically clears status_notes (all conditions). "
