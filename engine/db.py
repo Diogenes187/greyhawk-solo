@@ -6859,6 +6859,8 @@ def db_negotiate_surrender(
 _VRY_KNOWN_PREFIXES = {
     "cast", "item_added", "item_used", "hp",
     "spent", "gained", "npc_added", "location_changed", "troop_change",
+    # Phase 20: extended vocabulary for the non-inventory tables
+    "livestock_added", "troop_added", "project_added", "location_added",
 }
 
 
@@ -6955,6 +6957,61 @@ def _vry_parse_marker(marker: str) -> dict:
             return {"type": "malformed", "raw": marker,
                     "reason": "troop_change requires integer [old]>[new]"}
 
+    # ── Phase 20: extended vocabulary for non-inventory state ───────────────
+    if prefix == "livestock_added":
+        # rest format: "[animal_type]:[count]:[location]"
+        parts = [p.strip() for p in rest.split(":")]
+        if len(parts) < 3 or not all(parts[:3]):
+            return {"type": "malformed", "raw": marker,
+                    "reason": "expected livestock_added:[animal_type]:[count]:[location]"}
+        try:
+            count = int(parts[1])
+        except ValueError:
+            return {"type": "malformed", "raw": marker,
+                    "reason": "livestock_added count must be an integer"}
+        # Allow extra colons in the location name (e.g. 'Daral-Ra:hd Estate')
+        # by joining everything past the count back together.
+        location = ":".join(parts[2:]).strip()
+        return {
+            "type":         "livestock_added",
+            "animal_type":  parts[0],
+            "count":        count,
+            "location":     location,
+            "raw":          marker,
+        }
+
+    if prefix == "troop_added":
+        # rest format: "[group_name]:[count]:[location]"
+        parts = [p.strip() for p in rest.split(":")]
+        if len(parts) < 3 or not all(parts[:3]):
+            return {"type": "malformed", "raw": marker,
+                    "reason": "expected troop_added:[group_name]:[count]:[location]"}
+        try:
+            count = int(parts[1])
+        except ValueError:
+            return {"type": "malformed", "raw": marker,
+                    "reason": "troop_added count must be an integer"}
+        location = ":".join(parts[2:]).strip()
+        return {
+            "type":     "troop_added",
+            "group":    parts[0],
+            "count":    count,
+            "location": location,
+            "raw":      marker,
+        }
+
+    if prefix == "project_added":
+        if not rest:
+            return {"type": "malformed", "raw": marker,
+                    "reason": "expected project_added:[project name]"}
+        return {"type": "project_added", "name": rest, "raw": marker}
+
+    if prefix == "location_added":
+        if not rest:
+            return {"type": "malformed", "raw": marker,
+                    "reason": "expected location_added:[location name]"}
+        return {"type": "location_added", "name": rest, "raw": marker}
+
     return {"type": "malformed", "raw": marker, "reason": "unhandled prefix"}
 
 
@@ -7025,9 +7082,13 @@ def db_verify_turn(turn_id: int | None = None) -> dict:
             "warning": (
                 "No markers in this turn — state cannot be verified. "
                 "Pass markers=[...] to save_turn whenever game state changes. "
-                "Formats: cast:[spell], item_added:[name], item_used:[name], "
-                "hp:[old]>[new], spent:[N]gp, gained:[N]gp, npc_added:[name], "
-                "location_changed:[name], troop_change:[group]:[old]>[new]."
+                "Inventory/character: cast:[spell], item_added:[name], "
+                "item_used:[name], hp:[old]>[new], spent:[N]gp, "
+                "gained:[N]gp, npc_added:[name], location_changed:[name], "
+                "troop_change:[group]:[old]>[new]. Domain/realm: "
+                "livestock_added:[type]:[count]:[location], "
+                "troop_added:[group]:[count]:[location], "
+                "project_added:[name], location_added:[name]."
             ),
         }
 
@@ -7283,6 +7344,174 @@ def db_verify_turn(turn_id: int | None = None) -> dict:
                         "suggested_call": (
                             f'update_troop_count(group_name="{group}", '
                             f"new_count={marker['new']})"
+                        ),
+                    })
+                continue
+
+            # ── Phase 20: livestock_added ─────────────────────────────────────
+            if mtype == "livestock_added":
+                animal   = marker["animal_type"].strip()
+                count    = marker["count"]
+                location = marker["location"].strip()
+                claim_label = f"{count}× {animal} at {location}"
+                # Match by joined location.name + animal_type, count >= claimed.
+                row_match = conn.execute(
+                    "SELECT li.livestock_id, li.animal_type, li.count, "
+                    "       l.name AS location_name "
+                    "FROM livestock li "
+                    "LEFT JOIN locations l ON l.location_id = li.location_id "
+                    "WHERE li.campaign_id = ? "
+                    "  AND LOWER(li.animal_type) LIKE LOWER(?) "
+                    "  AND LOWER(IFNULL(l.name, '')) LIKE LOWER(?) "
+                    "ORDER BY li.livestock_id DESC LIMIT 1",
+                    (_CAMPAIGN_ID, f"%{animal[:18]}%", f"{location[:18]}%"),
+                ).fetchone()
+                if row_match and row_match["count"] >= count:
+                    confirmed.append({
+                        "type":   "livestock_added",
+                        "claim":  claim_label,
+                        "actual": (
+                            f"livestock_id={row_match['livestock_id']}, "
+                            f"{row_match['count']}× {row_match['animal_type']} "
+                            f"at {row_match['location_name'] or '(no loc)'}  ✓"
+                        ),
+                    })
+                else:
+                    unverified.append({
+                        "type":           "livestock_added",
+                        "claim":          claim_label,
+                        "reason": (
+                            "Livestock row not found at expected location, or "
+                            "count is below the claim."
+                            if not row_match
+                            else f"Found {row_match['count']}× {row_match['animal_type']} "
+                                 f"at {row_match['location_name']}, expected ≥{count}."
+                        ),
+                        "suggested_call": (
+                            f'add_livestock(animal_type="{animal}", '
+                            f'count={count}, location_name="{location}")'
+                        ),
+                    })
+                continue
+
+            # ── Phase 20: troop_added ─────────────────────────────────────────
+            if mtype == "troop_added":
+                group    = marker["group"].strip()
+                count    = marker["count"]
+                location = marker["location"].strip()
+                claim_label = f"{group}: {count} at {location}"
+                row_match = conn.execute(
+                    "SELECT t.troop_id, t.group_name, t.troop_type, t.count, "
+                    "       l.name AS location_name "
+                    "FROM troops t "
+                    "LEFT JOIN locations l ON l.location_id = t.location_id "
+                    "WHERE t.campaign_id = ? "
+                    "  AND LOWER(t.group_name) LIKE LOWER(?) "
+                    "ORDER BY t.troop_id DESC LIMIT 1",
+                    (_CAMPAIGN_ID, f"{group.lower()[:32]}%"),
+                ).fetchone()
+                if (row_match
+                        and row_match["count"] == count
+                        and (not location
+                             or location.lower() in (row_match["location_name"] or "").lower())):
+                    confirmed.append({
+                        "type":   "troop_added",
+                        "claim":  claim_label,
+                        "actual": (
+                            f"troop_id={row_match['troop_id']}, "
+                            f"{row_match['count']} {row_match['troop_type']} "
+                            f"at {row_match['location_name'] or '(no loc)'}  ✓"
+                        ),
+                    })
+                else:
+                    reason = (
+                        "Troop group not found."
+                        if not row_match
+                        else (
+                            f"Group exists (count={row_match['count']}, "
+                            f"location='{row_match['location_name']}') but "
+                            f"differs from claim (count={count}, location='{location}')."
+                        )
+                    )
+                    unverified.append({
+                        "type":           "troop_added",
+                        "claim":          claim_label,
+                        "reason":         reason,
+                        "suggested_call": (
+                            f'add_troop_group(group_name="{group}", '
+                            f'troop_type="<type>", count={count}, '
+                            f'location_name="{location}")'
+                        ),
+                    })
+                continue
+
+            # ── Phase 20: project_added ───────────────────────────────────────
+            if mtype == "project_added":
+                pname = marker["name"].strip()
+                row_match = conn.execute(
+                    "SELECT p.project_id, p.name, p.status, p.cost_gp, "
+                    "       l.name AS location_name "
+                    "FROM projects p "
+                    "LEFT JOIN locations l ON l.location_id = p.location_id "
+                    "WHERE p.campaign_id = ? "
+                    "  AND LOWER(p.name) LIKE LOWER(?) "
+                    "ORDER BY p.project_id DESC LIMIT 1",
+                    (_CAMPAIGN_ID, f"%{pname.lower()[:32]}%"),
+                ).fetchone()
+                if row_match:
+                    confirmed.append({
+                        "type":   "project_added",
+                        "claim":  f"Project added: {pname}",
+                        "actual": (
+                            f"project_id={row_match['project_id']}, "
+                            f"name={row_match['name']!r}, "
+                            f"status={row_match['status']!r}, "
+                            f"cost={row_match['cost_gp']} gp  ✓"
+                        ),
+                    })
+                else:
+                    unverified.append({
+                        "type":           "project_added",
+                        "claim":          f"Project added: {pname}",
+                        "reason":         "Project not found in projects table.",
+                        "suggested_call": (
+                            f'add_construction_project(name="{pname}", '
+                            f'project_type="<type>", cost_gp=<cost>, '
+                            f'weeks_total=<weeks>, location_name="<location>")'
+                        ),
+                    })
+                continue
+
+            # ── Phase 20: location_added ──────────────────────────────────────
+            if mtype == "location_added":
+                lname = marker["name"].strip()
+                row_match = conn.execute(
+                    "SELECT location_id, name, location_type, status "
+                    "FROM locations "
+                    "WHERE campaign_id = ? "
+                    "  AND LOWER(name) LIKE LOWER(?) "
+                    "ORDER BY location_id DESC LIMIT 1",
+                    (_CAMPAIGN_ID, f"%{lname.lower()[:32]}%"),
+                ).fetchone()
+                if row_match:
+                    confirmed.append({
+                        "type":   "location_added",
+                        "claim":  f"Location added: {lname}",
+                        "actual": (
+                            f"location_id={row_match['location_id']}, "
+                            f"name={row_match['name']!r}, "
+                            f"type={row_match['location_type']!r}, "
+                            f"status={row_match['status']!r}  ✓"
+                        ),
+                    })
+                else:
+                    unverified.append({
+                        "type":           "location_added",
+                        "claim":          f"Location added: {lname}",
+                        "reason":         "Location not found in locations table.",
+                        "suggested_call": (
+                            f'add_location(name="{lname}", '
+                            f'location_type="<type>", status="<status>")'
                         ),
                     })
                 continue

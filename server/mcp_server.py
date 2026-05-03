@@ -231,20 +231,33 @@ def _log_mcp_debug(channel: str, payload: dict) -> None:
 _MARKER_PREFIXES = {
     "cast", "item_added", "item_used", "hp",
     "spent", "gained", "npc_added", "location_changed", "troop_change",
+    # Phase 20: extended vocabulary for non-inventory state.
+    "livestock_added", "troop_added", "project_added", "location_added",
 }
 
 CANONICAL_MARKER_FORMAT_HELP = (
     'markers MUST be a JSON array of strings (e.g. ["cast:Invisibility", '
     '"hp:41>38"]). One marker per state change. Apostrophes and other '
     "special characters are safe inside the strings — pass them raw, no "
-    "escaping needed. Use one of these prefixes per marker:\n"
+    "escaping needed. Pick the prefix that matches what changed — the "
+    "verifier routes by prefix to the right table and emits the correct "
+    "suggested_call. Using item_added: for livestock or troop_added: for "
+    "an NPC will produce the wrong remediation suggestion.\n"
+    "\n"
+    "Inventory / character state:\n"
     "  cast:[spell name]\n"
     "  item_added:[name]      item_used:[name]\n"
     "  hp:[old]>[new]\n"
     "  spent:[amount]gp       gained:[amount]gp\n"
     "  npc_added:[name]\n"
     "  location_changed:[name]\n"
-    "  troop_change:[group]:[old]>[new]"
+    "  troop_change:[group]:[old]>[new]\n"
+    "\n"
+    "Domain / realm state (Phase 20):\n"
+    "  livestock_added:[animal_type]:[count]:[location]\n"
+    "  troop_added:[group_name]:[count]:[location]\n"
+    "  project_added:[project name]\n"
+    "  location_added:[location name]"
 )
 
 
@@ -943,9 +956,29 @@ def save_turn(
       troop_change:[group]:[old]>[new] Troop count changed. Both integers.
                                        Example: "troop_change:Iron Watch:120>108"
 
+    Phase 20 — domain/realm state additions. Pick the prefix that matches
+    what changed; the verifier routes by prefix to the right table and
+    emits the correct suggested_call. Using item_added: for livestock or
+    troop_added: for an NPC produces the wrong remediation suggestion:
+
+      livestock_added:[type]:[count]:[location]
+                                       New livestock at a location.
+                                       Example: "livestock_added:Sheep:65:Daral-Ra'ahd Estate"
+
+      troop_added:[group]:[count]:[location]
+                                       New troop group recruited/arrived.
+                                       Example: "troop_added:Wyvern Cohort:30:The Moathouse"
+
+      project_added:[name]             New construction project queued.
+                                       Example: "project_added:Moathouse Granary"
+
+      location_added:[name]            New location discovered/claimed/built.
+                                       Example: "location_added:Pale Chapel Fief"
+
     Always pair markers with the underlying tool call (update_character_status,
-    cast_spell, update_treasury, etc.). The marker is a *claim*; the tool call
-    is the *write*. verify_turn checks the claim against the write.
+    cast_spell, update_treasury, add_livestock, add_troop_group, etc.). The
+    marker is a *claim*; the tool call is the *write*. verify_turn checks
+    the claim against the write.
     ════════════════════════════════════════════════════════════════════════
     """
     # ── Markers normalization (Phase 15: single ingress path) ─────────────
