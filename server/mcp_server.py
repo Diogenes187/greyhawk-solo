@@ -4317,9 +4317,23 @@ def carouse(
         "Current in-game date/time to record, e.g. 'Coldeven 14, 576 CY'. "
         "If omitted, '+1d' is appended to the existing calendar entry.",
     ] = "",
+    character_target: Annotated[
+        str,
+        "Optional name (case-insensitive prefix match) or numeric "
+        "character_id of the carousing character. Leave blank to default "
+        "to the PC. Lets henchmen / hirelings / NPC party members carouse "
+        "and earn the XP themselves — gold debit still comes from the "
+        "shared primary treasury, but XP lands in the carouser's "
+        "class_levels rows.",
+    ] = "",
 ) -> dict:
     """
     Carousing downtime activity — Jeff Rients style.
+
+    Defaults to the PC. Pass character_target to have any tracked
+    character carouse instead — XP equal to the gold spent goes to that
+    character's class_levels rows. Treasury debit comes from the primary
+    party purse regardless.
 
     The character spends an evening (or three) in the taverns and back alleys of
     the nearest settlement. Gold spent is deducted from the primary treasury and
@@ -4330,6 +4344,7 @@ def carouse(
     Results 11-20 are colourful, beneficial, or at worst mixed.
 
     Returns:
+    - character_id (the resolved carouser)
     - gold_spent, treasury_before/after
     - xp_awarded and per-class XP breakdown
     - d20 raw roll, spend_bonus, final_roll
@@ -4341,7 +4356,22 @@ def carouse(
     Jeff Rients carousing XP rule: GP spent = XP earned, period. The night out
     is its own reward. The hangover/enemy/tattoo is the game.
     """
-    return db_carouse(gold_spent=gold_spent, calendar_note=calendar_note)
+    cid: int | None = None
+    if (character_target or "").strip():
+        cid = _resolve_character(character_target)
+        if cid is None:
+            return {
+                "error": (
+                    f"character_target {character_target!r} did not resolve "
+                    "— use list_characters to discover available names/ids."
+                ),
+            }
+    if cid is None:
+        return db_carouse(gold_spent=gold_spent, calendar_note=calendar_note)
+    return db_carouse(
+        gold_spent=gold_spent, calendar_note=calendar_note,
+        character_id=cid,
+    )
 
 
 @mcp.tool()
@@ -4372,9 +4402,22 @@ def research_spell(
         "Current in-game date after the research period, e.g. 'Coldeven 28, 576 CY'. "
         "If omitted, '+N days' is appended to the existing calendar entry.",
     ] = "",
+    character_target: Annotated[
+        str,
+        "Optional name (case-insensitive prefix match) or numeric "
+        "character_id of the researching Magic-User. Leave blank to "
+        "default to the PC. The Intelligence score consulted for the "
+        "success-chance bonus is the researcher's; XP on success goes "
+        "to that character's class_levels. Gold debit still comes from "
+        "the shared primary treasury.",
+    ] = "",
 ) -> dict:
     """
     Magic-User researches a new spell or copies one from a discovered scroll/tome.
+
+    Defaults to the PC. Pass character_target to have a henchman /
+    hireling Magic-User do the research — their INT drives the
+    success-chance bonus, and any XP award lands in their class_levels.
 
     Success chance formula:
       Base 45% + (Intelligence modifier × 5%) + (extra weeks over minimum × 5%)
@@ -4382,7 +4425,7 @@ def research_spell(
 
     On success:
     - Spell is noted as added to spellbook (DM calls update_world_fact to record it)
-    - XP awarded: 100 × spell_level
+    - XP awarded: 100 × spell_level (to the resolved researcher)
     - Calendar advances by days spent
 
     On failure:
@@ -4393,15 +4436,35 @@ def research_spell(
     The spell is not memorized upon research — use memorize_spells after the
     next long rest to prepare it.
 
-    Returns: spell_name, spell_level, success, roll, success_chance_pct,
-    days_spent, gold_spent, expected_cost_gp, xp_awarded, calendar, dm_note.
+    Returns: character_id, spell_name, spell_level, success, roll,
+    success_chance_pct, days_spent, gold_spent, expected_cost_gp,
+    intelligence (the researcher's score), xp_awarded, calendar, dm_note.
     """
+    cid: int | None = None
+    if (character_target or "").strip():
+        cid = _resolve_character(character_target)
+        if cid is None:
+            return {
+                "error": (
+                    f"character_target {character_target!r} did not resolve "
+                    "— use list_characters to discover available names/ids."
+                ),
+            }
+    if cid is None:
+        return db_research_spell(
+            spell_name=spell_name,
+            spell_level=spell_level,
+            days=days,
+            gold_spent=gold_spent,
+            calendar_note=calendar_note,
+        )
     return db_research_spell(
         spell_name=spell_name,
         spell_level=spell_level,
         days=days,
         gold_spent=gold_spent,
         calendar_note=calendar_note,
+        character_id=cid,
     )
 
 

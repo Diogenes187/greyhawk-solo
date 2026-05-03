@@ -4180,22 +4180,31 @@ def _fill_rumour(template: str) -> str:
 # Shared downtime helpers
 # ------------------------------------------------------------------------------
 
-def _award_pc_xp(amount: int) -> dict:
+def _award_pc_xp(amount: int, character_id: int = _PC_CHARACTER_ID) -> dict:
     """
-    Add XP to the PC's class_level rows (split evenly for multi-class).
-    Returns {"xp_awards": [...], "total_xp_awarded": int}.
+    Add XP to a character's class_level rows (split evenly for multi-class).
+    Defaults to the PC. Pass character_id to award to any tracked character —
+    henchman, hireling, NPC. Name kept as _award_pc_xp for back-compat with
+    existing internal callers; the parameter generalizes the helper.
+
+    Returns {"character_id": int, "xp_awards": [...], "total_xp_awarded": int}.
     """
     with _get_conn(read_only=True) as conn:
         cur = conn.cursor()
         cur.execute(
             "SELECT class_level_id, class_name, level, xp "
             "FROM class_levels WHERE character_id = ?",
-            (_PC_CHARACTER_ID,),
+            (character_id,),
         )
         rows = [dict(r) for r in cur.fetchall()]
 
     if not rows:
-        return {"error": "No class_levels found for PC", "xp_awards": [], "total_xp_awarded": 0}
+        return {
+            "error":            f"No class_levels found for character_id={character_id}",
+            "character_id":     character_id,
+            "xp_awards":        [],
+            "total_xp_awarded": 0,
+        }
 
     share = amount // max(1, len(rows))
     updates: list[dict] = []
@@ -4213,7 +4222,11 @@ def _award_pc_xp(amount: int) -> dict:
                 "xp_gained":  share,
                 "xp_after":   new_xp,
             })
-    return {"xp_awards": updates, "total_xp_awarded": amount}
+    return {
+        "character_id":     character_id,
+        "xp_awards":        updates,
+        "total_xp_awarded": amount,
+    }
 
 
 def _log_downtime(activity: str, data: dict) -> None:
@@ -4226,13 +4239,18 @@ def _log_downtime(activity: str, data: dict) -> None:
         )
 
 
-def _get_pc_ability(stat: str) -> int:
-    """Return the PC's score for the named ability (e.g. 'charisma', 'intelligence')."""
+def _get_pc_ability(stat: str, character_id: int = _PC_CHARACTER_ID) -> int:
+    """
+    Return a character's score for the named ability (e.g. 'charisma',
+    'intelligence'). Defaults to the PC. Pass character_id to read any
+    tracked character's score. Returns 10 (the AD&D 1e default) if the
+    row or column is missing.
+    """
     with _get_conn(read_only=True) as conn:
         cur = conn.cursor()
         cur.execute(
             f"SELECT {stat} FROM character_abilities WHERE character_id = ?",
-            (_PC_CHARACTER_ID,),
+            (character_id,),
         )
         row = cur.fetchone()
     return int(row[0]) if row and row[0] is not None else 10
@@ -4299,10 +4317,20 @@ def _downtime_advance_calendar(days: int, calendar_note: str) -> str:
 # PUBLIC DOWNTIME FUNCTIONS
 # ------------------------------------------------------------------------------
 
-def db_carouse(gold_spent: int, calendar_note: str = "") -> dict:
+def db_carouse(
+    gold_spent:   int,
+    calendar_note: str = "",
+    character_id: int = _PC_CHARACTER_ID,
+) -> dict:
     """
     Carousing: spend gold in taverns, earn XP equal to gold spent, roll d20 for
     consequence.  Higher spend tiers add a bonus to the roll (wilder results).
+
+    Defaults to the PC carousing. Pass character_id to have a henchman /
+    hireling / NPC carouse instead — XP is awarded to that character's
+    class_levels rows. Treasury debit comes from the primary account
+    (treasury_id=1) regardless of who's carousing — gold is shared
+    party purse, not per-character.
     """
     if gold_spent < 1:
         return {"error": "gold_spent must be at least 1."}
@@ -4326,8 +4354,8 @@ def db_carouse(gold_spent: int, calendar_note: str = "") -> dict:
     final_roll = max(1, min(20, raw_roll + roll_bonus))
     entry      = _CAROUSING_TABLE[final_roll]
 
-    # XP = gold spent (always, win or lose)
-    xp_result = _award_pc_xp(actual_spent)
+    # XP = gold spent (always, win or lose); awarded to the carousing character.
+    xp_result = _award_pc_xp(actual_spent, character_id=character_id)
 
     # Roll extra dice for mechanical effects
     extra_gold_recovered = 0
@@ -4367,6 +4395,7 @@ def db_carouse(gold_spent: int, calendar_note: str = "") -> dict:
 
     result = {
         "activity":          "carouse",
+        "character_id":      character_id,
         "gold_spent":        actual_spent,
         "treasury_before":   treasury_before,
         "treasury_after":    treasury_after,
@@ -4398,17 +4427,25 @@ def db_research_spell(
     days:          int,
     gold_spent:    int,
     calendar_note: str = "",
+    character_id:  int = _PC_CHARACTER_ID,
 ) -> dict:
     """
     Magic-User researches a new spell or copies one into their spellbook.
     Success chance: base 45% + INT modifier x5% + extra weeks over minimum x5%.
     Cost guideline: 100 gp x spell_level per week.
     XP on success: 100 x spell_level.
+
+    Defaults to the PC. Pass character_id to have a henchman / hireling
+    Magic-User do the research — the INT score consulted is the
+    researching character's, and any XP award goes to that character's
+    class_levels rows. Treasury debit comes from the primary account
+    regardless (gold is shared party purse).
     """
     spell_level = max(1, min(9, spell_level))
     days        = max(1, days)
 
-    int_score = _get_pc_ability("intelligence")
+    # INT score from the researching character (not always the PC).
+    int_score = _get_pc_ability("intelligence", character_id=character_id)
     int_mod   = _ability_mod(int_score)
 
     # Minimum time: spell_level days; typical: spell_level weeks
@@ -4432,7 +4469,7 @@ def db_research_spell(
 
     if success:
         xp_award  = spell_level * 100
-        xp_result = _award_pc_xp(xp_award)
+        xp_result = _award_pc_xp(xp_award, character_id=character_id)
         note = (
             f"'{spell_name}' (level {spell_level}) successfully researched "
             f"and added to spellbook after {days} days."
@@ -4450,6 +4487,7 @@ def db_research_spell(
 
     result = {
         "activity":          "research_spell",
+        "character_id":      character_id,
         "spell_name":        spell_name,
         "spell_level":       spell_level,
         "days_spent":        days,
