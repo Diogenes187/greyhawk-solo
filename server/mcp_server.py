@@ -29,6 +29,7 @@ Tools exposed:
   update_troop_count       -- Set or adjust count on a troop group
   add_troop_group          -- Insert a new troop group (optionally with commander)
   add_livestock            -- Insert a new livestock row at a location
+  remove_livestock         -- Delete a livestock row entirely (audit-logged)
   add_item                 -- Create an item and assign it to inventory (with combat fields, character_target)
   equip_item               -- Set a character's inventory item into a slot
   list_equipped            -- Compact slot-by-slot loadout for mid-combat reference
@@ -842,6 +843,26 @@ def save_turn(
         "parameter for state changes.",
     ] = "",
     markers: MarkersField = [],
+    markers_str: Annotated[
+        str,
+        Field(description=(
+            "DEPRECATED — accepted for backward compatibility but IGNORED. "
+            "The contents are not merged into markers. Use the markers "
+            "array instead. Sending a non-empty value raises a "
+            "deprecation_warning in the response so callers learn to "
+            "drop the field. Will be removed in a future engine pass."
+        )),
+    ] = "",
+    markers_json: Annotated[
+        str,
+        Field(description=(
+            "DEPRECATED — accepted for backward compatibility but IGNORED. "
+            "The contents are not merged into markers. Use the markers "
+            "array instead. Sending a non-empty value raises a "
+            "deprecation_warning in the response so callers learn to "
+            "drop the field. Will be removed in a future engine pass."
+        )),
+    ] = "",
     model_name: Annotated[
         str,
         "Model that generated this turn. Default 'claude'.",
@@ -936,16 +957,41 @@ def save_turn(
         if isinstance(m, str) and m.strip()
     ]
 
+    # ── Phase 16: deprecated-stub warnings (replace silent drop) ─────────
+    # markers_str / markers_json are kept in the schema so old client code
+    # doesn't crash, but their contents are ignored entirely — never merged
+    # into clean_markers (that was the silent-precedence bug from turn 74).
+    # If the caller sent a non-empty value we surface a loud warning in
+    # the response so the model learns to drop the field.
+    deprecation_warnings: list[str] = []
+    if (markers_str or "").strip():
+        deprecation_warnings.append(
+            "markers_str is deprecated and ignored — use the markers "
+            "array instead. Live testing on turns 72-74 confirmed the "
+            "array path is reliable; the markers_str workaround is no "
+            "longer needed and will be removed in a future engine pass."
+        )
+    if (markers_json or "").strip():
+        deprecation_warnings.append(
+            "markers_json is deprecated and ignored — use the markers "
+            "array instead. Live testing on turns 72-74 confirmed the "
+            "array path is reliable; the markers_json workaround is no "
+            "longer needed and will be removed in a future engine pass."
+        )
+
     # Standard logging: one line per save_turn so we can spot a
     # regression of the "non-empty array arrives as None" bug
     # immediately if it ever resurfaces. Cross-reference with the
     # 'normalize_markers' channel entries to confirm what Pydantic saw.
     _log_mcp_debug("save_turn", {
-        "markers_type":       type(markers).__name__,
-        "markers_count":      len(markers or []),
-        "clean_count":        len(clean_markers),
-        "scene_location_set": bool(scene_location),
-        "scene_notes_length": len(scene_notes or ""),
+        "markers_type":             type(markers).__name__,
+        "markers_count":            len(markers or []),
+        "clean_count":              len(clean_markers),
+        "scene_location_set":       bool(scene_location),
+        "scene_notes_length":       len(scene_notes or ""),
+        "markers_str_length":       len(markers_str or ""),
+        "markers_json_length":      len(markers_json or ""),
+        "deprecation_warning_count": len(deprecation_warnings),
     })
 
     structured: dict = {}
@@ -1005,6 +1051,15 @@ def save_turn(
     # burning another turn.
     if markers and not clean_markers:
         result["markers_format_help"] = CANONICAL_MARKER_FORMAT_HELP
+
+    # Phase 16: surface deprecated-stub warnings loudly. Either
+    # `deprecation_warning` (single) or `deprecation_warnings` (multiple)
+    # appears in the response so the model can't miss it.
+    if deprecation_warnings:
+        if len(deprecation_warnings) == 1:
+            result["deprecation_warning"] = deprecation_warnings[0]
+        else:
+            result["deprecation_warnings"] = deprecation_warnings
 
     # Surface conflicts prominently so the DM sees them immediately
     if verification.get("conflicts"):
@@ -1485,6 +1540,13 @@ def add_item(
         "item directly without a follow-up reassignment. Rejects with a "
         "'character_target did not resolve' error if the name/id is unknown.",
     ] = "",
+    auto_vacate: Annotated[
+        bool,
+        "When slot is set and another item already holds that slot for "
+        "this character: True (default) silently displaces it (matches "
+        "equip_item); False raises a slot-conflict error listing the "
+        "current occupant so the caller can decide how to resolve it.",
+    ] = True,
 ) -> dict:
     """
     Create a new item and place it in an inventory.
@@ -1522,6 +1584,7 @@ def add_item(
             armor_class_bonus=armor_class_bonus,
             slot=(slot or None),
             character_target=(character_target or None),
+            auto_vacate=bool(auto_vacate),
         )
         return {"created": True, **result}
     except ValueError as e:
@@ -5833,6 +5896,66 @@ def remove_inventory_item(
             _log_edit(conn, "remove_inventory_item", "inventory",
                       inventory_id, changes, reason)
         return {"ok": True, "inventory_id": inventory_id, "deleted_row": snapshot}
+    finally:
+        conn.close()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TOOL: remove_livestock
+# ══════════════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def remove_livestock(
+    livestock_id: Annotated[
+        int,
+        "livestock_id of the row to delete.",
+    ],
+    reason: Annotated[
+        str,
+        "Why the row is being removed (written to edit_log). Strongly "
+        "recommended so the deletion can be audited later — e.g. 'sold "
+        "30 sheep to Renna smokehouse', 'wolf attack at Olvert',  "
+        "'consolidated into single dairy herd row'.",
+    ] = "",
+) -> dict:
+    """
+    Delete a single livestock row entirely.
+
+    Intended for spinning down stock that's been sold off, slaughtered,
+    or consolidated into another row. For partial losses prefer
+    direct_db_edit on the count column so the row history stays intact.
+
+    The deleted row's prior contents are captured in the edit_log
+    (animal_type, count, location_id, notes) so it can be reconstructed
+    from the audit trail if needed.
+    """
+    try:
+        conn = _open_writable_active()
+    except RuntimeError as e:
+        return {"error": str(e)}
+
+    try:
+        row = conn.execute(
+            "SELECT * FROM livestock WHERE livestock_id = ?",
+            (livestock_id,),
+        ).fetchone()
+        if not row:
+            return {"error": f"No livestock row with livestock_id={livestock_id}."}
+
+        snapshot = dict(row)
+        changes  = [{"field": "__row__", "old": snapshot, "new": None}]
+        with conn:
+            conn.execute(
+                "DELETE FROM livestock WHERE livestock_id = ?",
+                (livestock_id,),
+            )
+            _log_edit(conn, "remove_livestock", "livestock",
+                      livestock_id, changes, reason)
+        return {
+            "ok":           True,
+            "livestock_id": livestock_id,
+            "deleted_row":  snapshot,
+        }
     finally:
         conn.close()
 

@@ -807,6 +807,8 @@ def add_item(
     slot: str | None = None,
     # ── Phase 13: character_target lets non-PC characters receive the item ──
     character_target: str | int | None = None,
+    # ── Phase 16: opt out of slot auto-vacate; surfaces a conflict instead ──
+    auto_vacate: bool = True,
 ) -> dict:
     """
     Create a new item and assign it to an inventory row.
@@ -826,13 +828,25 @@ def add_item(
     slot is character-only and equips the new item directly. Must be a valid
     inventory slot (mainhand, offhand, head, body, cloak, belt, boots,
     gloves, ring1, ring2, neck, back) or None. If slot is set, equipped_flag
-    is also set to 1 to keep the legacy column in sync, and any existing
-    occupant of that slot is auto-vacated. The legacy `equipped` parameter
-    is honored only when slot is None.
+    is also set to 1 to keep the legacy column in sync.
+
+    auto_vacate (Phase 16) controls slot collision behavior when slot is
+    set and another item already holds that slot for this character:
+      True  (default) — vacate the prior occupant (slot → NULL,
+                        equipped_flag → 0) and equip the new item.
+                        Matches equip_item's behavior so the two tools
+                        behave identically.
+      False           — raise ValueError listing the current occupant
+                        rather than silently displacing it. Use when
+                        the caller wants to confirm the slot is free
+                        before committing.
+
+    The legacy `equipped` parameter is honored only when slot is None.
 
     Returns a dict with item_id, inventory_id, and the assignment details.
-    Raises ValueError on bad inputs, missing location/treasury, or an
-    unresolvable character_target.
+    Raises ValueError on bad inputs, missing location/treasury, an
+    unresolvable character_target, or (when auto_vacate=False) a slot
+    that's already occupied.
     """
     _ensure_items_combat_columns()
     _ensure_inventory_slot_column()
@@ -907,6 +921,28 @@ def add_item(
             "characters wear equipment)."
         )
 
+    # Phase 16: when auto_vacate=False and a slot is requested, do the
+    # collision check BEFORE inserting the items row so we don't leave
+    # an orphan items row behind on conflict.
+    if slot is not None and char_id is not None and not auto_vacate:
+        with _get_conn(read_only=True) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT inv.inventory_id, i.name AS item_name "
+                "FROM inventory inv JOIN items i ON i.item_id = inv.item_id "
+                "WHERE inv.character_id = ? AND inv.slot = ? LIMIT 1",
+                (char_id, slot),
+            )
+            occupant = cur.fetchone()
+        if occupant:
+            raise ValueError(
+                f"slot={slot!r} is already occupied on character_id="
+                f"{char_id} by inventory_id={occupant['inventory_id']} "
+                f"({occupant['item_name']!r}). Re-call with "
+                "auto_vacate=True to displace it, or unequip the current "
+                "item first via equip_item(slot='')."
+            )
+
     # Resolve effective equipped_flag: slot wins if given.
     equipped_int = 1 if slot is not None else (1 if equipped else 0)
 
@@ -927,8 +963,10 @@ def add_item(
         )
         item_id = cur.lastrowid
 
-        # If equipping into a specific slot, vacate the current occupant first.
-        if slot is not None and char_id is not None:
+        # If equipping into a specific slot AND auto_vacate=True, displace
+        # the current occupant of that slot for this character. The
+        # auto_vacate=False path was already validated above.
+        if slot is not None and char_id is not None and auto_vacate:
             cur.execute(
                 "UPDATE inventory SET slot = NULL, equipped_flag = 0 "
                 "WHERE character_id = ? AND slot = ?",
