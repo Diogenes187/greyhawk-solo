@@ -429,12 +429,27 @@ def update_treasury(
     cp_delta: int = 0,
     pp_delta: int = 0,
     gems_delta: int = 0,
+    new_account_name: str | None = None,
 ) -> dict:
     """
     Apply signed deltas to a treasury account located by name (case-insensitive
     prefix match). Raises ValueError if the result would go below zero for any
-    denomination. Returns the updated account row.
+    denomination.
+
+    If new_account_name is provided, also rename the account in the same call.
+    The new name must be non-empty and must not collide with any other
+    treasury account in the campaign (case-insensitive exact match). Pass
+    deltas of 0 with a non-None new_account_name to perform a pure rename.
+
+    Returns the updated account row.
     """
+    # Pre-validate the rename target before doing anything destructive.
+    new_name_clean: str | None = None
+    if new_account_name is not None:
+        new_name_clean = new_account_name.strip()
+        if not new_name_clean:
+            raise ValueError("new_account_name may not be empty.")
+
     with _get_conn() as conn:
         cur = conn.cursor()
         cur.execute(
@@ -462,11 +477,33 @@ def update_treasury(
                     f"in '{row['account_name']}'."
                 )
 
+        # Rename collision check (excluding the row being renamed).
+        if new_name_clean is not None:
+            cur.execute(
+                "SELECT treasury_id, account_name FROM treasury_accounts "
+                "WHERE LOWER(account_name) = LOWER(?) AND campaign_id = ? "
+                "  AND treasury_id != ?",
+                (new_name_clean, _CAMPAIGN_ID, tid),
+            )
+            collision = cur.fetchone()
+            if collision:
+                raise ValueError(
+                    f"Cannot rename to '{new_name_clean}' — another treasury "
+                    f"account (treasury_id={collision['treasury_id']}, name="
+                    f"'{collision['account_name']}') already uses that name."
+                )
+
         conn.execute(
             "UPDATE treasury_accounts SET gp=?, sp=?, cp=?, pp=?, gems_gp_value=? "
             "WHERE treasury_id=?",
             (new_gp, new_sp, new_cp, new_pp, new_gems, tid),
         )
+        if new_name_clean is not None:
+            conn.execute(
+                "UPDATE treasury_accounts SET account_name = ? "
+                "WHERE treasury_id = ?",
+                (new_name_clean, tid),
+            )
 
     with _get_conn(read_only=True) as conn:
         cur = conn.cursor()
@@ -532,11 +569,26 @@ def update_location_status(
     name: str,
     new_status: str,
     notes: str | None = None,
+    new_name: str | None = None,
 ) -> dict:
     """
-    Change the status (and optionally notes) of a location by name.
-    Case-insensitive prefix match. Returns the updated row.
+    Change the status (and optionally notes / name) of a location.
+    Looked up by name via case-insensitive prefix match.
+
+    If new_name is provided, also rename the location in the same call.
+    The new name must be non-empty and must not collide with any other
+    location in the campaign (case-insensitive exact match). Useful when
+    a place's canonical name changes ('The Moathouse' -> 'Wyvern Hold')
+    or a working-handle gets formalized.
+
+    Returns the updated row.
     """
+    new_name_clean: str | None = None
+    if new_name is not None:
+        new_name_clean = new_name.strip()
+        if not new_name_clean:
+            raise ValueError("new_name may not be empty.")
+
     with _get_conn(read_only=True) as conn:
         cur = conn.cursor()
         cur.execute(
@@ -549,6 +601,21 @@ def update_location_status(
             raise ValueError(f"Location '{name}' not found.")
         loc_id = row["location_id"]
 
+        if new_name_clean is not None:
+            cur.execute(
+                "SELECT location_id, name FROM locations "
+                "WHERE LOWER(name) = LOWER(?) AND campaign_id = ? "
+                "  AND location_id != ?",
+                (new_name_clean, _CAMPAIGN_ID, loc_id),
+            )
+            collision = cur.fetchone()
+            if collision:
+                raise ValueError(
+                    f"Cannot rename to '{new_name_clean}' — another location "
+                    f"(location_id={collision['location_id']}, name="
+                    f"'{collision['name']}') already uses that name."
+                )
+
     with _get_conn() as conn:
         if notes is not None:
             conn.execute(
@@ -559,6 +626,11 @@ def update_location_status(
             conn.execute(
                 "UPDATE locations SET status = ? WHERE location_id = ?",
                 (new_status, loc_id),
+            )
+        if new_name_clean is not None:
+            conn.execute(
+                "UPDATE locations SET name = ? WHERE location_id = ?",
+                (new_name_clean, loc_id),
             )
 
     with _get_conn(read_only=True) as conn:
@@ -581,16 +653,33 @@ def update_troop_count(
     group_name: str,
     new_count: int | None = None,
     delta: int | None = None,
+    new_group_name: str | None = None,
 ) -> dict:
     """
     Set or adjust the count for a troop group by name (case-insensitive prefix).
     Provide either new_count (absolute) or delta (signed adjustment), not both.
-    Count cannot go below 0. Returns the updated troop row.
+    Count cannot go below 0.
+
+    If new_group_name is provided, also rename the group in the same call.
+    The new name must be non-empty and must not collide with any other
+    troop group in the campaign (case-insensitive exact match). Pass
+    new_count=None and delta=None with a non-None new_group_name to
+    perform a pure rename.
+
+    Returns the updated troop row.
     """
-    if new_count is None and delta is None:
-        raise ValueError("Provide either new_count or delta.")
+    if new_count is None and delta is None and new_group_name is None:
+        raise ValueError(
+            "Provide at least one of new_count, delta, or new_group_name."
+        )
     if new_count is not None and delta is not None:
         raise ValueError("Provide new_count OR delta, not both.")
+
+    new_name_clean: str | None = None
+    if new_group_name is not None:
+        new_name_clean = new_group_name.strip()
+        if not new_name_clean:
+            raise ValueError("new_group_name may not be empty.")
 
     with _get_conn(read_only=True) as conn:
         cur = conn.cursor()
@@ -605,15 +694,41 @@ def update_troop_count(
         troop_id = row["troop_id"]
         current  = row["count"]
 
-    final = new_count if new_count is not None else current + delta
-    if final < 0:
-        raise ValueError(f"Count would go to {final} — cannot have negative troops.")
+        if new_name_clean is not None:
+            cur.execute(
+                "SELECT troop_id, group_name FROM troops "
+                "WHERE LOWER(group_name) = LOWER(?) AND campaign_id = ? "
+                "  AND troop_id != ?",
+                (new_name_clean, _CAMPAIGN_ID, troop_id),
+            )
+            collision = cur.fetchone()
+            if collision:
+                raise ValueError(
+                    f"Cannot rename to '{new_name_clean}' — another troop "
+                    f"group (troop_id={collision['troop_id']}, name="
+                    f"'{collision['group_name']}') already uses that name."
+                )
+
+    # Compute final count only when an actual count change was requested.
+    final: int | None = None
+    if new_count is not None or delta is not None:
+        final = new_count if new_count is not None else current + delta
+        if final < 0:
+            raise ValueError(
+                f"Count would go to {final} — cannot have negative troops."
+            )
 
     with _get_conn() as conn:
-        conn.execute(
-            "UPDATE troops SET count = ? WHERE troop_id = ?",
-            (final, troop_id),
-        )
+        if final is not None:
+            conn.execute(
+                "UPDATE troops SET count = ? WHERE troop_id = ?",
+                (final, troop_id),
+            )
+        if new_name_clean is not None:
+            conn.execute(
+                "UPDATE troops SET group_name = ? WHERE troop_id = ?",
+                (new_name_clean, troop_id),
+            )
 
     with _get_conn(read_only=True) as conn:
         cur = conn.cursor()
@@ -1062,12 +1177,26 @@ def update_npc(
     character_type: str | None = None,
     race: str | None = None,
     alignment: str | None = None,
+    new_name: str | None = None,
 ) -> dict:
     """
     Update mutable fields on an NPC's characters row.
     Looks up by name (case-insensitive prefix match).
+
+    If new_name is provided, also rename the NPC in the same call. The
+    new name must be non-empty and must not collide with any other
+    character in the campaign (case-insensitive exact match). Useful
+    when a placeholder ('the wounded soldier') resolves to a real name,
+    or canonical spellings get standardized.
+
     Returns the full updated character row.
     """
+    new_name_clean: str | None = None
+    if new_name is not None:
+        new_name_clean = new_name.strip()
+        if not new_name_clean:
+            raise ValueError("new_name may not be empty.")
+
     with _get_conn(read_only=True) as conn:
         cur = conn.cursor()
         cur.execute(
@@ -1080,6 +1209,21 @@ def update_npc(
             raise ValueError(f"NPC '{name}' not found in characters table.")
         char_id = row["character_id"]
 
+        if new_name_clean is not None:
+            cur.execute(
+                "SELECT character_id, name FROM characters "
+                "WHERE LOWER(name) = LOWER(?) AND campaign_id = ? "
+                "  AND character_id != ?",
+                (new_name_clean, _CAMPAIGN_ID, char_id),
+            )
+            collision = cur.fetchone()
+            if collision:
+                raise ValueError(
+                    f"Cannot rename to '{new_name_clean}' — another "
+                    f"character (character_id={collision['character_id']}, "
+                    f"name='{collision['name']}') already uses that name."
+                )
+
     fields, values = [], []
     if notes is not None:
         fields.append("notes = ?");          values.append(notes)
@@ -1089,9 +1233,14 @@ def update_npc(
         fields.append("race = ?");           values.append(race)
     if alignment is not None:
         fields.append("alignment = ?");      values.append(alignment)
+    if new_name_clean is not None:
+        fields.append("name = ?");           values.append(new_name_clean)
 
     if not fields:
-        raise ValueError("No fields to update — provide at least one of notes, character_type, race, alignment.")
+        raise ValueError(
+            "No fields to update — provide at least one of notes, "
+            "character_type, race, alignment, or new_name."
+        )
 
     values.append(char_id)
     with _get_conn() as conn:

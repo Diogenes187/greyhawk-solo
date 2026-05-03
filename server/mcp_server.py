@@ -1153,20 +1153,36 @@ def update_treasury(
     cp_delta: Annotated[int, "Copper pieces to add or subtract."] = 0,
     pp_delta: Annotated[int, "Platinum pieces to add or subtract."] = 0,
     gems_delta: Annotated[int, "Gem value in GP to add or subtract."] = 0,
+    new_account_name: Annotated[
+        str,
+        "Optional new name for this treasury account. Leave blank to "
+        "leave the name unchanged. The new name must be non-empty and "
+        "must not collide with another treasury account in the campaign "
+        "(case-insensitive). Pass all-zero deltas with new_account_name "
+        "to perform a pure rename.",
+    ] = "",
 ) -> dict:
     """
-    Add or subtract coins/gems from a treasury account.
+    Add or subtract coins/gems from a treasury account, and optionally
+    rename the account.
 
     Use negative deltas to spend money (e.g. gp_delta=-800 for an 800 gp
-    construction cost). The tool validates that no denomination goes below zero
-    and returns an error instead of allowing overdraft.
+    construction cost). The tool validates that no denomination goes below
+    zero and returns an error instead of allowing overdraft.
 
-    Returns the account's full updated balances as confirmation.
+    Renaming: pass new_account_name to rename the row in the same call.
+    Replaces the off-piste 'go through direct_db_edit' workflow for the
+    standard 'we should call this The Moathouse Vault now' kind of fix.
+    Validation: non-empty, no case-insensitive collision with another
+    treasury account.
+
+    Returns the account's full updated balances + name as confirmation.
     """
     try:
         result = db_update_treasury(
             account_name, gp_delta=gp_delta, sp_delta=sp_delta,
             cp_delta=cp_delta, pp_delta=pp_delta, gems_delta=gems_delta,
+            new_account_name=(new_account_name or None),
         )
         return {"updated": True, **result}
     except ValueError as e:
@@ -1317,12 +1333,21 @@ def update_location_status(
         str,
         "Updated description/notes. Omit (leave blank) to keep existing notes unchanged.",
     ] = "",
+    new_name: Annotated[
+        str,
+        "Optional new canonical name for this location. Leave blank to "
+        "keep the existing name. The new name must be non-empty and "
+        "must not collide with another location in the campaign "
+        "(case-insensitive). Use when a working-handle gets formalized "
+        "or a place's canonical name changes through play.",
+    ] = "",
 ) -> dict:
     """
-    Change the status of an existing location.
+    Change the status (and optionally notes / canonical name) of a location.
 
     Call this when construction completes ('Under Construction' -> 'Active'),
     a location is captured or destroyed, or its operational state changes.
+    Pass new_name to also rename the location in the same call.
 
     Returns the updated location row as confirmation.
     """
@@ -1330,6 +1355,7 @@ def update_location_status(
         result = db_update_location_status(
             name=name, new_status=new_status,
             notes=notes if notes else None,
+            new_name=(new_name or None),
         )
         return {"updated": True, **result}
     except ValueError as e:
@@ -1357,19 +1383,30 @@ def update_troop_count(
         "Adjust count by this signed amount (e.g. -3 for 3 casualties, +5 for recruits). "
         "Provide either new_count OR delta, not both.",
     ] = None,
+    new_group_name: Annotated[
+        str,
+        "Optional new name for this troop group. Leave blank to keep the "
+        "existing name. The new name must be non-empty and must not "
+        "collide with another troop group in the campaign (case-"
+        "insensitive). Pass new_count and delta as None with "
+        "new_group_name to perform a pure rename.",
+    ] = "",
 ) -> dict:
     """
-    Set or adjust the headcount for a troop group.
+    Set or adjust the headcount for a troop group, and optionally rename
+    the group.
 
     Use delta for incremental changes (casualties, desertions, new recruits).
     Use new_count to correct to a known value from hard-copy records.
-    Count cannot go below zero.
+    Count cannot go below zero. Either new_count or delta may be provided
+    (not both); when both are None, only the rename happens.
 
     Returns the updated troop row as confirmation.
     """
     try:
         result = db_update_troop_count(
             group_name=group_name, new_count=new_count, delta=delta,
+            new_group_name=(new_group_name or None),
         )
         return {"updated": True, **result}
     except ValueError as e:
@@ -1698,6 +1735,14 @@ def update_npc(
         str | None,
         "Update alignment (e.g. 'Neutral Good', 'Chaotic Evil'). Omit to leave unchanged.",
     ] = None,
+    new_name: Annotated[
+        str | None,
+        "Optional new canonical name for this character. Useful when a "
+        "placeholder ('the wounded soldier') resolves to a real name, or "
+        "canonical spellings get standardized. Must be non-empty and "
+        "must not collide with another character in the campaign "
+        "(case-insensitive). Omit (or leave None) to keep the current name.",
+    ] = None,
 ) -> dict:
     """
     Update an NPC's record in the database.
@@ -1707,12 +1752,16 @@ def update_npc(
     an ally turns hostile, or someone dies. The notes field is the primary
     place to record narrative state.
 
+    Renaming: pass new_name to also rename the character in the same call.
+    Replaces the off-piste 'go through direct_db_edit' workflow when a
+    placeholder gets resolved to a proper name.
+
     Returns the full updated character row as confirmation.
     """
     try:
         result = db_update_npc(
             name=name, notes=notes, character_type=character_type,
-            race=race, alignment=alignment,
+            race=race, alignment=alignment, new_name=new_name,
         )
         return {"updated": True, **result}
     except ValueError as e:
