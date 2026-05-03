@@ -41,3 +41,7 @@ desktop.ini
 .pytest_cache/
 .coverage
 htmlcov/
+
+# ── Runtime debug logs (mcp_debug.log etc — never commit, always local) ───────
+logs/*
+!logs/.gitkeep

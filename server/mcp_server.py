@@ -102,15 +102,103 @@ Run standalone for testing:
 
 import ast
 import json
+import os
 import random
 import re
 import sqlite3
 import sys
-from datetime import datetime
+import threading
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Any
 
 from pydantic import BeforeValidator, Field
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PHASE 14 — MARKERS INSTRUMENTATION
+#
+# Investigating a long-standing bug where non-empty `markers` arrays passed
+# to save_turn arrive as None (or empty), while empty arrays arrive
+# correctly. Multiple prior investigations have not pinpointed where the
+# value gets dropped — Pydantic BeforeValidator? FastMCP transport? Client
+# serialization? This pass instruments every entry point in the path so we
+# can see, post-hoc, exactly what each layer received.
+#
+# Logs land in <project_root>/logs/mcp_debug.log as one-JSON-object-per-line.
+# That format is tail-friendly, grep-friendly, and easy to ingest into a
+# script for later analysis. Logging is best-effort: any IO failure is
+# caught silently so a broken log file can never break a save_turn call.
+# ══════════════════════════════════════════════════════════════════════════════
+
+_DEBUG_LOG_PATH = Path(__file__).parent.parent / "logs" / "mcp_debug.log"
+_DEBUG_LOG_LOCK = threading.Lock()
+
+
+def _debug_repr(value: Any, max_len: int = 800) -> str:
+    """
+    Best-effort string rep that always succeeds and never explodes the log.
+
+    repr() handles None/list/dict/str cleanly. Long strings are truncated
+    to keep individual log lines readable. Anything that raises in __repr__
+    falls back to the type name plus the exception message.
+    """
+    try:
+        s = repr(value)
+    except Exception as e:
+        return f"<unrepr-able {type(value).__name__}: {e!r}>"
+    if len(s) > max_len:
+        return s[:max_len] + f"...<+{len(s) - max_len} chars truncated>"
+    return s
+
+
+def _log_mcp_debug(channel: str, payload: dict) -> None:
+    """
+    Append one JSON-line entry to logs/mcp_debug.log.
+
+    Best-effort — any failure (no logs/ dir, permission denied, JSON encode
+    error from a stray non-serializable value) is swallowed silently. The
+    debug logger MUST NOT break a save_turn call; the markers bug we're
+    chasing already burns turns when it fires, and a broken logger would
+    burn them again.
+
+    Each entry is prefixed with an ISO-8601 UTC timestamp + the channel
+    name (e.g. 'normalize_markers.entry', 'save_turn.entry',
+    'save_turn.merged'). The payload is forced through a json-safe
+    encoding pass (stringifying anything that doesn't serialize) so a
+    surprise type never tanks the line.
+    """
+    try:
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        # Make the payload safe to json-encode by stringifying anything
+        # that doesn't survive the default encoder.
+        safe_payload = {}
+        for k, v in (payload or {}).items():
+            try:
+                json.dumps(v)
+                safe_payload[k] = v
+            except (TypeError, ValueError):
+                safe_payload[k] = _debug_repr(v)
+        line = json.dumps({
+            "ts":      ts,
+            "pid":     os.getpid(),
+            "channel": channel,
+            "data":    safe_payload,
+        }, ensure_ascii=False)
+
+        # Make sure the directory exists. Best-effort — if we can't create
+        # it, the open() below will fail and the whole call no-ops.
+        try:
+            _DEBUG_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
+        with _DEBUG_LOG_LOCK:
+            with open(_DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+    except Exception:
+        # Never propagate. Logging is observability, not control flow.
+        pass
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -235,24 +323,63 @@ def _normalize_markers(raw: Any) -> list[str]:
       str                    → _split_string_into_markers (5-step fallback)
       anything else          → ValueError (surfaces to the AI as a
                                 Pydantic validation error — never silent)
+
+    Phase 14 instrumentation: every invocation logs the raw input value
+    and resulting normalized list to logs/mcp_debug.log under channel
+    'normalize_markers'. This is the EARLIEST point in the pipeline that
+    user code can intercept the markers parameter — Pydantic calls a
+    BeforeValidator before doing any type coercion. If the value is
+    None/empty here while the wire payload was non-empty, the bug is
+    upstream of Pydantic (FastMCP transport, MCP client, or the model's
+    serialization).
     """
-    if raw is None:
-        return []
-    if isinstance(raw, list):
-        result: list[str] = []
-        for item in raw:
-            if isinstance(item, str):
-                result.extend(_split_string_into_markers(item))
-            # silently drop non-strings inside a list — schema validation
-            # will already have flagged the type elsewhere.
-        return result
-    if isinstance(raw, str):
-        return _split_string_into_markers(raw)
-    raise ValueError(
-        f"markers must be a JSON array of strings (or a string). "
-        f"Received {type(raw).__name__}: {raw!r}. "
-        + CANONICAL_MARKER_FORMAT_HELP
-    )
+    raw_type     = type(raw).__name__
+    raw_repr     = _debug_repr(raw)
+    raw_length   = (len(raw)
+                    if isinstance(raw, (list, str, tuple, dict))
+                    else None)
+
+    try:
+        if raw is None:
+            normalized = []
+        elif isinstance(raw, list):
+            normalized = []
+            for item in raw:
+                if isinstance(item, str):
+                    normalized.extend(_split_string_into_markers(item))
+                # silently drop non-strings inside a list — schema
+                # validation will already have flagged the type.
+        elif isinstance(raw, str):
+            normalized = _split_string_into_markers(raw)
+        else:
+            _log_mcp_debug("normalize_markers.invalid", {
+                "raw_type":    raw_type,
+                "raw_repr":    raw_repr,
+                "raw_length":  raw_length,
+            })
+            raise ValueError(
+                f"markers must be a JSON array of strings (or a string). "
+                f"Received {raw_type}: {raw!r}. " + CANONICAL_MARKER_FORMAT_HELP
+            )
+    except ValueError:
+        raise
+    except Exception as e:
+        _log_mcp_debug("normalize_markers.exception", {
+            "raw_type":   raw_type,
+            "raw_repr":   raw_repr,
+            "raw_length": raw_length,
+            "exception":  f"{type(e).__name__}: {e!r}",
+        })
+        raise
+
+    _log_mcp_debug("normalize_markers", {
+        "raw_type":          raw_type,
+        "raw_length":        raw_length,
+        "raw_repr":          raw_repr,
+        "normalized_count":  len(normalized),
+        "normalized":        normalized,
+    })
+    return normalized
 
 
 # Pydantic-friendly Annotated type alias used by save_turn. Schema is
@@ -707,16 +834,27 @@ def save_turn(
     markers_str: Annotated[
         str,
         Field(description=(
-            "PREFERRED — pipe-delimited markers string. Use this instead of "
-            'the markers array, e.g. markers_str="cast:Charm Person|hp:41>38'
-            '|item_added:Bone token". Live testing shows non-empty arrays '
-            "passed via the markers parameter are dropped by the MCP "
-            "transport, while strings always arrive intact. Each piece "
+            "Pipe-delimited markers string fallback. Use when the markers "
+            "array path is broken in your client, e.g. markers_str="
+            '"cast:Charm Person|hp:41>38|item_added:Bone token". Each piece '
             "between pipes is one marker using one of the canonical "
             "prefixes (cast:, item_added:, item_used:, hp:, spent:, gained:, "
             "npc_added:, location_changed:, troop_change:). Apostrophes and "
             "other special characters are safe inside the value. Pass an "
             "empty string when nothing changed."
+        )),
+    ] = "",
+    markers_json: Annotated[
+        str,
+        Field(description=(
+            "Pre-serialized JSON array string fallback for the markers "
+            'parameter, e.g. markers_json=\'["cast:Fireball","hp:41>38"]\'. '
+            "Bypasses Pydantic's BeforeValidator entirely — useful while "
+            "investigating whether the markers-array drop is a Pydantic "
+            "issue or a transport issue. The handler does json.loads() "
+            "internally and falls back to the same _normalize_markers "
+            "splitter on parse failure. Pass an empty string when nothing "
+            "changed."
         )),
     ] = "",
     model_name: Annotated[
@@ -745,27 +883,27 @@ def save_turn(
     (silence ≠ verified).
 
     ┌──────────────────────────────────────────────────────────────────────┐
-    │ HOW TO PASS MARKERS — PRIMARY METHOD: markers_str                    │
+    │ HOW TO PASS MARKERS — three formats accepted, first non-empty wins   │
     ├──────────────────────────────────────────────────────────────────────┤
-    │ Pipe-delimited string. Pieces separated by | (literal pipe char).    │
+    │ Phase 14 instrumentation pass — three ingress paths logged for       │
+    │ comparison (logs/mcp_debug.log) so we can pin down which one         │
+    │ survives the MCP transport reliably:                                 │
     │                                                                      │
-    │   markers_str="cast:Charm Person|hp:41>38|item_added:Bone token"     │
+    │ 1. markers (array of strings) — canonical interface                  │
+    │      markers=["cast:Charm Person", "hp:41>38",                       │
+    │               "item_added:Bone token"]                               │
     │                                                                      │
-    │ This is the recommended path. Live testing shows the markers ARRAY   │
-    │ parameter is sometimes dropped by the MCP transport on the wire      │
-    │ when non-empty; the string always arrives intact. Use markers_str    │
-    │ until the array bug is fixed upstream.                               │
-    └──────────────────────────────────────────────────────────────────────┘
-
-    ┌──────────────────────────────────────────────────────────────────────┐
-    │ FALLBACK: markers (array of strings)                                 │
-    ├──────────────────────────────────────────────────────────────────────┤
-    │ If you know the array path works in your client, pass:               │
+    │ 2. markers_json (raw JSON-array string) — bypasses Pydantic          │
+    │      markers_json='["cast:Charm Person","hp:41>38",                  │
+    │                     "item_added:Bone token"]'                        │
     │                                                                      │
-    │   markers=["cast:Charm Person", "hp:41>38", "item_added:Bone token"] │
+    │ 3. markers_str (pipe-delimited string) — loosest, always arrived     │
+    │      markers_str="cast:Charm Person|hp:41>38|item_added:Bone token"  │
     │                                                                      │
-    │ The handler accepts both and merges them — but if both are passed,   │
-    │ markers (the array) takes precedence when it has content.            │
+    │ Precedence on merge: markers > markers_json > markers_str. The       │
+    │ response payload reports which one won via the `markers_source`      │
+    │ field and includes raw_type/length on each so a single live turn     │
+    │ tells us which path the model + transport actually deliver.          │
     └──────────────────────────────────────────────────────────────────────┘
 
     One marker per state change. Use these exact prefixes:
@@ -803,23 +941,92 @@ def save_turn(
     is the *write*. verify_turn checks the claim against the write.
     ════════════════════════════════════════════════════════════════════════
     """
+    # ── Phase 14: log raw entry-point state for the markers bug hunt ──────────
+    # See logs/mcp_debug.log under channel 'save_turn.entry'. This is the
+    # earliest point in user code that all three ingress paths are visible
+    # together. Cross-reference with 'normalize_markers' entries (logged
+    # by the BeforeValidator) to see whether the markers array survived
+    # Pydantic intact.
+    _log_mcp_debug("save_turn.entry", {
+        "markers_type":         type(markers).__name__,
+        "markers_count":        len(markers or []),
+        "markers_repr":         _debug_repr(markers),
+        "markers_str_type":     type(markers_str).__name__,
+        "markers_str_length":   len(markers_str or ""),
+        "markers_str_repr":     _debug_repr(markers_str),
+        "markers_json_type":    type(markers_json).__name__,
+        "markers_json_length":  len(markers_json or ""),
+        "markers_json_repr":    _debug_repr(markers_json),
+        "scene_location_set":   bool(scene_location),
+        "scene_notes_length":   len(scene_notes or ""),
+    })
+
     # ── Markers normalization ─────────────────────────────────────────────────
-    # Two ingress paths because non-empty markers arrays sometimes get
-    # dropped by the MCP transport before reaching the handler:
-    #   1. markers       — list[str] (works when the wire allows it)
-    #   2. markers_str   — pipe-delimited string fallback (always arrives)
+    # Three ingress paths while the markers-array bug is under investigation:
+    #   1. markers       — list[str], normalized by Pydantic BeforeValidator
+    #   2. markers_str   — pipe/newline-delimited string fallback
+    #   3. markers_json  — pre-serialized JSON array string (bypasses
+    #                      Pydantic; the handler does json.loads itself)
     #
-    # If the array has any content, prefer it. Otherwise fall back to the
-    # pipe-delimited string. Whatever ends up in clean_markers is what the
-    # turn is verified against.
+    # Precedence: first non-empty source wins. Order is markers > markers_json
+    # > markers_str (array first since it's the canonical interface; json
+    # second because it's the explicit-format fallback; pipe-string last
+    # because it's the loosest format).
     clean_markers = [
         m.strip() for m in (markers or [])
         if isinstance(m, str) and m.strip()
     ]
+    markers_source = "markers" if clean_markers else None
+
+    # ── markers_json: parse JSON, fall back to the same splitter on error ──
+    markers_json_parsed: list[str] = []
+    markers_json_parse_error: str | None = None
+    if not clean_markers and markers_json:
+        try:
+            decoded = json.loads(markers_json)
+            if isinstance(decoded, list):
+                for item in decoded:
+                    if isinstance(item, str) and item.strip():
+                        markers_json_parsed.append(item.strip())
+            elif isinstance(decoded, str) and decoded.strip():
+                # JSON string-of-string — treat as a single marker.
+                markers_json_parsed.append(decoded.strip())
+            else:
+                markers_json_parse_error = (
+                    f"markers_json decoded to {type(decoded).__name__} — "
+                    "expected an array of strings."
+                )
+        except (json.JSONDecodeError, TypeError) as e:
+            # Fall back to recovery heuristics so a sloppy JSON-ish value
+            # still has a chance to land. Try pipe-split first (most
+            # likely model mistake), then the universal splitter.
+            markers_json_parse_error = f"json.loads failed: {e}"
+            if "|" in markers_json:
+                markers_json_parsed = [
+                    p.strip() for p in markers_json.split("|") if p.strip()
+                ]
+            else:
+                markers_json_parsed = _normalize_markers(markers_json)
+
+        if markers_json_parsed:
+            clean_markers = markers_json_parsed
+            markers_source = "markers_json"
+
+    # ── markers_str: pipe-delimited fallback ────────────────────────────────
     if not clean_markers and markers_str:
         clean_markers = [
             p.strip() for p in markers_str.split("|") if p.strip()
         ]
+        if clean_markers:
+            markers_source = "markers_str"
+
+    # ── Phase 14: log the merge outcome ──────────────────────────────────────
+    _log_mcp_debug("save_turn.merged", {
+        "markers_source":           markers_source,    # which path won, or None
+        "clean_markers_count":      len(clean_markers),
+        "clean_markers":            clean_markers,
+        "markers_json_parse_error": markers_json_parse_error,
+    })
 
     structured: dict = {}
     if scene_location:
@@ -857,13 +1064,19 @@ def save_turn(
         # The `*_raw_type` fields show what each ingress path produced:
         # "list" / "str" — value reached the handler intact.
         # "NoneType"     — parameter was dropped before the handler.
+        # markers_source names which path won the merge (or null if all
+        # three were empty).
         "markers_received_raw_type":     type(markers).__name__,
         "markers_received_count":        len(markers or []),
         "markers_str_received_raw_type": type(markers_str).__name__,
         "markers_str_received_length":   len(markers_str or ""),
         "markers_str_pieces_after_split":
             len([p for p in (markers_str or "").split("|") if p.strip()]),
-        "markers_normalized":            clean_markers,
+        "markers_json_received_raw_type": type(markers_json).__name__,
+        "markers_json_received_length":   len(markers_json or ""),
+        "markers_json_parse_error":       markers_json_parse_error,
+        "markers_source":                 markers_source,
+        "markers_normalized":             clean_markers,
         "world_fact_reminder": (
             "Check this turn for anything that should be written to the database "
             "immediately — do not let it live only in chat history. Call "
