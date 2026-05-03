@@ -7801,7 +7801,7 @@ def list_inventory(
                           need the inventory_id to act.
     """
     try:
-        return db_list_inventory(
+        result = db_list_inventory(
             character_target=character_target,
             magic_only=bool(magic_only),
             equipped_only=bool(equipped_only),
