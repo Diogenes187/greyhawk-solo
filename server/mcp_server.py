@@ -113,7 +113,7 @@ import sys
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Callable
 
 from pydantic import BeforeValidator, Field
 
@@ -428,6 +428,364 @@ MarkersField = Annotated[
     )),
 ]
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PHASE 24 — RESPONSE CAP + GENERALIZED SUMMARY PATTERN
+#
+# Several read tools could return >50KB on large campaigns:
+#   get_world_facts()              ~900 KB on Ramun (575 facts, 302 categories)
+#   get_character_state()          ~114 KB on Ramun (full PC sheet + inventory)
+#   get_realm_state()              ~66 KB on Ramun
+#   get_world_facts(category=X)    ~286 KB for the largest single category
+#   get_recent_history(n=20)       ~20 KB at the cap edge
+#   get_domain_state()             ~22 KB at the edge
+#   get_loyalty_state()            ~17 KB, close to cap
+#
+# The MCP harness used to dump >30KB responses to a temp file and ask the
+# caller to read it back in chunks — lossy and forced manual pagination.
+# This pass enforces a 30 KB cap at the tool layer, with two policies:
+#
+#   (A) Degrade-to-summary — for list-shaped tools. When oversize, swap to
+#       a thin-shape summary and append _response_meta with a hint about
+#       how to filter further. The list_inventory.summary_only flag added
+#       in Phase 13 is the explicit opt-in; this is the implicit safety net.
+#
+#   (B) Hard error — for atomic records like get_character_state. The
+#       response IS the data; there's no sensible summary. Caller must
+#       reach for finer-grained tools (list_inventory(magic_only=True),
+#       list_equipped, get_spell_slots, etc.) instead.
+#
+# Both policies surface a _response_meta dict with original_kb /
+# returned_kb / hint so the caller can see what happened and what to do.
+# ══════════════════════════════════════════════════════════════════════════════
+
+DEFAULT_RESPONSE_CAP_BYTES = 30_000   # 30 KB — empirically: above this the
+                                       # MCP harness's truncate-to-file path
+                                       # fires, which is what we're avoiding.
+
+
+def _payload_bytes(payload: Any) -> int:
+    """Serialized JSON byte size of a payload. default=str for non-JSON values."""
+    try:
+        return len(json.dumps(payload, default=str, ensure_ascii=False)
+                   .encode("utf-8"))
+    except (TypeError, ValueError):
+        # If something is genuinely un-serializable, treat as oversize so
+        # we fall through to the safety policy.
+        return 10**9
+
+
+def _cap_response(
+    payload: dict,
+    summary_fn: "Callable[[dict], dict] | None" = None,
+    max_bytes: int = DEFAULT_RESPONSE_CAP_BYTES,
+    error_hint: str = "",
+    tool_name: str = "",
+) -> dict:
+    """
+    Cap a tool's response payload to max_bytes (default 30 KB).
+
+      Under cap                  → return as-is.
+      Over cap + summary_fn      → return summary_fn(payload) with
+                                    _response_meta {degraded: true,
+                                    original_kb, returned_kb, hint}.
+                                    Policy (A): degrade-to-summary.
+      Over cap + no summary_fn   → return {"error": ..., _response_meta}
+                                    with error_hint included.
+                                    Policy (B): hard error, force the
+                                    caller to use finer-grained tools.
+
+    Logs every cap-fired event to logs/mcp_debug.log channel
+    'response_capped' so we have a long-term record of which tools the
+    cap is biting and how often.
+    """
+    original = _payload_bytes(payload)
+    if original <= max_bytes:
+        return payload
+
+    if summary_fn is not None:
+        try:
+            summarized = summary_fn(payload)
+        except Exception as e:
+            # If the summary_fn itself blows up, fall through to the
+            # hard-error path. Don't let a buggy summarizer take down
+            # the whole tool call.
+            _log_mcp_debug("response_capped.summary_fn_failed", {
+                "tool":           tool_name,
+                "original_kb":    round(original / 1024, 1),
+                "exception":      f"{type(e).__name__}: {e!r}",
+            })
+            summary_fn = None
+
+    if summary_fn is not None:
+        returned = _payload_bytes(summarized)
+        # Defensive: if the "summary" is somehow STILL over cap, log and
+        # truncate harder by stripping all but top-level keys.
+        if returned > max_bytes:
+            _log_mcp_debug("response_capped.summary_still_oversize", {
+                "tool":           tool_name,
+                "original_kb":    round(original / 1024, 1),
+                "summary_kb":     round(returned / 1024, 1),
+            })
+        if not isinstance(summarized, dict):
+            summarized = {"_summary": summarized}
+        summarized["_response_meta"] = {
+            "degraded":     True,
+            "original_kb":  round(original / 1024, 1),
+            "returned_kb":  round(returned / 1024, 1),
+            "cap_kb":       round(max_bytes / 1024, 1),
+            "hint": (
+                error_hint or
+                "Response auto-degraded to summary shape. Pass an "
+                "explicit summary parameter (e.g. summary_only=True) "
+                "or use filters to silence this warning."
+            ),
+        }
+        _log_mcp_debug("response_capped.degraded", {
+            "tool":         tool_name,
+            "original_kb":  round(original / 1024, 1),
+            "returned_kb":  round(returned / 1024, 1),
+        })
+        return summarized
+
+    # No summary_fn: hard error.
+    _log_mcp_debug("response_capped.error", {
+        "tool":         tool_name,
+        "original_kb":  round(original / 1024, 1),
+    })
+    return {
+        "error": (
+            f"Response is {round(original/1024, 1)} KB, exceeds the "
+            f"{round(max_bytes/1024)} KB cap. " +
+            (error_hint or "Use a more focused tool to fetch the data you need.")
+        ),
+        "_response_meta": {
+            "degraded":     False,
+            "rejected":     True,
+            "original_kb":  round(original / 1024, 1),
+            "cap_kb":       round(max_bytes / 1024, 1),
+            "hint":         error_hint or "Use finer-grained tools.",
+        },
+    }
+
+
+# ── Tool-specific summary functions ──────────────────────────────────────────
+
+def _summarize_world_facts_categories(payload: dict) -> dict:
+    """
+    For get_world_facts() with no category filter, when the full payload
+    is oversize: drop the fact bodies entirely and return just the
+    category index — a {category_name: count} map. The caller then
+    picks one and re-calls with category=X for the bodies.
+    """
+    by_category = payload.get("by_category", {}) or {}
+    return {
+        "count":               payload.get("count"),
+        "categories_summary":  {
+            cat: len(facts)
+            for cat, facts in by_category.items()
+        },
+        "categories":          sorted(by_category.keys()),
+        "hint": (
+            "Full fact bodies dropped because the payload exceeded the "
+            "response cap. Re-call get_world_facts(category=X) with a "
+            "specific category to retrieve its facts. Categories with "
+            "very high counts (e.g. edit_log) may still trigger the cap "
+            "and degrade to fact previews."
+        ),
+    }
+
+
+def _summarize_world_facts_single_category(payload: dict) -> dict:
+    """
+    For get_world_facts(category=X) when one category alone is oversize
+    (e.g. edit_log on Ramun: ~200 entries x ~1 KB each = 200 KB).
+
+    Two-stage trim:
+      1. Truncate every fact_text to a 200-char preview.
+      2. Cap the number of entries per category at MAX_ENTRIES_PER_CAT
+         (most-recent first by id) so even a category with thousands of
+         entries fits under the response cap.
+
+    Caller fetches specific older entries via direct SQL on
+    world_facts(world_fact_id).
+    """
+    MAX_ENTRIES_PER_CAT = 25
+
+    by_category = payload.get("by_category", {}) or {}
+    summarized: dict = {}
+    truncated_counts: dict = {}
+    for cat, facts in by_category.items():
+        # Most recent first: sort by id descending
+        sorted_facts = sorted(
+            facts,
+            key=lambda f: (f.get("id") or 0),
+            reverse=True,
+        )
+        kept = sorted_facts[:MAX_ENTRIES_PER_CAT]
+        if len(sorted_facts) > MAX_ENTRIES_PER_CAT:
+            truncated_counts[cat] = {
+                "shown":   len(kept),
+                "total":   len(sorted_facts),
+                "dropped": len(sorted_facts) - len(kept),
+            }
+        previews = []
+        for f in kept:
+            body = f.get("fact", "") or ""
+            preview = body if len(body) <= 200 else (body[:197] + "...")
+            previews.append({
+                "id":              f.get("id"),
+                "fact_preview":    preview,
+                "source_note":     f.get("source_note"),
+            })
+        summarized[cat] = previews
+    out = {
+        "count":          payload.get("count"),
+        "categories":     payload.get("categories", []),
+        "by_category":    summarized,
+        "hint": (
+            f"Fact bodies truncated to 200-char previews and per-category "
+            f"entries limited to the most recent {MAX_ENTRIES_PER_CAT}. "
+            "Use direct SQL on world_facts (world_fact_id) for the full "
+            "body of any specific entry, or for entries older than the "
+            "shown window."
+        ),
+    }
+    if truncated_counts:
+        out["truncated_counts"] = truncated_counts
+    return out
+
+
+def _summarize_realm_state(payload: dict) -> dict:
+    """
+    For get_realm_state(): drop the verbose `notes` field on every list
+    row and the troop/treasury detail dicts; keep counts, names, and
+    the summary roll-ups. Caller can fetch full per-table detail via
+    list_treasury_accounts, get_loyalty_state, get_domain_state, etc.
+    """
+    def _strip(rows: list, drop: set) -> list:
+        out = []
+        for row in (rows or []):
+            if isinstance(row, dict):
+                out.append({k: v for k, v in row.items() if k not in drop})
+            else:
+                out.append(row)
+        return out
+
+    return {
+        "locations": _strip(payload.get("locations", []), {"notes"}),
+        "troops":    _strip(payload.get("troops", []), {"notes"}),
+        "treasury":  _strip(payload.get("treasury", []), {"notes"}),
+        "livestock": _strip(payload.get("livestock", []), {"notes"}),
+        "key_npcs":  _strip(payload.get("key_npcs", []),
+                            {"notes", "background", "description"}),
+        "treasury_summary": payload.get("treasury_summary"),
+        "troop_summary":    payload.get("troop_summary"),
+        "hint": (
+            "All `notes` fields stripped to fit under the response cap. "
+            "Use the dedicated list_* / get_* tools for full detail on "
+            "any single sub-table."
+        ),
+    }
+
+
+def _summarize_recent_history(payload: list) -> list:
+    """
+    For get_recent_history(): truncate each turn's player_action and
+    dm_response to 300-char previews. turn_id stays intact so the caller
+    can fetch the full turn via direct SQL on ai_turns if needed.
+    """
+    summarized = []
+    for turn in (payload or []):
+        if not isinstance(turn, dict):
+            summarized.append(turn)
+            continue
+        out = dict(turn)
+        for k in ("player_action", "dm_response"):
+            v = out.get(k) or ""
+            if len(v) > 300:
+                out[k] = v[:297] + "..."
+        summarized.append(out)
+    return summarized
+
+
+def _summarize_domain_state(payload: dict) -> dict:
+    """For get_domain_state(): strip notes from every nested list."""
+    def _strip(rows: list, drop: set) -> list:
+        out = []
+        for row in (rows or []):
+            if isinstance(row, dict):
+                out.append({k: v for k, v in row.items() if k not in drop})
+            else:
+                out.append(row)
+        return out
+    out = dict(payload)
+    out["holdings"]          = _strip(payload.get("holdings", []), {"notes"})
+    out["troops"]             = _strip(payload.get("troops", []), {"notes"})
+    out["treasury_accounts"]  = _strip(payload.get("treasury_accounts", []),
+                                       {"notes"})
+    out["projects"]           = _strip(payload.get("projects", []), {"notes"})
+    out["hint"] = (
+        "All `notes` fields stripped to fit under the response cap. "
+        "Use list_treasury_accounts or direct SQL for full notes."
+    )
+    return out
+
+
+def _summarize_loyalty_state(payload: dict) -> dict:
+    """For get_loyalty_state(): keep names + scores, drop verbose notes."""
+    def _strip_notes(rows: list) -> list:
+        out = []
+        for row in (rows or []):
+            if isinstance(row, dict):
+                kept = {k: v for k, v in row.items()
+                        if k not in {"notes", "history"}}
+                out.append(kept)
+            else:
+                out.append(row)
+        return out
+    return {
+        "npcs":          _strip_notes(payload.get("npcs", [])),
+        "troops":        _strip_notes(payload.get("troops", [])),
+        "at_risk":       payload.get("at_risk", []),
+        "total_tracked": payload.get("total_tracked"),
+        "dm_note":       payload.get("dm_note"),
+        "hint": (
+            "Notes / loyalty history dropped to fit under the response cap. "
+            "Use direct SQL on the relevant table for the full record."
+        ),
+    }
+
+
+def _summarize_inventory(payload: dict) -> dict:
+    """
+    For list_inventory() when the full shape is oversize: degrade to the
+    Phase 13 summary_only=True shape — the 5 fields downstream tools
+    actually need (inventory_id, name, slot, magic_flag, equipped).
+    """
+    items = payload.get("items", []) or []
+    summary_items = [{
+        "inventory_id": it.get("inventory_id"),
+        "name":         it.get("name"),
+        "slot":         it.get("slot"),
+        "magic_flag":   it.get("magic_flag"),
+        "equipped":     it.get("equipped"),
+    } for it in items]
+    return {
+        "character_id":  payload.get("character_id"),
+        "magic_only":    payload.get("magic_only"),
+        "equipped_only": payload.get("equipped_only"),
+        "summary_only":  True,
+        "count":         payload.get("count"),
+        "items":         summary_items,
+        "hint": (
+            "Auto-degraded to summary_only=True shape because full payload "
+            "exceeded the response cap. Pass summary_only=True to silence, "
+            "or use magic_only / equipped_only / search_inventory to narrow."
+        ),
+    }
+
+
 # Allow imports from project root (works whether run from root or server/)
 _ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(_ROOT))
@@ -636,7 +994,20 @@ def get_character_state(
     char["cha"] = abilities.get("charisma")
     char["portrait_path"] = abilities.get("portrait_path")
 
-    return char
+    return _cap_response(
+        char,
+        summary_fn=None,    # atomic record — no summary makes sense
+        tool_name="get_character_state",
+        error_hint=(
+            "Use finer-grained tools instead: list_equipped(character_target) "
+            "for the slot loadout, list_inventory(character_target, "
+            "magic_only=True) for magic items, list_inventory(character_target, "
+            "summary_only=True) for the full inventory in trim shape, "
+            "get_spell_slots(character_target) for memorized spells. "
+            "The HP/AC/abilities header is small enough to fit; only the "
+            "inventory roll-up bloats this response."
+        ),
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -674,7 +1045,11 @@ def get_realm_state() -> dict:
     troop_total = sum(t.get("count", 0) or 0 for t in realm.get("troops", []))
     realm["troop_summary"] = {"total_troops": troop_total}
 
-    return realm
+    return _cap_response(
+        realm,
+        summary_fn=_summarize_realm_state,
+        tool_name="get_realm_state",
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1134,6 +1509,35 @@ def get_recent_history(
     """
     n = max(1, min(n, 20))  # clamp: 1..20
     turns = load_recent_ai_turns(limit=n)
+    # Cap at 30 KB; auto-degrade by truncating each turn's
+    # player_action / dm_response to 300-char previews. This tool returns
+    # a list (not a dict), so we apply the cap manually rather than
+    # routing through _cap_response (which is dict-shaped).
+    if _payload_bytes(turns) > DEFAULT_RESPONSE_CAP_BYTES:
+        original_kb = round(_payload_bytes(turns) / 1024, 1)
+        summarized = _summarize_recent_history(turns)
+        returned_kb = round(_payload_bytes(summarized) / 1024, 1)
+        _log_mcp_debug("response_capped.degraded", {
+            "tool":         "get_recent_history",
+            "original_kb":  original_kb,
+            "returned_kb":  returned_kb,
+        })
+        # Append a meta sentinel as the last list element so callers
+        # iterating the list see it without a separate response shape.
+        return summarized + [{
+            "_response_meta": {
+                "degraded":     True,
+                "original_kb":  original_kb,
+                "returned_kb":  returned_kb,
+                "cap_kb":       round(DEFAULT_RESPONSE_CAP_BYTES / 1024),
+                "hint": (
+                    "Each turn's player_action and dm_response truncated "
+                    "to 300-char previews to fit under cap. Use direct "
+                    "SQL on ai_turns(turn_id) for the full body of any "
+                    "specific turn."
+                ),
+            },
+        }]
     return turns
 
 
@@ -3617,7 +4021,11 @@ def get_domain_state() -> dict:
     Call this at the start of every domain management session and after any
     major transaction. Does not modify any state.
     """
-    return get_full_domain_state()
+    return _cap_response(
+        get_full_domain_state(),
+        summary_fn=_summarize_domain_state,
+        tool_name="get_domain_state",
+    )
 
 
 @mcp.tool()
@@ -4799,7 +5207,11 @@ def get_loyalty_state() -> dict:
     Returns: lists of NPC and troop records, at_risk list, dm_note with
     instructions for running loyalty checks.
     """
-    return db_get_loyalty_state()
+    return _cap_response(
+        db_get_loyalty_state(),
+        summary_fn=_summarize_loyalty_state,
+        tool_name="get_loyalty_state",
+    )
 
 
 @mcp.tool()
@@ -5814,11 +6226,21 @@ def get_world_facts(
             "source_note": r["source_note"],
         })
 
-    return {
+    payload = {
         "count":       len(rows),
         "categories":  sorted(by_category.keys()),
         "by_category": by_category,
     }
+    # Two summary policies based on whether the caller asked for everything
+    # or for a single category. Unfiltered → categories_summary (just
+    # category_name → count). Single category → fact_text previews.
+    summary_fn = (_summarize_world_facts_categories if not cat
+                  else _summarize_world_facts_single_category)
+    return _cap_response(
+        payload,
+        summary_fn=summary_fn,
+        tool_name=f"get_world_facts(category={cat or '<all>'})",
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -7387,6 +7809,15 @@ def list_inventory(
         )
     except ValueError as e:
         return {"error": str(e)}
+    # If the caller already asked for summary_only, no point auto-
+    # degrading; return as-is. Otherwise apply the cap.
+    if summary_only:
+        return result
+    return _cap_response(
+        result,
+        summary_fn=_summarize_inventory,
+        tool_name="list_inventory",
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
