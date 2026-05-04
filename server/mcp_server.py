@@ -11,7 +11,8 @@ Tools exposed:
   session_start         -- One-call briefing: character + scene + history + pending updates
 
   READ
-  get_character_state   -- Theron's full stats, HP, AC, inventory, abilities
+  get_character_state   -- Full sheet incl. inventory (caps when inventory is large; prefer get_character_stats)
+  get_character_stats   -- Core stats only — name/race/classes/abilities/HP/AC/THAC0/saves, no inventory or spells
   get_realm_state       -- All locations, troops, treasury, active projects
   roll_dice             -- Parse and roll any dice expression (e.g. "3d6+2")
   get_current_scene     -- Current location, active NPCs, recent events
@@ -999,13 +1000,252 @@ def get_character_state(
         summary_fn=None,    # atomic record — no summary makes sense
         tool_name="get_character_state",
         error_hint=(
-            "Use finer-grained tools instead: list_equipped(character_target) "
+            "Use finer-grained tools instead: get_character_stats"
+            "(character_target) for the core sheet (name / race / classes / "
+            "abilities / HP / AC / THAC0 / saves) without inventory — that's "
+            "the right tool for session start. list_equipped(character_target) "
             "for the slot loadout, list_inventory(character_target, "
             "magic_only=True) for magic items, list_inventory(character_target, "
             "summary_only=True) for the full inventory in trim shape, "
             "get_spell_slots(character_target) for memorized spells. "
             "The HP/AC/abilities header is small enough to fit; only the "
             "inventory roll-up bloats this response."
+        ),
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TOOL: get_character_stats
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Core stats sheet — the right tool for "what are my numbers?" at session
+# start, replacing get_character_state which now caps because inventory has
+# grown too large. Returns identity (name / race / alignment), class roster
+# (name / level / xp / THAC0 / saves per class), all six abilities, HP / AC /
+# movement / attacks_per_round / status_notes. NO inventory, NO spells —
+# fetch those via list_equipped / list_inventory / get_spell_slots when
+# needed. Designed to fit comfortably under the 30 KB cap on any character.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Cache classes.json once at import. Keys are the canonical Title-Case
+# class names ('Fighter', 'Cleric', 'Magic-User', 'Thief'). The DB stores
+# class_name with various conventions (`magic_user`, `Magic-User`,
+# `magicuser`); _normalize_class_for_data_lookup matches them robustly.
+try:
+    with open(_ROOT / "data" / "classes.json", encoding="utf-8") as _f:
+        _CLASSES_DATA: dict = json.load(_f)
+except Exception:
+    _CLASSES_DATA = {}
+
+
+def _normalize_class_for_data_lookup(stored_name: str) -> str | None:
+    """
+    Map a class name as stored in the class_levels table to the canonical
+    classes.json key (Title-Case). Returns None when no match exists.
+    """
+    if not stored_name:
+        return None
+    needle = stored_name.lower().replace("-", "").replace("_", "").replace(" ", "")
+    for key in _CLASSES_DATA.keys():
+        candidate = key.lower().replace("-", "").replace("_", "").replace(" ", "")
+        if candidate == needle or needle in candidate or candidate in needle:
+            return key
+    return None
+
+
+def _thac0_for_class_level(class_name: str, level: int) -> int | None:
+    """
+    Look up THAC0 for a class + level from classes.json, falling back
+    sensibly if the exact level isn't in the table (use closest <= level).
+    Returns None when the class isn't found.
+    """
+    canonical = _normalize_class_for_data_lookup(class_name)
+    if not canonical:
+        return None
+    table = _CLASSES_DATA.get(canonical, {}).get("thac0_by_level", {}) or {}
+    if not table:
+        return None
+    if str(level) in table:
+        return int(table[str(level)])
+    # Fall back to closest level <= requested
+    avail = sorted([int(k) for k in table if k.isdigit() and int(k) <= level])
+    if avail:
+        return int(table[str(avail[-1])])
+    return None
+
+
+def _saves_for_class_level(class_name: str, level: int) -> dict | None:
+    """
+    Look up saves dict ({'death':N, 'wands':N, 'paralysis':N, 'breath':N,
+    'spells':N}) for a class + level. Same fallback logic as THAC0.
+    """
+    canonical = _normalize_class_for_data_lookup(class_name)
+    if not canonical:
+        return None
+    table = _CLASSES_DATA.get(canonical, {}).get("saves_by_level", {}) or {}
+    if not table:
+        return None
+    if str(level) in table:
+        return dict(table[str(level)])
+    avail = sorted([int(k) for k in table if k.isdigit() and int(k) <= level])
+    if avail:
+        return dict(table[str(avail[-1])])
+    return None
+
+
+@mcp.tool()
+def get_character_stats(
+    character_target: Annotated[
+        str,
+        "Optional name (case-insensitive prefix match) or numeric "
+        "character_id. Leave blank to default to the PC. Same resolution "
+        "as the rest of the character_target tools.",
+    ] = "",
+) -> dict:
+    """
+    Return ONLY the core stats — no inventory, no spells.
+
+    The right tool for session start: 'what are my numbers?'. Designed to
+    fit comfortably under the 30 KB response cap regardless of how big
+    the inventory has grown. Use list_equipped / list_inventory /
+    get_spell_slots for the rest.
+
+    Returns:
+      character_id, name, race, alignment, character_type
+      classes:    [{class_name, level, xp, thac0, saves}, ...]
+      abilities:  {str, int, wis, dex, con, cha}
+      hp_current, hp_max
+      ac
+      thac0_best, saves_best  — multi-class rollup (lowest THAC0,
+                                lowest target per save category across
+                                all of this character's classes)
+      movement, attacks_per_round, status_notes
+
+    Errors clearly when:
+      - character_target doesn't resolve
+      - the character has no character_status row (HP/AC tracking missing)
+    """
+    cid: int | None = None
+    if (character_target or "").strip():
+        cid = _resolve_character(character_target)
+        if cid is None:
+            return {
+                "error": (
+                    f"character_target {character_target!r} did not resolve "
+                    "— use list_characters to discover available names/ids."
+                ),
+            }
+    from engine.db import (_get_conn as _ec,
+                           _PC_CHARACTER_ID as _pc_id)
+    target_id = cid if cid is not None else _pc_id
+
+    with _ec(read_only=True) as conn:
+        cur = conn.cursor()
+        # ── Identity ────────────────────────────────────────────────────────
+        cur.execute(
+            "SELECT character_id, name, character_type, race, alignment, notes "
+            "FROM characters WHERE character_id = ?",
+            (target_id,),
+        )
+        ch = cur.fetchone()
+        if not ch:
+            return {
+                "error": f"No character row with character_id={target_id}.",
+            }
+        # ── Class levels ───────────────────────────────────────────────────
+        cur.execute(
+            "SELECT class_name, level, xp FROM class_levels "
+            "WHERE character_id = ? ORDER BY class_name",
+            (target_id,),
+        )
+        cls_rows = [dict(r) for r in cur.fetchall()]
+        # ── Status ─────────────────────────────────────────────────────────
+        cur.execute(
+            "SELECT hp_current, hp_max, ac, movement, attacks_per_round, "
+            "       status_notes "
+            "FROM character_status WHERE character_id = ?",
+            (target_id,),
+        )
+        status = cur.fetchone()
+        if status is None:
+            return {
+                "error": (
+                    f"character_id={target_id} has no character_status row "
+                    "— stats unavailable. Initialize via update_character_status."
+                ),
+            }
+        status = dict(status)
+        # ── Abilities ──────────────────────────────────────────────────────
+        cur.execute(
+            "SELECT strength, intelligence, wisdom, dexterity, constitution, "
+            "       charisma "
+            "FROM character_abilities WHERE character_id = ?",
+            (target_id,),
+        )
+        abi = cur.fetchone()
+    abi = dict(abi) if abi else {}
+
+    # ── Per-class derived stats (THAC0 + saves) ───────────────────────────
+    classes_out = []
+    thac0_values: list[int] = []
+    saves_acc: dict[str, list[int]] = {}
+    for c in cls_rows:
+        cname = c.get("class_name") or ""
+        lvl   = int(c.get("level") or 1)
+        thac0 = _thac0_for_class_level(cname, lvl)
+        saves = _saves_for_class_level(cname, lvl) or {}
+        classes_out.append({
+            "class_name": cname,
+            "level":      lvl,
+            "xp":         c.get("xp"),
+            "thac0":      thac0,
+            "saves":      saves,
+        })
+        if isinstance(thac0, int):
+            thac0_values.append(thac0)
+        for cat, target in saves.items():
+            saves_acc.setdefault(cat, []).append(int(target))
+
+    # Multi-class rollup: best (lowest) THAC0, best (lowest) save target per category.
+    thac0_best = min(thac0_values) if thac0_values else None
+    saves_best = {cat: min(vals) for cat, vals in saves_acc.items()} or None
+
+    payload = {
+        "character_id":      target_id,
+        "name":              ch["name"],
+        "race":              ch["race"],
+        "alignment":         ch["alignment"],
+        "character_type":    ch["character_type"],
+        "classes":           classes_out,
+        "abilities": {
+            "str": abi.get("strength"),
+            "int": abi.get("intelligence"),
+            "wis": abi.get("wisdom"),
+            "dex": abi.get("dexterity"),
+            "con": abi.get("constitution"),
+            "cha": abi.get("charisma"),
+        },
+        "hp_current":        status.get("hp_current"),
+        "hp_max":            status.get("hp_max"),
+        "ac":                status.get("ac"),
+        "thac0_best":        thac0_best,
+        "saves_best":        saves_best,
+        "movement":          status.get("movement"),
+        "attacks_per_round": status.get("attacks_per_round"),
+        "status_notes":      status.get("status_notes"),
+    }
+    # Cap as a safety net only — this tool is designed to be small. If a
+    # character somehow has a 50-class roster the cap will fire with a
+    # helpful error directing the caller to list_characters.
+    return _cap_response(
+        payload,
+        summary_fn=None,
+        tool_name="get_character_stats",
+        error_hint=(
+            "Stats payload unexpectedly oversized — usually caused by a "
+            "character with an enormous class roster or unusual notes. "
+            "Use list_characters to inspect the basic row, or direct SQL "
+            "on character_status / character_abilities for the raw fields."
         ),
     )
 
