@@ -13,6 +13,8 @@ Tools exposed:
   READ
   get_character_state   -- Full sheet incl. inventory (caps when inventory is large; prefer get_character_stats)
   get_character_stats   -- Core stats only — name/race/classes/abilities/HP/AC/THAC0/saves, no inventory or spells
+  get_saving_throws     -- Just the 5 save target numbers (~150 bytes)
+  get_combat_summary    -- Compact combat card: THAC0, AC, HP, attacks_per_round, equipped weapons (~250 bytes)
   get_realm_state       -- All locations, troops, treasury, active projects
   roll_dice             -- Parse and roll any dice expression (e.g. "3d6+2")
   get_current_scene     -- Current location, active NPCs, recent events
@@ -1251,44 +1253,291 @@ def get_character_stats(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TOOL: get_realm_state
+# TOOL: get_saving_throws
 # ══════════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
-def get_realm_state() -> dict:
+def get_saving_throws(
+    character_target: Annotated[
+        str,
+        "Optional name (case-insensitive prefix match) or numeric "
+        "character_id. Leave blank to default to the PC.",
+    ] = "",
+) -> dict:
     """
-    Return the full state of Theron's realm (Quasquetan and all holdings).
+    Return ONLY the five AD&D 1e saving throw target numbers.
 
-    Includes:
-      locations   -- All 24 named locations with type, status, and parent
-      troops      -- All 13 troop groups with counts, commanders, and billets
-      treasury    -- All treasury accounts with coin and gem totals
-      livestock   -- Animal counts by type across all farms
-      key_npcs    -- Named NPCs with relationship type and notes
+    Compact specialty tool for "what does Caiya save at vs. spells?"
+    style lookups. ~150 bytes — fits anywhere. For multi-class
+    characters, returns the BEST (lowest) target per category across
+    all classes.
 
-    Call this when the player asks about domain affairs, troop dispositions,
-    treasury balance, ongoing construction projects, or NPC whereabouts.
+    Returns:
+      character_id, name
+      saves: {death, wands, paralysis, breath, spells} — best of each
+      saves_by_class: per-class breakdown {class_name: {death, ...}}
+        so the caller can see which class is providing the best save
+        in each category if relevant.
+
+    Errors clearly when the target doesn't resolve or has no class_levels.
     """
+    cid: int | None = None
+    if (character_target or "").strip():
+        cid = _resolve_character(character_target)
+        if cid is None:
+            return {
+                "error": (
+                    f"character_target {character_target!r} did not resolve "
+                    "— use list_characters to discover available names/ids."
+                ),
+            }
+    from engine.db import (_get_conn as _ec,
+                           _PC_CHARACTER_ID as _pc_id)
+    target_id = cid if cid is not None else _pc_id
+
+    with _ec(read_only=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT name FROM characters WHERE character_id = ?",
+            (target_id,),
+        )
+        nm = cur.fetchone()
+        if not nm:
+            return {"error": f"No character with character_id={target_id}."}
+        cur.execute(
+            "SELECT class_name, level FROM class_levels "
+            "WHERE character_id = ? ORDER BY class_name",
+            (target_id,),
+        )
+        cls_rows = [dict(r) for r in cur.fetchall()]
+
+    if not cls_rows:
+        return {
+            "error": (
+                f"character_id={target_id} has no class_levels rows — "
+                "saves cannot be derived. Use add_class_level to "
+                "populate at least one class."
+            ),
+        }
+
+    saves_by_class: dict = {}
+    saves_acc: dict[str, list[int]] = {}
+    for c in cls_rows:
+        cname = c.get("class_name") or ""
+        lvl   = int(c.get("level") or 1)
+        saves = _saves_for_class_level(cname, lvl) or {}
+        if saves:
+            saves_by_class[cname] = saves
+            for cat, target in saves.items():
+                saves_acc.setdefault(cat, []).append(int(target))
+
+    saves_best = ({cat: min(v) for cat, v in saves_acc.items()}
+                  if saves_acc else None)
+
+    return {
+        "character_id":   target_id,
+        "name":           nm["name"],
+        "saves":          saves_best,
+        "saves_by_class": saves_by_class,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TOOL: get_combat_summary
+# ══════════════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def get_combat_summary(
+    character_target: Annotated[
+        str,
+        "Optional name (case-insensitive prefix match) or numeric "
+        "character_id. Leave blank to default to the PC.",
+    ] = "",
+) -> dict:
+    """
+    Return a compact combat card — ~250 bytes — for use mid-combat or
+    for "what are Caiya's swing numbers?" lookups.
+
+    Returns:
+      character_id, name
+      thac0           -- best (lowest) across the character's classes
+      ac, hp_current, hp_max
+      attacks_per_round
+      mainhand        -- {name, damage_dice, damage_bonus, to_hit_bonus,
+                          weapon_type} for the currently equipped
+                          mainhand weapon (or null when no mainhand)
+      offhand         -- same shape for offhand (or null)
+
+    No abilities, no saves, no inventory roll-up — fetch those via
+    get_character_stats / get_saving_throws / list_inventory.
+    """
+    cid: int | None = None
+    if (character_target or "").strip():
+        cid = _resolve_character(character_target)
+        if cid is None:
+            return {
+                "error": (
+                    f"character_target {character_target!r} did not resolve "
+                    "— use list_characters to discover available names/ids."
+                ),
+            }
+    from engine.db import (_get_conn as _ec,
+                           _PC_CHARACTER_ID as _pc_id)
+    target_id = cid if cid is not None else _pc_id
+
+    with _ec(read_only=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT name FROM characters WHERE character_id = ?",
+            (target_id,),
+        )
+        nm_row = cur.fetchone()
+        if not nm_row:
+            return {"error": f"No character with character_id={target_id}."}
+        cur.execute(
+            "SELECT class_name, level FROM class_levels "
+            "WHERE character_id = ?",
+            (target_id,),
+        )
+        cls_rows = [dict(r) for r in cur.fetchall()]
+        cur.execute(
+            "SELECT hp_current, hp_max, ac, attacks_per_round "
+            "FROM character_status WHERE character_id = ?",
+            (target_id,),
+        )
+        st_row = cur.fetchone()
+        # Equipped mainhand + offhand (if any) with their combat fields
+        cur.execute(
+            "SELECT inv.slot, i.name, i.damage_dice, i.damage_bonus, "
+            "       i.to_hit_bonus, i.weapon_type "
+            "FROM inventory inv JOIN items i ON i.item_id = inv.item_id "
+            "WHERE inv.character_id = ? "
+            "  AND inv.slot IN ('mainhand', 'offhand')",
+            (target_id,),
+        )
+        slot_rows = [dict(r) for r in cur.fetchall()]
+
+    # Best (lowest) THAC0 across all classes
+    thac0_values: list[int] = []
+    for c in cls_rows:
+        t = _thac0_for_class_level(
+            c.get("class_name") or "",
+            int(c.get("level") or 1),
+        )
+        if isinstance(t, int):
+            thac0_values.append(t)
+    thac0_best = min(thac0_values) if thac0_values else None
+
+    st = dict(st_row) if st_row else {}
+    by_slot = {r["slot"]: r for r in slot_rows}
+    def _weapon_card(slot: str) -> dict | None:
+        r = by_slot.get(slot)
+        if not r:
+            return None
+        return {
+            "name":         r["name"],
+            "damage_dice":  r["damage_dice"],
+            "damage_bonus": r["damage_bonus"] or 0,
+            "to_hit_bonus": r["to_hit_bonus"] or 0,
+            "weapon_type":  r["weapon_type"],
+        }
+
+    return {
+        "character_id":      target_id,
+        "name":              nm_row["name"],
+        "thac0":             thac0_best,
+        "ac":                st.get("ac"),
+        "hp_current":        st.get("hp_current"),
+        "hp_max":            st.get("hp_max"),
+        "attacks_per_round": st.get("attacks_per_round"),
+        "mainhand":          _weapon_card("mainhand"),
+        "offhand":           _weapon_card("offhand"),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TOOL: get_realm_state
+# ══════════════════════════════════════════════════════════════════════════════
+
+_REALM_SECTIONS = {"all", "locations", "troops", "treasury", "livestock", "npcs"}
+
+
+@mcp.tool()
+def get_realm_state(
+    section: Annotated[
+        str,
+        "Which slice to return. One of: 'all' (default — every section, "
+        "may auto-degrade on rich campaigns), 'locations', 'troops', "
+        "'treasury', 'livestock', 'npcs'. Single-section calls return "
+        "just that list plus the relevant summary roll-up (e.g. "
+        "section='treasury' returns {treasury, treasury_summary}). Use "
+        "the focused sections on rich campaigns to avoid the auto-cap.",
+    ] = "all",
+) -> dict:
+    """
+    Return state of the realm (locations / troops / treasury / livestock / NPCs).
+
+    section='all' (default) returns every section. On large campaigns
+    this may exceed the 30 KB cap and auto-degrade to a summary shape
+    (notes stripped). For surgical access prefer section='troops' /
+    'treasury' / etc — each single-section call carries far less data
+    and stays well under the cap.
+
+    Always returns the relevant summary roll-up alongside the requested
+    section: treasury_summary with treasury, troop_summary with troops.
+    """
+    sec = (section or "all").strip().lower()
+    if sec not in _REALM_SECTIONS:
+        return {
+            "error": f"section must be one of {sorted(_REALM_SECTIONS)}; "
+                     f"got {section!r}.",
+            "allowed_sections": sorted(_REALM_SECTIONS),
+        }
+
     realm = load_realm()
     if not realm:
         return {"error": "Realm data not found in database."}
 
-    # Summarise treasury into a quick total for convenience
-    gp_total = sum(a.get("gp", 0) or 0 for a in realm.get("treasury", []))
-    gems_total = sum(a.get("gems_gp_value", 0) or 0 for a in realm.get("treasury", []))
-    realm["treasury_summary"] = {
-        "liquid_gp": gp_total,
-        "gems_gp_value": gems_total,
+    # Summary roll-ups — always computed, included with their related section.
+    gp_total   = sum(a.get("gp", 0) or 0 for a in realm.get("treasury", []))
+    gems_total = sum(a.get("gems_gp_value", 0) or 0
+                     for a in realm.get("treasury", []))
+    treasury_summary = {
+        "liquid_gp":           gp_total,
+        "gems_gp_value":       gems_total,
         "total_gp_equivalent": gp_total + gems_total,
     }
-
     troop_total = sum(t.get("count", 0) or 0 for t in realm.get("troops", []))
-    realm["troop_summary"] = {"total_troops": troop_total}
+    troop_summary = {"total_troops": troop_total}
+
+    if sec == "all":
+        realm["treasury_summary"] = treasury_summary
+        realm["troop_summary"]    = troop_summary
+        return _cap_response(
+            realm,
+            summary_fn=_summarize_realm_state,
+            tool_name="get_realm_state",
+        )
+
+    # Single-section response.
+    section_payload: dict = {"section": sec}
+    if sec == "locations":
+        section_payload["locations"] = realm.get("locations", [])
+    elif sec == "troops":
+        section_payload["troops"]        = realm.get("troops", [])
+        section_payload["troop_summary"] = troop_summary
+    elif sec == "treasury":
+        section_payload["treasury"]         = realm.get("treasury", [])
+        section_payload["treasury_summary"] = treasury_summary
+    elif sec == "livestock":
+        section_payload["livestock"] = realm.get("livestock", [])
+    elif sec == "npcs":
+        section_payload["key_npcs"] = realm.get("key_npcs", [])
 
     return _cap_response(
-        realm,
+        section_payload,
         summary_fn=_summarize_realm_state,
-        tool_name="get_realm_state",
+        tool_name=f"get_realm_state(section={sec})",
     )
 
 
@@ -1734,21 +1983,35 @@ def save_turn(
 def get_recent_history(
     n: Annotated[
         int,
-        "Number of recent turns to return. Default 5, max 20.",
+        "Number of recent turns to return. Default 5, max 20. Alias of "
+        "limit; keep for back-compat.",
     ] = 5,
+    limit: Annotated[
+        int,
+        "Number of recent turns to return. Default 5, max 20. Preferred "
+        "over n. When both are passed, limit wins.",
+    ] = 0,
 ) -> list[dict]:
     """
     Return the last N turns from the ai_turns table in chronological order.
+
+    Either parameter (n or limit) can be used; limit is the preferred name
+    going forward (matches the rest of the read-tool family). Both are
+    clamped to 1..20 — the tool will never return more than 20 turns.
 
     Each turn includes: turn_id, player_action, dm_response, model_name,
     created_at. Use this to re-establish context when resuming a session,
     resolve continuity questions, or review what was narrated recently.
 
-    Keep N small (5-10) for normal session resumption. Use larger values
-    only when the player explicitly asks about earlier events.
+    Keep small (5-10) for normal session resumption. Use larger values
+    only when the player explicitly asks about earlier events. The cap
+    auto-degrades by truncating each turn's text to 300-char previews
+    if the result is still too large.
     """
-    n = max(1, min(n, 20))  # clamp: 1..20
-    turns = load_recent_ai_turns(limit=n)
+    # `limit` wins when explicitly passed (>0); else fall back to `n`.
+    eff = limit if (limit and limit > 0) else n
+    eff = max(1, min(int(eff or 5), 20))  # clamp 1..20
+    turns = load_recent_ai_turns(limit=eff)
     # Cap at 30 KB; auto-degrade by truncating each turn's
     # player_action / dm_response to 300-char previews. This tool returns
     # a list (not a dict), so we apply the cap manually rather than
@@ -2622,72 +2885,169 @@ def create_character(
 # ══════════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
-def session_start() -> dict:
+def session_start(
+    full: Annotated[
+        bool,
+        "When False (default), returns the LEAN startup briefing — core "
+        "character stats (no inventory), current scene, and the last 5 "
+        "turns. Designed to fit comfortably under the response cap on "
+        "any campaign size. When True, also includes the last 10 turns, "
+        "pending_updates, and the verbose briefing_notes. Pass full=True "
+        "only when you need the comprehensive view — most session starts "
+        "are fine with the lean default.",
+    ] = False,
+) -> dict:
     """
     Call this FIRST at the start of every session, before any narration.
 
-    Returns a single consolidated briefing containing everything needed to
-    resume the campaign accurately:
+    Two modes:
+      full=False (default — LEAN):
+        character       -- Core stats (name/race/classes/abilities/HP/AC/
+                           THAC0/saves) — same shape as get_character_stats
+        scene           -- Current location and last turn context
+        recent_history  -- Last 5 turns in chronological order
+        briefing_notes  -- One-line reminder
 
-      character       -- Full PC stats, HP, AC, ability scores, inventory
-      scene           -- Current location and last turn context
-      recent_history  -- Last 10 turns in chronological order
-      pending_updates -- Turns whose state_changes have not yet been committed
-                         to the database (HP adjustments, treasure, etc.)
-      briefing_notes  -- Session startup checklist for the DM
+      full=True (COMPREHENSIVE):
+        character       -- Same lean stats (no full inventory; use
+                           list_inventory / list_equipped for that)
+        scene           -- Same
+        recent_history  -- Last 10 turns
+        pending_updates -- Turns whose state_changes have not yet been
+                           committed to the database
+        briefing_notes  -- Full DM checklist
+
+    Inventory and spells are deliberately excluded from both modes —
+    fetch via list_equipped / list_inventory / get_spell_slots if needed.
 
     After receiving this briefing you should:
-      1. Resolve any pending_updates before starting — call the appropriate
-         write tools (update_character_status, update_treasury, etc.) for
-         each uncommitted change listed there.
-      2. Orient the player: tell them where they are, what just happened, and
+      1. Pass full=True if you need pending_updates — and resolve any
+         entries before starting (call the appropriate write tools).
+      2. Orient the player: tell them where they are, what just happened,
          what immediate situation they face.
       3. Never invent a state that contradicts what this briefing contains.
     """
-    # ── Character (same flattening as get_character_state) ────────────────────
-    char = load_character() or {}
-    status    = char.pop("status", {}) or {}
-    abilities = char.pop("abilities", {}) or {}
-    char.update({
-        "hp_current":        status.get("hp_current"),
-        "hp_max":            status.get("hp_max"),
-        "ac":                status.get("ac"),
-        "movement":          status.get("movement"),
-        "attacks_per_round": status.get("attacks_per_round"),
-        "status_notes":      status.get("status_notes"),
-        "str": abilities.get("strength"),
-        "int": abilities.get("intelligence"),
-        "wis": abilities.get("wisdom"),
-        "dex": abilities.get("dexterity"),
-        "con": abilities.get("constitution"),
-        "cha": abilities.get("charisma"),
-    })
+    # ── Character: lean shape (same as get_character_stats) ───────────────────
+    # Pulled inline rather than calling get_character_stats so we don't
+    # double-cap and so we keep one DB-connection round trip.
+    from engine.db import (_get_conn as _ec,
+                           _PC_CHARACTER_ID as _pc_id)
+    with _ec(read_only=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT character_id, name, character_type, race, alignment "
+            "FROM characters WHERE character_id = ?",
+            (_pc_id,),
+        )
+        ch = cur.fetchone()
+        cur.execute(
+            "SELECT class_name, level, xp FROM class_levels "
+            "WHERE character_id = ? ORDER BY class_name",
+            (_pc_id,),
+        )
+        cls_rows = [dict(r) for r in cur.fetchall()]
+        cur.execute(
+            "SELECT hp_current, hp_max, ac, movement, attacks_per_round, "
+            "       status_notes "
+            "FROM character_status WHERE character_id = ?",
+            (_pc_id,),
+        )
+        status_row = cur.fetchone()
+        cur.execute(
+            "SELECT strength, intelligence, wisdom, dexterity, constitution, "
+            "       charisma "
+            "FROM character_abilities WHERE character_id = ?",
+            (_pc_id,),
+        )
+        abi = cur.fetchone()
 
-    # ── Scene ─────────────────────────────────────────────────────────────────
-    scene   = load_current_scene() or {}
-    history = load_recent_ai_turns(limit=10)
+    if not ch:
+        char: dict = {"error": "Character not found in database."}
+    else:
+        st  = dict(status_row) if status_row else {}
+        abi = dict(abi) if abi else {}
+        classes_out: list[dict] = []
+        thac0_values: list[int] = []
+        saves_acc: dict[str, list[int]] = {}
+        for c in cls_rows:
+            cname = c.get("class_name") or ""
+            lvl   = int(c.get("level") or 1)
+            thac0 = _thac0_for_class_level(cname, lvl)
+            saves = _saves_for_class_level(cname, lvl) or {}
+            classes_out.append({
+                "class_name": cname, "level": lvl, "xp": c.get("xp"),
+                "thac0": thac0, "saves": saves,
+            })
+            if isinstance(thac0, int):
+                thac0_values.append(thac0)
+            for cat, target in saves.items():
+                saves_acc.setdefault(cat, []).append(int(target))
+        char = {
+            "character_id":      ch["character_id"],
+            "name":              ch["name"],
+            "race":              ch["race"],
+            "alignment":         ch["alignment"],
+            "character_type":    ch["character_type"],
+            "classes":           classes_out,
+            "abilities": {
+                "str": abi.get("strength"),
+                "int": abi.get("intelligence"),
+                "wis": abi.get("wisdom"),
+                "dex": abi.get("dexterity"),
+                "con": abi.get("constitution"),
+                "cha": abi.get("charisma"),
+            },
+            "hp_current":        st.get("hp_current"),
+            "hp_max":            st.get("hp_max"),
+            "ac":                st.get("ac"),
+            "thac0_best":        min(thac0_values) if thac0_values else None,
+            "saves_best":        ({cat: min(v) for cat, v in saves_acc.items()}
+                                  if saves_acc else None),
+            "movement":          st.get("movement"),
+            "attacks_per_round": st.get("attacks_per_round"),
+            "status_notes":      st.get("status_notes"),
+        }
 
+    # ── Scene + recent history ────────────────────────────────────────────────
+    scene = load_current_scene() or {}
+    history = load_recent_ai_turns(limit=10 if full else 5)
     if history:
         scene["last_player_action"]       = history[-1]["player_action"]
         scene["last_dm_response_preview"] = (history[-1]["dm_response"] or "")[:300]
 
-    # ── Pending updates ───────────────────────────────────────────────────────
-    pending = db_get_pending_updates(limit=30)
+    if not full:
+        return {
+            "mode":            "lean",
+            "character":       char,
+            "scene":           scene,
+            "recent_history":  history,
+            "briefing_notes": (
+                "Lean session_start. Pass full=True for pending_updates "
+                "and the full DM checklist. Inventory / spells not "
+                "included — use list_equipped / list_inventory / "
+                "get_spell_slots."
+            ),
+        }
 
+    # full=True: comprehensive briefing
+    pending = db_get_pending_updates(limit=30)
     return {
-        "character":       char if char else {"error": "Character not found in database."},
+        "mode":            "full",
+        "character":       char,
         "scene":           scene,
         "recent_history":  history,
         "pending_updates": pending,
         "briefing_notes": (
             "SESSION STARTUP CHECKLIST — complete before narrating: "
-            "(1) If pending_updates is non-empty, commit each unresolved state "
-            "change now using the appropriate write tools. "
-            "(2) Orient the player from the scene and recent_history context. "
-            "(3) After each turn, call save_turn then act on its "
-            "world_fact_reminder — write every named NPC, item, decision, and "
-            "quest development to the database immediately. Nothing important "
-            "should exist only in chat history."
+            "(1) If pending_updates is non-empty, commit each unresolved "
+            "state change now using the appropriate write tools. "
+            "(2) Orient the player from the scene and recent_history "
+            "context. (3) After each turn, call save_turn then act on its "
+            "world_fact_reminder — write every named NPC, item, decision, "
+            "and quest development to the database immediately. Nothing "
+            "important should exist only in chat history. Inventory and "
+            "spells deliberately excluded — use list_equipped / "
+            "list_inventory / get_spell_slots when you need them."
         ),
     }
 
@@ -2920,15 +3280,29 @@ def start_combat(
 
 
 @mcp.tool()
-def get_combat_state() -> dict:
+def get_combat_state(
+    summary_only: Annotated[
+        bool,
+        "When True, returns the compact combat card: round number, "
+        "current_actor, and a thin initiative_order with only "
+        "{id, name, hp_current, initiative}. Drops AC, hp_max, side, "
+        "status, and combat_log. ~10× smaller; ideal for a quick "
+        "'whose turn is it / who's hurt' check between rounds.",
+    ] = False,
+) -> dict:
     """
-    Return the full current combat state.
+    Return current combat state.
 
-    Includes initiative order, current HP and status for every combatant,
-    round number, and the last 10 entries of the combat log.
+    Default: full state with initiative order, every combatant's HP / AC /
+    status, and the last 10 combat_log entries.
 
-    Call this at the start of any round to verify current state before
-    narrating. If no combat is active, returns an informational message.
+    summary_only=True: compact card with just round / current_actor /
+    {id, name, hp_current, initiative} for each combatant. Use this for
+    quick mid-round "whose turn / who's hurt" lookups; drop into the
+    full call when you actually need stat blocks.
+
+    If no combat is active, returns {"active": false} with an informational
+    message — same in either mode.
     """
     state = get_active_combat()
     if not state:
@@ -2939,13 +3313,33 @@ def get_combat_state() -> dict:
 
     combatants = state.get("combatants", {})
     order      = state.get("initiative_order", [])
+    current_actor = order[state.get("current_actor_index", 0)] if order else ""
+
+    if summary_only:
+        return {
+            "active":         True,
+            "summary_only":   True,
+            "encounter_name": state.get("encounter_name", ""),
+            "round":          state.get("round", 1),
+            "current_actor":  current_actor,
+            "initiative_order": [
+                {
+                    "id":         cid,
+                    "name":       combatants[cid]["name"],
+                    "hp_current": combatants[cid]["hp_current"],
+                    "initiative": combatants[cid]["initiative"],
+                }
+                for cid in order
+                if cid in combatants
+            ],
+        }
 
     return {
         "active":          True,
         "encounter_name":  state.get("encounter_name", ""),
         "location":        state.get("location", ""),
         "round":           state.get("round", 1),
-        "current_actor":   order[state.get("current_actor_index", 0)] if order else "",
+        "current_actor":   current_actor,
         "initiative_order": [
             {
                 "id":         cid,
@@ -4242,29 +4636,73 @@ def generate_treasure(
 # Domain turns · Income · Upkeep · Construction · Realm Events
 # ══════════════════════════════════════════════════════════════════════════════
 
+_DOMAIN_SECTIONS = {"all", "holdings", "troops", "treasury", "projects", "summary"}
+
+
 @mcp.tool()
-def get_domain_state() -> dict:
+def get_domain_state(
+    section: Annotated[
+        str,
+        "Which slice to return. One of: 'all' (default — every section, "
+        "may auto-degrade on rich campaigns), 'holdings', 'troops', "
+        "'treasury', 'projects', 'summary' (just the income / upkeep / "
+        "net range roll-ups + last_domain_turn — the cheapest call, "
+        "ideal for monthly-bookkeeping checks).",
+    ] = "all",
+) -> dict:
     """
-    Return the complete domain status snapshot.
+    Return domain state (holdings / troops / treasury / projects / summary).
 
-    Covers:
-      - All holdings (locations) with their income range and active status
-      - All troop groups with headcount, location, and monthly upkeep cost
-      - All treasury accounts with current balances and a GP total
-      - All construction projects — both established and in-progress — with
-        weeks_remaining and cost_per_week for projects in the construction queue
-      - Estimated monthly income range (sum of active holding rates)
-      - Total monthly troop upkeep
-      - Estimated net monthly range (income minus upkeep)
-      - Last domain turn record
+    section='all' (default) returns every section. On rich campaigns this
+    may exceed the 30 KB cap and auto-degrade. For surgical access prefer
+    section='holdings' / 'projects' / 'summary' / etc — single-section
+    calls are far smaller.
 
-    Call this at the start of every domain management session and after any
-    major transaction. Does not modify any state.
+    Always returns the income / upkeep / net rollup fields alongside the
+    requested section so the financial picture stays visible.
     """
+    sec = (section or "all").strip().lower()
+    if sec not in _DOMAIN_SECTIONS:
+        return {
+            "error": f"section must be one of {sorted(_DOMAIN_SECTIONS)}; "
+                     f"got {section!r}.",
+            "allowed_sections": sorted(_DOMAIN_SECTIONS),
+        }
+
+    full = get_full_domain_state()
+
+    if sec == "all":
+        return _cap_response(
+            full,
+            summary_fn=_summarize_domain_state,
+            tool_name="get_domain_state",
+        )
+
+    # Always include the small monetary roll-ups so the caller has the
+    # bottom-line financial context regardless of which section they ask for.
+    rollup = {
+        "treasury_total_gp":   full.get("treasury_total_gp"),
+        "monthly_income_range": full.get("monthly_income_range"),
+        "monthly_upkeep_gp":   full.get("monthly_upkeep_gp"),
+        "monthly_net_range":   full.get("monthly_net_range"),
+        "last_domain_turn":    full.get("last_domain_turn"),
+    }
+
+    section_payload: dict = {"section": sec, **rollup}
+    if sec == "holdings":
+        section_payload["holdings"] = full.get("holdings", [])
+    elif sec == "troops":
+        section_payload["troops"] = full.get("troops", [])
+    elif sec == "treasury":
+        section_payload["treasury_accounts"] = full.get("treasury_accounts", [])
+    elif sec == "projects":
+        section_payload["projects"] = full.get("projects", [])
+    # 'summary' — rollup only, no list. Already included above.
+
     return _cap_response(
-        get_full_domain_state(),
+        section_payload,
         summary_fn=_summarize_domain_state,
-        tool_name="get_domain_state",
+        tool_name=f"get_domain_state(section={sec})",
     )
 
 
@@ -6409,24 +6847,46 @@ def get_world_facts(
     category: Annotated[
         str,
         "Optional category filter (e.g. 'geography', 'factions', 'rumours'). "
-        "Leave blank to return every fact grouped by category.",
+        "Leave blank to return every fact grouped by category — but on a "
+        "rich campaign that's hundreds of KB and will always auto-degrade. "
+        "Always prefer a specific category for surgical access.",
     ] = "",
+    search: Annotated[
+        str,
+        "Optional case-insensitive substring to match against fact_text. "
+        "Combines with category — pass both to scope to a category AND "
+        "filter by content. Empty string means no substring filter. "
+        "Especially useful for the unbounded edit_log category and "
+        "long-running rumour categories.",
+    ] = "",
+    limit: Annotated[
+        int,
+        "Maximum facts to return after filters apply. 0 (default) means "
+        "no row-count limit at the SQL layer (the response cap may still "
+        "auto-degrade further). Use a small limit (10-50) for surveying "
+        "a long category without auto-degrading.",
+    ] = 0,
 ) -> dict:
     """
-    Return campaign-specific world facts stored via update_world_fact.
+    Return campaign world facts stored via update_world_fact.
 
     World facts are the DM's persistent notes about the setting — canon
     details, secrets, established truths — that need to survive across
-    sessions. Call this whenever you need to check what has already been
-    established before narrating.
+    sessions. The world_facts table grows without bound; never call
+    unfiltered on a rich campaign — always pass at least one of category /
+    search / limit.
+
+    Filters compose: category narrows to one category, search filters
+    by fact_text substring (case-insensitive), limit caps the row count.
+    All three can be combined.
 
     Returns:
-      count       -- total number of facts returned
-      categories  -- list of category names present in the result
-      by_category -- dict of {category: [{id, fact, source_note}, ...]}
+      count          -- number of facts after all filters
+      categories     -- list of category names present in the result
+      by_category    -- {category: [{id, fact, source_note}, ...]}
+      filters_applied -- echo of category / search / limit (for debugging)
 
-    If a category filter is given and no facts match, by_category is empty
-    and count is 0 — not an error.
+    Empty result is not an error — it just means nothing matched.
     """
     active_rel = _active_campaign_rel()
     if not active_rel:
@@ -6435,25 +6895,33 @@ def get_world_facts(
     if not db_path.exists():
         return {"error": f"Active DB missing on disk: {active_rel}"}
 
-    cat = category.strip()
+    cat       = (category or "").strip()
+    needle    = (search or "").strip()
+    limit_int = max(0, int(limit or 0))
+
+    # Build dynamic WHERE
+    where = ["campaign_id = 1"]
+    params: list = []
+    if cat:
+        where.append("category = ? COLLATE NOCASE")
+        params.append(cat)
+    if needle:
+        where.append("LOWER(fact_text) LIKE LOWER(?)")
+        params.append(f"%{needle}%")
+    order = "category, world_fact_id" if not cat else "world_fact_id"
+    sql = (
+        "SELECT world_fact_id, category, fact_text, source_note "
+        "FROM world_facts "
+        f"WHERE {' AND '.join(where)} "
+        f"ORDER BY {order}"
+    )
+    if limit_int > 0:
+        sql += f" LIMIT {limit_int}"
+
     try:
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
-        if cat:
-            rows = conn.execute(
-                "SELECT world_fact_id, category, fact_text, source_note "
-                "FROM world_facts "
-                "WHERE campaign_id = 1 AND category = ? COLLATE NOCASE "
-                "ORDER BY world_fact_id",
-                (cat,),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT world_fact_id, category, fact_text, source_note "
-                "FROM world_facts "
-                "WHERE campaign_id = 1 "
-                "ORDER BY category, world_fact_id"
-            ).fetchall()
+        rows = conn.execute(sql, tuple(params)).fetchall()
         conn.close()
     except sqlite3.Error as e:
         return {"error": f"Read failed: {e}"}
@@ -6470,16 +6938,25 @@ def get_world_facts(
         "count":       len(rows),
         "categories":  sorted(by_category.keys()),
         "by_category": by_category,
+        "filters_applied": {
+            "category": cat or None,
+            "search":   needle or None,
+            "limit":    limit_int or None,
+        },
     }
     # Two summary policies based on whether the caller asked for everything
-    # or for a single category. Unfiltered → categories_summary (just
-    # category_name → count). Single category → fact_text previews.
+    # or for a single category. Unfiltered → categories_summary. Single
+    # category → fact_text previews + per-category 25-row cap.
     summary_fn = (_summarize_world_facts_categories if not cat
                   else _summarize_world_facts_single_category)
     return _cap_response(
         payload,
         summary_fn=summary_fn,
-        tool_name=f"get_world_facts(category={cat or '<all>'})",
+        tool_name=(
+            f"get_world_facts(category={cat or '<all>'}"
+            f"{', search=' + needle if needle else ''}"
+            f"{', limit=' + str(limit_int) if limit_int else ''})"
+        ),
     )
 
 
