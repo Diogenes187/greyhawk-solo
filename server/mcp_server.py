@@ -1549,28 +1549,41 @@ _DICE_RE = re.compile(
     r"^\s*(?:(\d+)\s*[dD])?\s*(\d+)\s*([+-]\s*\d+)?\s*$"
 )
 
-def _parse_dice(expression: str) -> tuple[int, int, int]:
+def _parse_dice(expression: str) -> tuple[int, int, int, int]:
     """
-    Parse a dice expression into (num_dice, die_sides, modifier).
-    Accepts: "d20", "1d20", "3d6", "3d6+2", "2d8-1", "20" (flat number).
-    Returns (num_dice, sides, modifier). Raises ValueError on bad input.
+    Parse a dice expression into (num_dice, die_sides, modifier, multiplier).
+    Accepts:
+      "d20", "1d20", "3d6", "3d6+2", "2d8-1"     standard
+      "2d6*50", "2d6×50", "1d6 * 100"            multiplication (gold etc.)
+      "2d6*50+10"                                 multiply then add modifier
+      "20"                                        flat number (no dice)
+
+    Multiplication semantics: result = (sum_of_dice + modifier) * multiplier.
+    The multiplier defaults to 1.
+
+    Returns (num_dice, sides, modifier, multiplier). Raises ValueError on bad
+    input.
     """
-    expr = expression.strip()
+    # Normalize unicode multiply sign to ASCII '*' so the regex stays simple.
+    expr = expression.strip().replace("×", "*").replace("×", "*")
+
     # Handle bare integer (no dice)
     if re.match(r"^\d+$", expr):
-        return (0, 0, int(expr))
+        return (0, 0, int(expr), 1)
 
+    # Standard dice with optional modifier and optional trailing *N multiplier.
     m = re.match(
-        r"^(\d+)?[dD](\d+)\s*([+-]\s*\d+)?$",
+        r"^(\d+)?[dD](\d+)\s*([+-]\s*\d+)?\s*(?:\*\s*(\d+))?$",
         expr.replace(" ", ""),
     )
     if not m:
         raise ValueError(f"Cannot parse dice expression: '{expression}'")
 
-    num   = int(m.group(1)) if m.group(1) else 1
-    sides = int(m.group(2))
+    num     = int(m.group(1)) if m.group(1) else 1
+    sides   = int(m.group(2))
     mod_str = (m.group(3) or "0").replace(" ", "")
-    mod   = int(mod_str)
+    mod     = int(mod_str)
+    mult    = int(m.group(4)) if m.group(4) else 1
 
     if num < 1:
         raise ValueError("Number of dice must be at least 1.")
@@ -1578,8 +1591,12 @@ def _parse_dice(expression: str) -> tuple[int, int, int]:
         raise ValueError("Die must have at least 2 sides.")
     if num > 100:
         raise ValueError("Maximum 100 dice per roll.")
+    if mult < 1:
+        raise ValueError("Multiplier must be at least 1.")
+    if mult > 10000:
+        raise ValueError("Multiplier capped at 10,000.")
 
-    return (num, sides, mod)
+    return (num, sides, mod, mult)
 
 
 @mcp.tool()
@@ -1587,7 +1604,10 @@ def roll_dice(
     expression: Annotated[
         str,
         "Dice expression to evaluate. Examples: '1d20', 'd6', '3d6+2', "
-        "'2d8-1', '7d6', '4d6'. Use standard NdS+M notation.",
+        "'2d8-1', '7d6'. Multiplication: '2d6*50' (rolls 2d6 then ×50; "
+        "common for gold haul / encumbrance), '1d6×100' (Unicode × is "
+        "also accepted), '2d6*50+10' (modifier first, then multiply). "
+        "Use standard NdS+M[*K] notation.",
     ],
     label: Annotated[
         str,
@@ -1598,23 +1618,30 @@ def roll_dice(
     Roll any standard dice expression and return the full breakdown.
 
     ALWAYS use this tool for mechanical outcomes — attack rolls, damage,
-    saving throws, random encounters, ability checks, morale. Never invent
-    dice results. The engine is the source of truth for all randomness.
+    saving throws, random encounters, ability checks, morale, gold haul.
+    Never invent dice results. The engine is the source of truth.
+
+    Multiplication: NdS[+M]*K rolls NdS, applies the modifier, then
+    multiplies the result by K. Useful for AD&D 1e gold rolls (e.g.
+    treasure type 'A' has '2d6*1000 gp' for the copper line) and any
+    other "roll then scale" mechanic. Both '*' and '×' are accepted.
 
     Returns:
-      expression   -- the expression as given
-      label        -- the label as given
-      num_dice     -- number of dice rolled
-      die_sides    -- sides on each die
-      modifier     -- flat modifier applied
+      expression       -- the expression as given
+      label            -- the label as given
+      num_dice         -- number of dice rolled
+      die_sides        -- sides on each die
+      modifier         -- flat modifier applied
+      multiplier       -- final multiplier (default 1)
       individual_rolls -- list of each die result
-      subtotal     -- sum of dice before modifier
-      total        -- final result (subtotal + modifier)
-      natural_20   -- true if 1d20 and result was 20 (for attack rolls)
-      natural_1    -- true if 1d20 and result was 1 (fumble)
+      subtotal         -- sum of dice (no modifier, no multiplier)
+      pre_multiply     -- subtotal + modifier (the value before *K)
+      total            -- pre_multiply * multiplier (final answer)
+      natural_20       -- true if 1d20 and result was 20 (attack rolls)
+      natural_1        -- true if 1d20 and result was 1 (fumble)
     """
     try:
-        num, sides, mod = _parse_dice(expression)
+        num, sides, mod, mult = _parse_dice(expression)
     except ValueError as e:
         return {"error": str(e), "expression": expression}
 
@@ -1626,16 +1653,19 @@ def roll_dice(
             "num_dice":         0,
             "die_sides":        0,
             "modifier":         mod,
+            "multiplier":       mult,
             "individual_rolls": [],
             "subtotal":         0,
-            "total":            mod,
+            "pre_multiply":     mod,
+            "total":            mod * mult,
             "natural_20":       False,
             "natural_1":        False,
         }
 
-    rolls = [random.randint(1, sides) for _ in range(num)]
+    rolls    = [random.randint(1, sides) for _ in range(num)]
     subtotal = sum(rolls)
-    total = subtotal + mod
+    pre_mult = subtotal + mod
+    total    = pre_mult * mult
 
     return {
         "expression":       expression,
@@ -1643,8 +1673,10 @@ def roll_dice(
         "num_dice":         num,
         "die_sides":        sides,
         "modifier":         mod,
+        "multiplier":       mult,
         "individual_rolls": rolls,
         "subtotal":         subtotal,
+        "pre_multiply":     pre_mult,
         "total":            total,
         "natural_20":       (num == 1 and sides == 20 and rolls[0] == 20),
         "natural_1":        (num == 1 and sides == 20 and rolls[0] == 1),
@@ -2528,8 +2560,23 @@ def add_item(
     ] = 0,
     weapon_type: Annotated[
         str,
-        "Weapon category: one_handed | two_handed | off_hand | ranged | thrown. "
-        "Leave blank for non-weapons.",
+        "Weapon category. Accepted values (no others — the validator "
+        "rejects anything else, including natural weapon names like "
+        "'shortsword' or 'longbow'):\n"
+        "  one_handed  — sword, mace, hammer, dagger held single-handed\n"
+        "  two_handed  — greatsword, polearm, two-handed axe, longbow\n"
+        "                (longbow is two-handed because it requires two\n"
+        "                hands to draw, NOT 'ranged'; 'ranged' is for\n"
+        "                projectile category, see below)\n"
+        "  off_hand    — secondary weapon when dual-wielding (a dagger\n"
+        "                in the off hand for thieves, etc.)\n"
+        "  ranged      — bow / crossbow / sling category — covers any\n"
+        "                weapon whose primary use is firing projectiles\n"
+        "  thrown      — javelin, throwing dagger, hand axe — meant to\n"
+        "                be hurled\n"
+        "  none        — explicit non-weapon (alias for blank). Use for\n"
+        "                armor, shields, gear that has no attack profile.\n"
+        "Leave blank for non-weapons (same as 'none').",
     ] = "",
     armor_class_bonus: Annotated[
         int,
@@ -2570,6 +2617,24 @@ def add_item(
     armor_class_bonus) are written into the items table so they can drive
     attack/AC math without re-parsing the notes field.
 
+    weapon_type — accepted values (anything else is rejected by the
+    validator; do NOT pass natural-language names like 'shortsword' or
+    'longbow'):
+      one_handed  — sword, mace, hammer, dagger held single-handed
+      two_handed  — greatsword, polearm, two-handed axe, longbow
+                    (longbow is two-handed because it takes two hands
+                    to draw — NOT 'ranged'; 'ranged' is the projectile
+                    category, see below)
+      off_hand    — secondary weapon when dual-wielding (a thief's
+                    off-hand dagger, etc.)
+      ranged      — bow / crossbow / sling — any weapon whose primary
+                    use is firing projectiles
+      thrown      — javelin, throwing dagger, hand axe — meant to be
+                    hurled
+      none        — explicit non-weapon (alias for blank). Use for
+                    armor, shields, gear with no attack profile.
+    Leave blank for non-weapons (treated identically to 'none').
+
     slot equips the item directly at insert time (only when assign_to=
     'character'). Pass it for known-equipped purchases like 'a +1 cloak
     of protection put straight on'.
@@ -2581,6 +2646,12 @@ def add_item(
     Returns item_id, inventory_id, character_id (when applicable), and
     assignment details as confirmation.
     """
+    # 'none' is an explicit alias for blank weapon_type — the user-facing
+    # docstring lists it as accepted, so the validator must treat it as
+    # equivalent to the empty string.
+    wt_clean = (weapon_type or "").strip()
+    if wt_clean.lower() == "none":
+        wt_clean = ""
     try:
         result = db_add_item(
             name=name, item_type=item_type, magic_flag=magic_flag,
@@ -2591,7 +2662,7 @@ def add_item(
             damage_dice=(damage_dice or None),
             damage_bonus=damage_bonus,
             to_hit_bonus=to_hit_bonus,
-            weapon_type=(weapon_type or None),
+            weapon_type=(wt_clean or None),
             armor_class_bonus=armor_class_bonus,
             slot=(slot or None),
             character_target=(character_target or None),
@@ -6767,8 +6838,11 @@ def search_history(
     query: Annotated[
         str,
         "Keyword or phrase to search for in past turns. Matching is "
-        "case-insensitive and substring-based (SQL LIKE). Searches both the "
-        "player's action and the DM's narration.",
+        "case-insensitive and substring-based (SQL LIKE). Searches the "
+        "player's action, the DM's narration, AND the structured markers "
+        "field (where cast:X, item_added:Y etc. live) — so spell names, "
+        "item names, and NPC names that only appear in markers are now "
+        "findable.",
     ],
     limit: Annotated[
         int,
@@ -6778,18 +6852,27 @@ def search_history(
 ) -> dict:
     """
     Search the full ai_turns history for a keyword (e.g. an NPC name, place,
-    item) and return matching turns with snippets.
+    item, spell) and return matching turns with snippets.
 
     Complements get_recent_history, which only returns the last N turns.
     Use when the player references something from earlier in the campaign
-    ("that merchant in Hommlet", "the ring we found in the crypt") and you
-    need to ground the recollection in what actually happened.
+    ("that merchant in Hommlet", "the ring we found in the crypt", "when
+    did Ramun cast Cloudkill") and you need to ground the recollection in
+    what actually happened.
+
+    Search coverage:
+      - ai_turns.player_action
+      - ai_turns.dm_response
+      - ai_turns.structured_response_json (catches markers like cast:X)
 
     Returns:
-      query   -- the search string used
-      count   -- number of matches returned
-      matches -- list of {turn_id, created_at, matched_in, player_snippet,
-                 dm_snippet} where matched_in is 'player', 'dm', or 'both'.
+      query                  -- the search string used
+      count                  -- number of matching turns returned
+      total_turns_searched   -- size of the ai_turns table (sanity check)
+      matches                -- list of {turn_id, created_at, matched_in,
+                                player_snippet, dm_snippet, marker_match}
+                                where matched_in is 'player', 'dm',
+                                'markers', or any combination joined by '+'.
     """
     q = (query or "").strip()
     if not q:
@@ -6808,13 +6891,17 @@ def search_history(
     try:
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
+        # Total turn count for sanity-check in the response.
+        total = conn.execute("SELECT COUNT(*) FROM ai_turns").fetchone()[0]
         rows = conn.execute(
-            "SELECT turn_id, player_action, dm_response, created_at "
+            "SELECT turn_id, player_action, dm_response, "
+            "       structured_response_json, created_at "
             "FROM ai_turns "
-            "WHERE player_action LIKE ? COLLATE NOCASE "
-            "   OR dm_response   LIKE ? COLLATE NOCASE "
+            "WHERE player_action            LIKE ? COLLATE NOCASE "
+            "   OR dm_response              LIKE ? COLLATE NOCASE "
+            "   OR structured_response_json LIKE ? COLLATE NOCASE "
             "ORDER BY turn_id DESC LIMIT ?",
-            (like, like, limit),
+            (like, like, like, limit),
         ).fetchall()
         conn.close()
     except sqlite3.Error as e:
@@ -6825,17 +6912,40 @@ def search_history(
     for r in rows:
         pa = r["player_action"] or ""
         dm = r["dm_response"]   or ""
+        sj = r["structured_response_json"] or ""
         in_p = ql in pa.lower()
         in_d = ql in dm.lower()
+        in_m = ql in sj.lower()
+        where_parts = []
+        if in_p: where_parts.append("player")
+        if in_d: where_parts.append("dm")
+        if in_m: where_parts.append("markers")
+        # Try to extract the matched marker so the response is informative.
+        marker_match = ""
+        if in_m and sj:
+            try:
+                struct = json.loads(sj) or {}
+                for m in (struct.get("markers") or []):
+                    if isinstance(m, str) and ql in m.lower():
+                        marker_match = m
+                        break
+            except (json.JSONDecodeError, TypeError):
+                pass
         matches.append({
             "turn_id":        r["turn_id"],
             "created_at":     r["created_at"],
-            "matched_in":     "both" if (in_p and in_d) else ("player" if in_p else "dm"),
+            "matched_in":     "+".join(where_parts) or "unknown",
             "player_snippet": _snippet(pa, q) if in_p else "",
             "dm_snippet":     _snippet(dm, q) if in_d else "",
+            "marker_match":   marker_match,
         })
 
-    return {"query": q, "count": len(matches), "matches": matches}
+    return {
+        "query":                q,
+        "count":                len(matches),
+        "total_turns_searched": total,
+        "matches":              matches,
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -6866,6 +6976,18 @@ def get_world_facts(
         "auto-degrade further). Use a small limit (10-50) for surveying "
         "a long category without auto-degrading.",
     ] = 0,
+    fact_ids: Annotated[
+        str,
+        "Direct-lookup escape hatch for 'is fact #N still alive?' style "
+        "questions. Comma-separated list of integer world_fact_ids "
+        "(e.g. '842,907,1041') OR a JSON array string. When non-empty, "
+        "category / search / limit are IGNORED — the result returns "
+        "exactly the rows whose world_fact_id is in this set, plus a "
+        "missing_ids list naming any IDs that didn't resolve (so the "
+        "caller can distinguish 'fact deleted' from 'fact in another "
+        "campaign'). Bypasses the substring-search index entirely; "
+        "useful when search_index gaps are suspected.",
+    ] = "",
 ) -> dict:
     """
     Return campaign world facts stored via update_world_fact.
@@ -6874,17 +6996,22 @@ def get_world_facts(
     details, secrets, established truths — that need to survive across
     sessions. The world_facts table grows without bound; never call
     unfiltered on a rich campaign — always pass at least one of category /
-    search / limit.
+    search / limit / fact_ids.
 
-    Filters compose: category narrows to one category, search filters
-    by fact_text substring (case-insensitive), limit caps the row count.
-    All three can be combined.
+    Filters compose (except fact_ids, which is exclusive):
+      - category narrows to one category
+      - search filters by fact_text substring (case-insensitive)
+      - limit caps the row count
+      - fact_ids does direct PK lookup, ignoring everything else
 
     Returns:
-      count          -- number of facts after all filters
+      count          -- number of facts returned
       categories     -- list of category names present in the result
       by_category    -- {category: [{id, fact, source_note}, ...]}
-      filters_applied -- echo of category / search / limit (for debugging)
+      filters_applied -- echo of category / search / limit / fact_ids
+      missing_ids    -- (only present when fact_ids was used) IDs that
+                        didn't resolve — so the caller can distinguish
+                        a deleted row from an existing one
 
     Empty result is not an error — it just means nothing matched.
     """
@@ -6899,7 +7026,69 @@ def get_world_facts(
     needle    = (search or "").strip()
     limit_int = max(0, int(limit or 0))
 
-    # Build dynamic WHERE
+    # ── fact_ids direct-lookup path ──────────────────────────────────────────
+    fid_raw = (fact_ids or "").strip()
+    requested_ids: list[int] = []
+    if fid_raw:
+        # Try JSON array first; fall back to comma-separated parse.
+        try:
+            decoded = json.loads(fid_raw)
+            if isinstance(decoded, list):
+                requested_ids = [int(x) for x in decoded
+                                 if isinstance(x, (int, str)) and str(x).strip().isdigit()]
+        except (json.JSONDecodeError, TypeError, ValueError):
+            requested_ids = []
+        if not requested_ids:
+            for part in fid_raw.split(","):
+                p = part.strip()
+                if p.isdigit():
+                    requested_ids.append(int(p))
+        if not requested_ids:
+            return {
+                "error": (
+                    f"fact_ids parsed to no integer ids: {fid_raw!r}. Use "
+                    "either a comma-separated list ('842,907') or a JSON "
+                    "array ('[842, 907]')."
+                ),
+            }
+
+    if requested_ids:
+        placeholders = ",".join("?" for _ in requested_ids)
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                f"SELECT world_fact_id, category, fact_text, source_note "
+                f"FROM world_facts "
+                f"WHERE campaign_id = 1 AND world_fact_id IN ({placeholders}) "
+                f"ORDER BY world_fact_id",
+                requested_ids,
+            ).fetchall()
+            conn.close()
+        except sqlite3.Error as e:
+            return {"error": f"Read failed: {e}"}
+
+        by_category: dict[str, list[dict]] = {}
+        found_ids: set[int] = set()
+        for r in rows:
+            found_ids.add(int(r["world_fact_id"]))
+            by_category.setdefault(r["category"], []).append({
+                "id":          r["world_fact_id"],
+                "fact":        r["fact_text"],
+                "source_note": r["source_note"],
+            })
+        missing = [i for i in requested_ids if i not in found_ids]
+        # No cap path on direct lookup — the caller specifically asked for
+        # these N rows and presumably knows it's a short list.
+        return {
+            "count":       len(rows),
+            "categories":  sorted(by_category.keys()),
+            "by_category": by_category,
+            "missing_ids": missing,
+            "filters_applied": {"fact_ids": requested_ids},
+        }
+
+    # ── Standard category / search / limit path ─────────────────────────────
     where = ["campaign_id = 1"]
     params: list = []
     if cat:
@@ -7610,18 +7799,37 @@ def direct_db_edit(
         "Short reason for the edit, written to the edit_log. Strongly "
         "recommended for any canon override.",
     ] = "",
+    confirm: Annotated[
+        bool,
+        "Two-stage write protection. When False (default), the tool "
+        "returns a PREVIEW — the current row contents plus the proposed "
+        "diff — and DOES NOT WRITE. The caller must verify the row is "
+        "the intended target, then re-call with confirm=True to commit. "
+        "Prevents accidental overwrites caused by passing the wrong "
+        "id_value (the bug that produced the spellbook-notes mis-attach "
+        "incident). Pass confirm=True directly when you're certain — "
+        "e.g. from a chained call where the id was just looked up.",
+    ] = False,
 ) -> dict:
     """
     Override any single row in the active campaign DB.
 
-    Swiss-army tool for data correction when no specific tool fits. All
-    validation is done before the write:
+    Swiss-army tool for data correction when no specific tool fits.
 
+    Validation runs in this order:
       1. Table exists and is not a system table.
       2. id_field is a column of that table.
       3. Every key in updates_json is a column of that table.
       4. The primary-key column is not among the keys (no row-renumbering).
       5. A single row with id_field = id_value exists.
+
+    Two-stage write (confirm gate):
+      - confirm=False (default): returns {"preview": True, "current_row":
+        {...full row...}, "proposed_changes": [{field, old, new}, ...],
+        "note": "..."}. NO WRITE happens. Caller verifies the row is
+        what they intended, then re-calls with confirm=True.
+      - confirm=True: same validation, then commits. Returns
+        {"ok": True, "changes": [...]}.
 
     The update is wrapped in a transaction together with the edit_log
     insert, so partial writes cannot occur. Every old/new value pair is
@@ -7686,6 +7894,28 @@ def direct_db_edit(
         if not applied:
             return {"ok": True, "unchanged": True, "table": table, "id": id_value}
 
+        # ── Confirm gate: preview-and-stop unless confirm=True ───────────
+        if not confirm:
+            return {
+                "preview":          True,
+                "table":            table,
+                "id_field":         id_field,
+                "id":               id_value,
+                "current_row":      dict(row),
+                "proposed_changes": changes,
+                "note": (
+                    "Preview only — NO WRITE happened. Verify "
+                    f"{id_field}={id_value} is the row you meant to edit "
+                    "(the current_row contents are above), then re-call "
+                    "with confirm=True to commit. This guard exists "
+                    "because earlier mis-attach bugs (e.g. spellbook "
+                    "notes ending up on a different inventory_id) were "
+                    "all caused by writing to the wrong id without "
+                    "verifying first."
+                ),
+            }
+
+        # confirm=True: commit.
         set_clause = ", ".join(f"{k} = ?" for k in applied)
         params     = list(applied.values()) + [id_value]
         with conn:
