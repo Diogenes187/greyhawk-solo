@@ -9771,6 +9771,417 @@ def db_list_treasury_accounts() -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# PHASE 29 — TRADE CIRCUIT TRACKER
+# Recurring merchant-circuit income on predictable cycles. Each circuit has a
+# fixed cycle in days, a min/max gp range, and an optional linked treasury
+# account that gets auto-credited when a return is logged.
+# Schema lives below; _ensure_trade_circuits_tables runs an idempotent
+# CREATE TABLE IF NOT EXISTS at the top of every public function so existing
+# campaign DBs auto-migrate on first use without any manual step.
+# ══════════════════════════════════════════════════════════════════════════════
+
+_TRADE_CIRCUITS_DDL = """
+CREATE TABLE IF NOT EXISTS trade_circuits (
+    circuit_id            INTEGER PRIMARY KEY,
+    campaign_id           INTEGER NOT NULL,
+    name                  TEXT NOT NULL,
+    description           TEXT,
+    cycle_days            INTEGER NOT NULL,
+    income_min_gp         INTEGER NOT NULL DEFAULT 0,
+    income_max_gp         INTEGER NOT NULL DEFAULT 0,
+    last_return_day       INTEGER,
+    next_due_day          INTEGER,
+    treasury_account_name TEXT,
+    active                INTEGER NOT NULL DEFAULT 1,
+    notes                 TEXT,
+    FOREIGN KEY (campaign_id) REFERENCES campaigns(campaign_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_trade_circuits_active
+    ON trade_circuits(campaign_id, active, next_due_day);
+
+CREATE TABLE IF NOT EXISTS circuit_ledger (
+    ledger_id        INTEGER PRIMARY KEY,
+    campaign_id      INTEGER NOT NULL,
+    circuit_id       INTEGER NOT NULL,
+    day              INTEGER NOT NULL,
+    amount_gp        INTEGER NOT NULL,
+    treasury_account TEXT,
+    notes            TEXT,
+    created_at       TEXT NOT NULL,
+    FOREIGN KEY (campaign_id) REFERENCES campaigns(campaign_id),
+    FOREIGN KEY (circuit_id)  REFERENCES trade_circuits(circuit_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_circuit_ledger_circuit
+    ON circuit_ledger(circuit_id, day);
+"""
+
+
+def _ensure_trade_circuits_tables(conn) -> None:
+    """Idempotent runtime migration. Safe to call on every entry."""
+    conn.executescript(_TRADE_CIRCUITS_DDL)
+
+
+def _resolve_circuit_id_by_name(conn, circuit_name: str) -> tuple[int, str] | None:
+    """
+    Case-insensitive exact match wins; falls back to prefix. Returns
+    (circuit_id, canonical_name) or None.
+    """
+    s = (circuit_name or "").strip()
+    if not s:
+        return None
+    row = conn.execute(
+        "SELECT circuit_id, name FROM trade_circuits "
+        "WHERE campaign_id = ? AND LOWER(name) = LOWER(?) LIMIT 1",
+        (_CAMPAIGN_ID, s),
+    ).fetchone()
+    if row:
+        return row["circuit_id"], row["name"]
+    row = conn.execute(
+        "SELECT circuit_id, name FROM trade_circuits "
+        "WHERE campaign_id = ? AND LOWER(name) LIKE LOWER(?) LIMIT 1",
+        (_CAMPAIGN_ID, s + "%"),
+    ).fetchone()
+    if row:
+        return row["circuit_id"], row["name"]
+    return None
+
+
+def _campaign_current_day() -> int:
+    """
+    Best-effort current campaign day from the PC's aging record. Returns 0 if
+    the campaign has never advanced via advance_time (no aging record yet).
+    """
+    aging = _get_aging_record(_PC_CHARACTER_ID)
+    if aging and isinstance(aging.get("campaign_days_elapsed"), (int, float)):
+        return int(aging["campaign_days_elapsed"])
+    return 0
+
+
+def db_add_trade_circuit(
+    name:                  str,
+    cycle_days:            int,
+    income_min_gp:         int = 0,
+    income_max_gp:         int = 0,
+    description:           str | None = None,
+    treasury_account_name: str | None = None,
+    last_return_day:       int = 0,
+    notes:                 str | None = None,
+) -> dict:
+    """
+    Register a new trade circuit. Validates name uniqueness, the income
+    range (max >= min, both non-negative), and the linked treasury account
+    (if provided — must already exist). next_due_day is computed
+    automatically as last_return_day + cycle_days.
+
+    Returns the freshly-inserted row.
+    """
+    nm = (name or "").strip()
+    if not nm:
+        raise ValueError("name is required and may not be empty.")
+    if not isinstance(cycle_days, int) or cycle_days < 1:
+        raise ValueError("cycle_days must be a positive integer.")
+    if income_min_gp < 0 or income_max_gp < 0:
+        raise ValueError("income figures may not be negative.")
+    if income_max_gp < income_min_gp:
+        raise ValueError("income_max_gp must be >= income_min_gp.")
+
+    canonical_treasury: str | None = None
+    last_day = max(0, int(last_return_day or 0))
+    next_due = last_day + int(cycle_days)
+
+    with _get_conn() as conn:
+        _ensure_trade_circuits_tables(conn)
+
+        if treasury_account_name and treasury_account_name.strip():
+            ta_row = conn.execute(
+                "SELECT account_name FROM treasury_accounts "
+                "WHERE LOWER(account_name) LIKE LOWER(?) AND campaign_id = ? LIMIT 1",
+                (f"{treasury_account_name.strip()}%", _CAMPAIGN_ID),
+            ).fetchone()
+            if not ta_row:
+                raise ValueError(
+                    f"treasury_account_name '{treasury_account_name}' did not match any "
+                    f"treasury account in this campaign. Add it via add_treasury_account "
+                    f"first, or pass blank to defer linking."
+                )
+            canonical_treasury = ta_row["account_name"]
+
+        dup = conn.execute(
+            "SELECT circuit_id, name FROM trade_circuits "
+            "WHERE campaign_id = ? AND LOWER(name) = LOWER(?)",
+            (_CAMPAIGN_ID, nm),
+        ).fetchone()
+        if dup:
+            raise ValueError(
+                f"A trade circuit named '{dup['name']}' already exists "
+                f"(circuit_id={dup['circuit_id']})."
+            )
+
+        cur = conn.execute(
+            "INSERT INTO trade_circuits "
+            "(campaign_id, name, description, cycle_days, income_min_gp, "
+            " income_max_gp, last_return_day, next_due_day, "
+            " treasury_account_name, active, notes) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)",
+            (_CAMPAIGN_ID, nm, description, int(cycle_days),
+             int(income_min_gp), int(income_max_gp),
+             last_day, next_due,
+             canonical_treasury, notes),
+        )
+        new_id = cur.lastrowid
+
+        row = conn.execute(
+            "SELECT * FROM trade_circuits WHERE circuit_id = ?",
+            (new_id,),
+        ).fetchone()
+
+    return _row_to_dict(row)
+
+
+def db_list_trade_circuits(current_day: int | None = None) -> dict:
+    """
+    Return every circuit in the campaign with derived status fields.
+    current_day defaults to the PC's campaign_days_elapsed (or 0 if absent).
+    Each row carries last_amount_gp, days_overdue (0 if not overdue), and
+    projected_annual_income_gp (mid-of-range × cycles/year).
+    """
+    today = _campaign_current_day() if current_day is None else int(current_day)
+    out: list[dict] = []
+    with _get_conn() as conn:
+        _ensure_trade_circuits_tables(conn)
+        rows = conn.execute(
+            "SELECT * FROM trade_circuits WHERE campaign_id = ? "
+            "ORDER BY active DESC, next_due_day ASC, circuit_id",
+            (_CAMPAIGN_ID,),
+        ).fetchall()
+        for r in rows:
+            d = _row_to_dict(r)
+            cycle  = d["cycle_days"] or 1
+            min_gp = d["income_min_gp"] or 0
+            max_gp = d["income_max_gp"] or 0
+            mid_gp = (min_gp + max_gp) // 2
+
+            last_entry = conn.execute(
+                "SELECT day, amount_gp FROM circuit_ledger "
+                "WHERE circuit_id = ? "
+                "ORDER BY day DESC, ledger_id DESC LIMIT 1",
+                (d["circuit_id"],),
+            ).fetchone()
+
+            d["status"]         = "active" if d["active"] else "inactive"
+            d["last_amount_gp"] = last_entry["amount_gp"] if last_entry else None
+            d["days_overdue"]   = (
+                today - d["next_due_day"]
+                if d["active"] and d["next_due_day"] is not None
+                   and today > d["next_due_day"]
+                else 0
+            )
+            d["projected_annual_income_gp"] = round(365.25 / cycle * mid_gp)
+            out.append(d)
+
+    return {
+        "count":       len(out),
+        "current_day": today,
+        "circuits":    out,
+    }
+
+
+def db_collect_circuit_income(
+    circuit_name: str,
+    current_day:  int,
+    amount_gp:    int,
+    notes:        str | None = None,
+) -> dict:
+    """
+    Log a circuit return:
+      - writes a circuit_ledger row,
+      - sets last_return_day = current_day, next_due_day = current_day + cycle_days,
+      - if a treasury_account_name is linked, credits it via update_treasury.
+
+    Returns the deposit confirmation including treasury_after balances and
+    the new next_due_day.
+    """
+    if amount_gp is None or int(amount_gp) < 0:
+        raise ValueError("amount_gp must be a non-negative integer.")
+    cd = int(current_day)
+
+    with _get_conn() as conn:
+        _ensure_trade_circuits_tables(conn)
+        resolved = _resolve_circuit_id_by_name(conn, circuit_name)
+        if not resolved:
+            raise ValueError(
+                f"No trade circuit matching '{circuit_name}' in this campaign."
+            )
+        circuit_id, canon_name = resolved
+
+        c_row = conn.execute(
+            "SELECT cycle_days, treasury_account_name FROM trade_circuits "
+            "WHERE circuit_id = ?",
+            (circuit_id,),
+        ).fetchone()
+        cycle = int(c_row["cycle_days"] or 1)
+        treasury_name: str | None = c_row["treasury_account_name"]
+        new_next_due = cd + cycle
+
+        conn.execute(
+            "UPDATE trade_circuits SET last_return_day = ?, next_due_day = ? "
+            "WHERE circuit_id = ?",
+            (cd, new_next_due, circuit_id),
+        )
+
+        import datetime as _dt
+        now_iso = _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        conn.execute(
+            "INSERT INTO circuit_ledger "
+            "(campaign_id, circuit_id, day, amount_gp, treasury_account, "
+            " notes, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (_CAMPAIGN_ID, circuit_id, cd, int(amount_gp),
+             treasury_name, notes, now_iso),
+        )
+
+    treasury_after: dict | None = None
+    treasury_error: str | None = None
+    if treasury_name and int(amount_gp) > 0:
+        try:
+            treasury_after = update_treasury(treasury_name, gp_delta=int(amount_gp))
+        except ValueError as e:
+            # Ledger entry is already written; surface the treasury error so the
+            # caller can reconcile manually rather than silently lose the deposit.
+            treasury_error = str(e)
+
+    return {
+        "circuit_id":       circuit_id,
+        "circuit_name":     canon_name,
+        "day":              cd,
+        "amount_gp":        int(amount_gp),
+        "treasury_account": treasury_name,
+        "treasury_after":   treasury_after,
+        "treasury_error":   treasury_error,
+        "next_due_day":     new_next_due,
+        "notes":            notes,
+    }
+
+
+def db_get_circuit_ledger(
+    circuit_name: str | None = None,
+    limit:        int = 20,
+) -> dict:
+    """
+    Chronological log of circuit returns (newest-first), optionally filtered
+    to one circuit. Includes per-circuit lifetime totals (independent of
+    `limit`) so the caller can see the full picture without pagination.
+    """
+    lim = max(1, min(int(limit or 20), 500))
+    cid: int | None = None
+    canon: str | None = None
+    with _get_conn() as conn:
+        _ensure_trade_circuits_tables(conn)
+        params: list = [_CAMPAIGN_ID]
+        where = "WHERE cl.campaign_id = ?"
+        if circuit_name and circuit_name.strip():
+            resolved = _resolve_circuit_id_by_name(conn, circuit_name)
+            if not resolved:
+                raise ValueError(
+                    f"No trade circuit matching '{circuit_name}'."
+                )
+            cid, canon = resolved
+            where += " AND cl.circuit_id = ?"
+            params.append(cid)
+
+        rows = conn.execute(
+            f"SELECT cl.ledger_id, cl.circuit_id, tc.name AS circuit_name, "
+            f"       cl.day, cl.amount_gp, cl.treasury_account, "
+            f"       cl.notes, cl.created_at "
+            f"FROM circuit_ledger cl "
+            f"JOIN trade_circuits tc ON tc.circuit_id = cl.circuit_id "
+            f"{where} "
+            f"ORDER BY cl.day DESC, cl.ledger_id DESC "
+            f"LIMIT ?",
+            (*params, lim),
+        ).fetchall()
+
+        total_params: list = [_CAMPAIGN_ID]
+        total_where  = "WHERE campaign_id = ?"
+        if cid is not None:
+            total_where += " AND circuit_id = ?"
+            total_params.append(cid)
+        totals_rows = conn.execute(
+            f"SELECT cl.circuit_id, tc.name AS circuit_name, "
+            f"       SUM(cl.amount_gp) AS total_gp, COUNT(*) AS entries "
+            f"FROM circuit_ledger cl "
+            f"JOIN trade_circuits tc ON tc.circuit_id = cl.circuit_id "
+            f"{total_where.replace('campaign_id', 'cl.campaign_id').replace('circuit_id', 'cl.circuit_id')} "
+            f"GROUP BY cl.circuit_id, tc.name",
+            total_params,
+        ).fetchall()
+        totals = {
+            r["circuit_id"]: {
+                "circuit_name": r["circuit_name"],
+                "total_gp":     r["total_gp"],
+                "entries":      r["entries"],
+            }
+            for r in totals_rows
+        }
+
+    return {
+        "count":             len(rows),
+        "limit":             lim,
+        "filter":            (canon or circuit_name or "(all)"),
+        "entries":           [_row_to_dict(r) for r in rows],
+        "totals_by_circuit": totals,
+    }
+
+
+def db_check_circuits_due(
+    current_day:    int | None = None,
+    lookahead_days: int = 30,
+) -> dict:
+    """
+    Surface circuits past their due date (`overdue`) and circuits coming due
+    within the next `lookahead_days` (`upcoming`). current_day defaults to
+    the PC's campaign_days_elapsed (or 0 if no aging record yet). Inactive
+    circuits are excluded from both lists.
+    """
+    today = _campaign_current_day() if current_day is None else int(current_day)
+    horizon = max(0, int(lookahead_days))
+
+    with _get_conn() as conn:
+        _ensure_trade_circuits_tables(conn)
+        rows = conn.execute(
+            "SELECT * FROM trade_circuits "
+            "WHERE campaign_id = ? AND active = 1 "
+            "ORDER BY next_due_day ASC, circuit_id",
+            (_CAMPAIGN_ID,),
+        ).fetchall()
+
+    overdue:  list[dict] = []
+    upcoming: list[dict] = []
+    for r in rows:
+        d = _row_to_dict(r)
+        nd = d.get("next_due_day")
+        if nd is None:
+            continue
+        if today > nd:
+            d["days_overdue"] = today - nd
+            overdue.append(d)
+        elif nd - today <= horizon:
+            d["days_until_due"] = nd - today
+            upcoming.append(d)
+
+    return {
+        "current_day":    today,
+        "lookahead_days": horizon,
+        "overdue_count":  len(overdue),
+        "upcoming_count": len(upcoming),
+        "overdue":        overdue,
+        "upcoming":       upcoming,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # PHASE 12 — INVENTORY SLOT SYSTEM
 # Equipped-by-slot model · structured combat fields · auto-migration
 # ══════════════════════════════════════════════════════════════════════════════

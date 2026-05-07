@@ -877,6 +877,12 @@ from engine.db import (
     # Phase 10 — treasury account create/list
     db_add_treasury_account,
     db_list_treasury_accounts,
+    # Phase 29 — trade circuit tracker
+    db_add_trade_circuit,
+    db_list_trade_circuits,
+    db_collect_circuit_income,
+    db_get_circuit_ledger,
+    db_check_circuits_due,
     # Phase 12 — equipment slot system
     db_equip_item,
     db_list_equipped,
@@ -2273,6 +2279,242 @@ def list_treasury_accounts() -> dict:
     auditing total wealth across multiple stashes.
     """
     return db_list_treasury_accounts()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PHASE 29 — TRADE CIRCUIT TRACKER
+# Recurring merchant-circuit income on predictable cycles. Each circuit has a
+# fixed cycle in days, an income range, and an optional linked treasury that
+# gets credited when a return is logged. domain_turn auto-runs check_circuits_due
+# and includes the result in its season report.
+# ══════════════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def add_trade_circuit(
+    name: Annotated[
+        str,
+        "Unique name for this circuit. Case-insensitive duplicates are "
+        "rejected. Examples: 'Chendl Circuit', 'Eastern Circuit', "
+        "'Riverbend Salt Run'.",
+    ],
+    cycle_days: Annotated[
+        int,
+        "How many days between returns (the time between one departure and "
+        "the next return at the home depot). Common: 30 for monthly, "
+        "60 for bi-monthly, 90 for seasonal. Must be a positive integer.",
+    ],
+    income_min_gp: Annotated[
+        int,
+        "Lower bound of the per-return income range in gp. Used for "
+        "projection and to communicate variance, not for auto-rolling — "
+        "the actual amount is passed in by the caller of "
+        "collect_circuit_income.",
+    ] = 0,
+    income_max_gp: Annotated[
+        int,
+        "Upper bound of the per-return income range in gp. Must be >= "
+        "income_min_gp. Defaults to 0 for circuits whose income is fully "
+        "variable and not yet characterised.",
+    ] = 0,
+    description: Annotated[
+        str,
+        "Free-text description: route, principal goods, factor or wagonmaster, "
+        "any complications. Optional but strongly recommended for canon.",
+    ] = "",
+    treasury_account_name: Annotated[
+        str,
+        "Name (case-insensitive prefix match) of an EXISTING treasury "
+        "account that should be credited automatically when "
+        "collect_circuit_income is called. Leave blank to defer linking. "
+        "If non-blank and the name does not match an existing account, "
+        "the call is rejected — add the account first via "
+        "add_treasury_account.",
+    ] = "",
+    last_return_day: Annotated[
+        int,
+        "Campaign day of the most recent return for this circuit (0 if "
+        "the circuit is being established now and the next due day should "
+        "be cycle_days from day 0). Defaults to 0.",
+    ] = 0,
+    notes: Annotated[
+        str,
+        "Free-text notes: weather considerations, escort arrangements, "
+        "trustworthiness of the factor, etc. Optional.",
+    ] = "",
+) -> dict:
+    """
+    Register a new trade circuit.
+
+    Validates name uniqueness, the income range (max >= min, both
+    non-negative), and the linked treasury account if one was given.
+    Calculates next_due_day = last_return_day + cycle_days automatically.
+
+    Returns the new circuit_id and the full row as confirmation.
+    """
+    try:
+        result = db_add_trade_circuit(
+            name                  = name,
+            cycle_days            = int(cycle_days),
+            income_min_gp         = int(income_min_gp),
+            income_max_gp         = int(income_max_gp),
+            description           = (description or None),
+            treasury_account_name = (treasury_account_name or None),
+            last_return_day       = int(last_return_day),
+            notes                 = (notes or None),
+        )
+        return {"created": True, **result}
+    except ValueError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def list_trade_circuits(
+    current_day: Annotated[
+        int,
+        "Campaign day used to compute days_overdue. Pass -1 to auto-resolve "
+        "from the PC's campaign_days_elapsed (the standard advance_time "
+        "counter). Default -1.",
+    ] = -1,
+) -> dict:
+    """
+    List every trade circuit in the campaign with status fields.
+
+    Each entry includes: circuit_id, name, description, cycle_days, income
+    range, last_return_day, next_due_day, treasury_account_name, status
+    ('active' | 'inactive'), last_amount_gp (from the most-recent ledger
+    row, if any), days_overdue (0 if not overdue), and
+    projected_annual_income_gp (mid-of-range × cycles per year).
+
+    Sorted by active-first then next_due_day ascending so the most-pressing
+    circuits surface at the top.
+    """
+    cd = None if current_day is None or current_day < 0 else int(current_day)
+    return db_list_trade_circuits(current_day=cd)
+
+
+@mcp.tool()
+def collect_circuit_income(
+    circuit_name: Annotated[
+        str,
+        "Name (case-insensitive exact, then prefix) of the trade circuit "
+        "whose return is being logged. Examples: 'Chendl Circuit', 'Eastern'.",
+    ],
+    current_day: Annotated[
+        int,
+        "Campaign day on which the return arrived. Used to set "
+        "last_return_day and to compute next_due_day = current_day + "
+        "cycle_days.",
+    ],
+    amount_gp: Annotated[
+        int,
+        "Actual gp amount returned this cycle (caller rolls within the "
+        "circuit's income range, applies modifiers, and passes the final "
+        "number here). Must be non-negative.",
+    ],
+    notes: Annotated[
+        str,
+        "Free-text notes for this specific return: weather, raids, "
+        "exceptional sales, factor's report, etc. Optional.",
+    ] = "",
+) -> dict:
+    """
+    Log a circuit return.
+
+    Three things happen atomically (within one engine call):
+      1. A new circuit_ledger row is written.
+      2. The circuit's last_return_day is set to current_day and
+         next_due_day is recomputed as current_day + cycle_days.
+      3. If a treasury account is linked, update_treasury is called to
+         credit the deposit.
+
+    If the treasury credit fails (e.g. the linked account was renamed or
+    deleted), the ledger row is still kept and the response includes a
+    treasury_error field so the caller can reconcile manually instead of
+    losing the deposit.
+
+    Returns deposit confirmation, treasury_after balances, and the new
+    next_due_day.
+    """
+    try:
+        result = db_collect_circuit_income(
+            circuit_name = circuit_name,
+            current_day  = int(current_day),
+            amount_gp    = int(amount_gp),
+            notes        = (notes or None),
+        )
+        return {"logged": True, **result}
+    except ValueError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def get_circuit_ledger(
+    circuit_name: Annotated[
+        str,
+        "Name (case-insensitive exact, then prefix) of one circuit to filter "
+        "to. Leave blank to see ledger entries for ALL circuits in the "
+        "campaign.",
+    ] = "",
+    limit: Annotated[
+        int,
+        "Maximum number of ledger rows to return (newest-first). Default "
+        "20, capped at 500.",
+    ] = 20,
+) -> dict:
+    """
+    Chronological log of circuit returns (newest-first), optionally filtered
+    to a single circuit.
+
+    Returns:
+      - entries: list of {ledger_id, circuit_id, circuit_name, day,
+        amount_gp, treasury_account, notes, created_at}.
+      - totals_by_circuit: a mapping of circuit_id -> {circuit_name,
+        total_gp, entries} computed across the FULL ledger (not capped by
+        limit), so the caller always sees lifetime running totals even
+        with a small limit.
+    """
+    try:
+        return db_get_circuit_ledger(
+            circuit_name = (circuit_name or None),
+            limit        = int(limit),
+        )
+    except ValueError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def check_circuits_due(
+    current_day: Annotated[
+        int,
+        "Campaign day to compare against. Pass -1 to auto-resolve from "
+        "the PC's campaign_days_elapsed (the standard advance_time "
+        "counter). Default -1.",
+    ] = -1,
+    lookahead_days: Annotated[
+        int,
+        "How many days ahead to scan for upcoming circuits. Default 30.",
+    ] = 30,
+) -> dict:
+    """
+    Surface trade circuits that need attention.
+
+    Returns:
+      - overdue:  active circuits whose next_due_day is in the past
+        (each entry carries a days_overdue field). Flag these prominently
+        to the player at session start.
+      - upcoming: active circuits coming due within the next
+        lookahead_days days (each entry carries days_until_due).
+
+    Inactive circuits are excluded from both lists.
+
+    Called automatically by domain_turn at the end of every season; the
+    caller may also invoke it directly at session start as a reminder.
+    """
+    cd = None if current_day is None or current_day < 0 else int(current_day)
+    return db_check_circuits_due(
+        current_day    = cd,
+        lookahead_days = int(lookahead_days),
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -5199,6 +5441,21 @@ def domain_turn(
     else:
         report["realm_event"] = None
 
+    # ── Step 6: Trade circuit due check (Phase 29) ─────────────────────────────
+    # Best-effort — if the migration hasn't run yet (very fresh DB) or the
+    # campaign has no circuits, we still want the rest of the report to land.
+    try:
+        circuits_due = db_check_circuits_due(current_day=None, lookahead_days=30)
+        report["circuits"] = {
+            "current_day":    circuits_due["current_day"],
+            "overdue_count":  circuits_due["overdue_count"],
+            "upcoming_count": circuits_due["upcoming_count"],
+            "overdue":        circuits_due["overdue"],
+            "upcoming":       circuits_due["upcoming"],
+        }
+    except Exception as e:
+        report["circuits"] = {"error": str(e)}
+
     # ── Summary ───────────────────────────────────────────────────────────────
     net_gp = income["total_gp"] - upkeep["total_gp_charged"]
     report["net_gp_this_season"] = net_gp
@@ -5213,6 +5470,11 @@ def domain_turn(
     )
     if roll_event and report["realm_event"]:
         report["summary"] += f" Realm event: {report['realm_event']['title']}."
+    circ = report.get("circuits") or {}
+    if isinstance(circ, dict) and (circ.get("overdue_count") or 0) > 0:
+        report["summary"] += f" ⚠ {circ['overdue_count']} circuit(s) OVERDUE."
+    elif isinstance(circ, dict) and (circ.get("upcoming_count") or 0) > 0:
+        report["summary"] += f" {circ['upcoming_count']} circuit(s) due within 30 days."
 
     return report
 
