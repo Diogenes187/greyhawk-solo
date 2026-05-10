@@ -937,6 +937,7 @@ CREATE TABLE treasury_accounts (
     sp INTEGER DEFAULT 0,
     cp INTEGER DEFAULT 0,
     pp INTEGER DEFAULT 0,
+    ep INTEGER NOT NULL DEFAULT 0,
     gems_gp_value INTEGER,
     notes TEXT,
     FOREIGN KEY (campaign_id) REFERENCES campaigns(campaign_id),
@@ -1330,25 +1331,32 @@ CREATE VIEW vw_treasure_lookup AS
                source_file
         FROM treasure_types;
 
+-- AD&D 1e coin conversion (NOT D&D 5e!):
+--   1 PP = 5 GP · 1 EP = 0.5 GP · 1 SP = 0.05 GP · 1 CP = 0.005 GP
+-- Older campaign DBs had this view computing 1 SP = 0.1 GP (5e math) and
+-- ignored electrum entirely; the runtime _ensure_treasury_ep_column helper
+-- drops and recreates the view on first call to bring legacy DBs onto canon.
 CREATE VIEW vw_treasury_summary AS
 SELECT
     ta.treasury_id,
     ta.account_name,
     l.name AS location,
+    ta.pp,
     ta.gp,
+    ta.ep,
     ta.sp,
     ta.cp,
-    ta.pp,
     ta.gems_gp_value,
-    (COALESCE(ta.gp,0)
-     + COALESCE(ta.sp,0)/10.0
-     + COALESCE(ta.cp,0)/100.0
-     + COALESCE(ta.pp,0)*5.0
-     + COALESCE(ta.gems_gp_value,0)) AS estimated_total_gp,
+    (COALESCE(ta.pp,0)  * 5.0
+     + COALESCE(ta.gp,0)
+     + COALESCE(ta.ep,0) * 0.5
+     + COALESCE(ta.sp,0) * 0.05
+     + COALESCE(ta.cp,0) * 0.005
+     + COALESCE(ta.gems_gp_value,0)) AS total_gp_equivalent,
     ta.notes
 FROM treasury_accounts ta
 LEFT JOIN locations l ON l.location_id = ta.location_id
-ORDER BY estimated_total_gp DESC, ta.account_name;
+ORDER BY total_gp_equivalent DESC, ta.account_name;
 
 CREATE VIEW vw_world_facts AS
 SELECT

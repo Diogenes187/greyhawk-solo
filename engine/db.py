@@ -199,7 +199,17 @@ def load_realm() -> dict:
             LEFT JOIN locations l ON l.location_id = ta.location_id
             WHERE ta.campaign_id = ?
         """, (_CAMPAIGN_ID,))
-        treasury = [dict(r) for r in cur.fetchall()]
+        treasury_raw = [dict(r) for r in cur.fetchall()]
+        treasury = []
+        for _t in treasury_raw:
+            _t_pp = _t.get("pp", 0) or 0
+            _t_gp = _t.get("gp", 0) or 0
+            _t_sp = _t.get("sp", 0) or 0
+            _t_cp = _t.get("cp", 0) or 0
+            _t["ep"]                  = 0
+            _t["total_gp_equivalent"] = coins_to_gp_equivalent(_t_pp, _t_gp, 0, _t_sp, _t_cp)
+            _t["formatted_total"]     = format_coin_total(_t_pp, _t_gp, 0, _t_sp, _t_cp)
+            treasury.append(_t)
 
         # Livestock summary
         cur.execute("""
@@ -419,6 +429,84 @@ def update_character_status(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# TREASURY HELPERS — coin conversion utilities (AD&D 1e rates)
+# 1 PP = 5 GP · 1 GP = 1 GP · 1 EP = 0.5 GP · 1 SP = 0.05 GP · 1 CP = 0.005 GP
+# ══════════════════════════════════════════════════════════════════════════════
+
+def coins_to_gp_equivalent(pp: int = 0, gp: int = 0, ep: int = 0,
+                            sp: int = 0, cp: int = 0) -> float:
+    """Return the GP-equivalent value of a coin set using AD&D 1e rates."""
+    return (pp * 5) + gp + (ep * 0.5) + (sp * 0.05) + (cp * 0.005)
+
+
+def format_coin_total(pp: int = 0, gp: int = 0, ep: int = 0,
+                      sp: int = 0, cp: int = 0) -> str:
+    """
+    Return a human-readable GP-equivalent string, e.g.:
+      '9,465.3 gp equivalent (457 pp, 3465 gp, 0 ep, 5 sp, 60 cp)'
+    """
+    total = coins_to_gp_equivalent(pp, gp, ep, sp, cp)
+    # Format the total: drop the decimal if it's a whole number
+    if total == int(total):
+        total_str = f"{int(total):,}"
+    else:
+        total_str = f"{total:,.3f}".rstrip("0").rstrip(".")
+    return f"{total_str} gp equivalent ({pp} pp, {gp} gp, {ep} ep, {sp} sp, {cp} cp)"
+
+
+def _ensure_treasury_ep_column() -> None:
+    """
+    Idempotent runtime migration:
+      1. Adds treasury_accounts.ep (INTEGER NOT NULL DEFAULT 0) if missing.
+      2. Refreshes vw_treasury_summary so it uses AD&D 1e conversion rates
+         and surfaces electrum. Older campaign DBs had this view computing
+         1 SP = 0.1 GP / 1 CP = 0.01 GP (D&D 5e rates) and ignoring EP
+         entirely; the drop+recreate brings it onto canonical 1e math.
+
+    Safe to call repeatedly. Runs on a writable connection; for read-only
+    paths, callers must invoke this once at session warmup.
+    """
+    with _get_conn() as conn:
+        cols = {r["name"] for r in conn.execute(
+            "PRAGMA table_info(treasury_accounts)"
+        ).fetchall()}
+        if not cols:
+            # treasury_accounts does not exist yet (very fresh DB before
+            # starter.sql ran). Nothing to migrate; bail.
+            return
+        if "ep" not in cols:
+            conn.execute(
+                "ALTER TABLE treasury_accounts "
+                "ADD COLUMN ep INTEGER NOT NULL DEFAULT 0"
+            )
+        # Always refresh the view to keep it on AD&D 1e canon.
+        conn.execute("DROP VIEW IF EXISTS vw_treasury_summary")
+        conn.execute("""
+            CREATE VIEW vw_treasury_summary AS
+            SELECT
+                ta.treasury_id,
+                ta.account_name,
+                l.name AS location,
+                ta.pp,
+                ta.gp,
+                ta.ep,
+                ta.sp,
+                ta.cp,
+                ta.gems_gp_value,
+                (COALESCE(ta.pp,0)  * 5.0
+                 + COALESCE(ta.gp,0)
+                 + COALESCE(ta.ep,0) * 0.5
+                 + COALESCE(ta.sp,0) * 0.05
+                 + COALESCE(ta.cp,0) * 0.005
+                 + COALESCE(ta.gems_gp_value,0)) AS total_gp_equivalent,
+                ta.notes
+            FROM treasury_accounts ta
+            LEFT JOIN locations l ON l.location_id = ta.location_id
+            ORDER BY total_gp_equivalent DESC, ta.account_name
+        """)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # WRITE — TREASURY
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -428,6 +516,7 @@ def update_treasury(
     sp_delta: int = 0,
     cp_delta: int = 0,
     pp_delta: int = 0,
+    ep_delta: int = 0,
     gems_delta: int = 0,
     new_account_name: str | None = None,
 ) -> dict:
@@ -436,13 +525,20 @@ def update_treasury(
     prefix match). Raises ValueError if the result would go below zero for any
     denomination.
 
-    If new_account_name is provided, also rename the account in the same call.
-    The new name must be non-empty and must not collide with any other
+    Supports all five AD&D 1e coin types — pp, gp, ep, sp, cp — plus a
+    gems_delta channel that tracks the running gp-equivalent value of stored
+    gems.
+
+    If new_account_name is provided, also rename the account in the same
+    call. The new name must be non-empty and must not collide with any other
     treasury account in the campaign (case-insensitive exact match). Pass
     deltas of 0 with a non-None new_account_name to perform a pure rename.
 
-    Returns the updated account row.
+    Returns the updated account row including total_gp_equivalent and
+    formatted_total.
     """
+    _ensure_treasury_ep_column()
+
     # Pre-validate the rename target before doing anything destructive.
     new_name_clean: str | None = None
     if new_account_name is not None:
@@ -453,7 +549,7 @@ def update_treasury(
     with _get_conn() as conn:
         cur = conn.cursor()
         cur.execute(
-            "SELECT treasury_id, account_name, gp, sp, cp, pp, gems_gp_value "
+            "SELECT treasury_id, account_name, gp, sp, cp, pp, ep, gems_gp_value "
             "FROM treasury_accounts "
             "WHERE LOWER(account_name) LIKE LOWER(?) AND campaign_id = ?",
             (f"{account_name}%", _CAMPAIGN_ID),
@@ -462,15 +558,16 @@ def update_treasury(
         if not row:
             raise ValueError(f"Treasury account matching '{account_name}' not found.")
 
-        tid     = row["treasury_id"]
-        new_gp  = (row["gp"]  or 0) + gp_delta
-        new_sp  = (row["sp"]  or 0) + sp_delta
-        new_cp  = (row["cp"]  or 0) + cp_delta
-        new_pp  = (row["pp"]  or 0) + pp_delta
+        tid      = row["treasury_id"]
+        new_gp   = (row["gp"]  or 0) + gp_delta
+        new_sp   = (row["sp"]  or 0) + sp_delta
+        new_cp   = (row["cp"]  or 0) + cp_delta
+        new_pp   = (row["pp"]  or 0) + pp_delta
+        new_ep   = (row["ep"]  or 0) + ep_delta
         new_gems = (row["gems_gp_value"] or 0) + gems_delta
 
         for label, val in [("gp", new_gp), ("sp", new_sp), ("cp", new_cp),
-                           ("pp", new_pp), ("gems", new_gems)]:
+                           ("pp", new_pp), ("ep", new_ep), ("gems", new_gems)]:
             if val < 0:
                 raise ValueError(
                     f"Transaction would leave {label} at {val} — insufficient funds "
@@ -494,9 +591,10 @@ def update_treasury(
                 )
 
         conn.execute(
-            "UPDATE treasury_accounts SET gp=?, sp=?, cp=?, pp=?, gems_gp_value=? "
+            "UPDATE treasury_accounts "
+            "SET gp=?, sp=?, cp=?, pp=?, ep=?, gems_gp_value=? "
             "WHERE treasury_id=?",
-            (new_gp, new_sp, new_cp, new_pp, new_gems, tid),
+            (new_gp, new_sp, new_cp, new_pp, new_ep, new_gems, tid),
         )
         if new_name_clean is not None:
             conn.execute(
@@ -508,11 +606,20 @@ def update_treasury(
     with _get_conn(read_only=True) as conn:
         cur = conn.cursor()
         cur.execute(
-            "SELECT account_name, gp, sp, cp, pp, gems_gp_value, notes "
+            "SELECT account_name, gp, sp, cp, pp, ep, gems_gp_value, notes "
             "FROM treasury_accounts WHERE treasury_id = ?",
             (tid,),
         )
-        return _row_to_dict(cur.fetchone())
+        row = _row_to_dict(cur.fetchone())
+
+    pp_val = row.get("pp", 0) or 0
+    gp_val = row.get("gp", 0) or 0
+    ep_val = row.get("ep", 0) or 0
+    sp_val = row.get("sp", 0) or 0
+    cp_val = row.get("cp", 0) or 0
+    row["total_gp_equivalent"] = coins_to_gp_equivalent(pp_val, gp_val, ep_val, sp_val, cp_val)
+    row["formatted_total"]     = format_coin_total(pp_val, gp_val, ep_val, sp_val, cp_val)
+    return row
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2588,6 +2695,9 @@ def get_full_domain_state() -> dict:
       - Monthly and seasonal income/upkeep estimates
       - Last domain_turn record
     """
+    # Ensure the ep column exists before reading from it on legacy DBs.
+    _ensure_treasury_ep_column()
+
     with _get_conn(read_only=True) as conn:
         cur = conn.cursor()
 
@@ -2611,8 +2721,8 @@ def get_full_domain_state() -> dict:
 
         # Treasury
         cur.execute(
-            "SELECT ta.treasury_id, ta.account_name, ta.gp, ta.sp, ta.cp, ta.pp, "
-            "ta.gems_gp_value, ta.notes, l.name AS location_name "
+            "SELECT ta.treasury_id, ta.account_name, ta.gp, ta.sp, ta.cp, "
+            "ta.pp, ta.ep, ta.gems_gp_value, ta.notes, l.name AS location_name "
             "FROM treasury_accounts ta "
             "LEFT JOIN locations l ON ta.location_id = l.location_id "
             "WHERE ta.campaign_id = ?",
@@ -2683,18 +2793,44 @@ def get_full_domain_state() -> dict:
             proj["weeks_total"]     = None
             proj["cost_per_week"]   = 0
 
-    total_gp = sum(acc["gp"] or 0 for acc in treasury)
+    # Annotate each treasury account with per-account GP-equivalent fields
+    for acc in treasury:
+        _a_pp = acc.get("pp", 0) or 0
+        _a_gp = acc.get("gp", 0) or 0
+        _a_ep = acc.get("ep", 0) or 0
+        _a_sp = acc.get("sp", 0) or 0
+        _a_cp = acc.get("cp", 0) or 0
+        acc["ep"]                  = _a_ep
+        acc["total_gp_equivalent"] = coins_to_gp_equivalent(_a_pp, _a_gp, _a_ep, _a_sp, _a_cp)
+        acc["formatted_total"]     = format_coin_total(_a_pp, _a_gp, _a_ep, _a_sp, _a_cp)
+
+    total_gp  = sum(acc["gp"] or 0 for acc in treasury)
+    _total_pp = sum(acc.get("pp", 0) or 0 for acc in treasury)
+    _total_ep = sum(acc.get("ep", 0) or 0 for acc in treasury)
+    _total_sp = sum(acc.get("sp", 0) or 0 for acc in treasury)
+    _total_cp = sum(acc.get("cp", 0) or 0 for acc in treasury)
+    treasury_total_gp_equiv = coins_to_gp_equivalent(
+        _total_pp, total_gp, _total_ep, _total_sp, _total_cp
+    )
 
     return {
-        "holdings":              locations,
-        "troops":                troops,
-        "treasury_accounts":     treasury,
-        "treasury_total_gp":     total_gp,
-        "projects":              projects,
-        "last_domain_turn":      last_turn,
-        "monthly_income_range":  f"{monthly_income_lo:,}–{monthly_income_hi:,} gp",
-        "monthly_upkeep_gp":     monthly_upkeep,
-        "monthly_net_range":     f"{monthly_income_lo - monthly_upkeep:,}–{monthly_income_hi - monthly_upkeep:,} gp",
+        "holdings":                    locations,
+        "troops":                      troops,
+        "treasury_accounts":           treasury,
+        "treasury_total_pp":           _total_pp,
+        "treasury_total_gp":           total_gp,
+        "treasury_total_ep":           _total_ep,
+        "treasury_total_sp":           _total_sp,
+        "treasury_total_cp":           _total_cp,
+        "treasury_total_gp_equivalent": treasury_total_gp_equiv,
+        "treasury_formatted_total":    format_coin_total(
+                                            _total_pp, total_gp, _total_ep,
+                                            _total_sp, _total_cp),
+        "projects":                    projects,
+        "last_domain_turn":            last_turn,
+        "monthly_income_range":        f"{monthly_income_lo:,}–{monthly_income_hi:,} gp",
+        "monthly_upkeep_gp":           monthly_upkeep,
+        "monthly_net_range":           f"{monthly_income_lo - monthly_upkeep:,}–{monthly_income_hi - monthly_upkeep:,} gp",
     }
 
 
@@ -9638,18 +9774,25 @@ def db_add_treasury_account(
     sp:             int = 0,
     cp:             int = 0,
     pp:             int = 0,
+    ep:             int = 0,
     gems_gp_value:  int = 0,
     notes:          str | None = None,
 ) -> dict:
     """
     Insert a new treasury account into the active campaign.
 
-    Validates that account_name is not already taken (case-insensitive exact
-    match) — raises ValueError on duplicate. If location_name is provided,
-    looks up the location_id by case-insensitive prefix match and raises
-    ValueError if no match is found. Returns the new account row including
-    the resolved location_name.
+    Accepts opening balances in all five AD&D 1e coin denominations
+    (pp, gp, ep, sp, cp) plus a gp-valued gem total.
+
+    Validates that account_name is not already taken (case-insensitive
+    exact match) — raises ValueError on duplicate. If location_name is
+    provided, looks up the location_id by case-insensitive prefix match
+    and raises ValueError if no match is found. Returns the new account
+    row including the resolved location_name and the
+    total_gp_equivalent / formatted_total fields.
     """
+    _ensure_treasury_ep_column()
+
     name = (account_name or "").strip()
     if not name:
         raise ValueError("account_name is required and may not be empty.")
@@ -9696,11 +9839,12 @@ def db_add_treasury_account(
         cur = conn.cursor()
         cur.execute(
             "INSERT INTO treasury_accounts "
-            "(campaign_id, account_name, location_id, gp, sp, cp, pp, "
+            "(campaign_id, account_name, location_id, gp, sp, cp, pp, ep, "
             " gems_gp_value, notes) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (_CAMPAIGN_ID, name, loc_id,
-             int(gp or 0), int(sp or 0), int(cp or 0), int(pp or 0),
+             int(gp or 0), int(sp or 0), int(cp or 0),
+             int(pp or 0), int(ep or 0),
              int(gems_gp_value or 0), notes_val),
         )
         new_id = cur.lastrowid
@@ -9709,7 +9853,7 @@ def db_add_treasury_account(
         cur = conn.cursor()
         cur.execute(
             "SELECT ta.treasury_id, ta.account_name, ta.location_id, "
-            "ta.gp, ta.sp, ta.cp, ta.pp, ta.gems_gp_value, ta.notes, "
+            "ta.gp, ta.sp, ta.cp, ta.pp, ta.ep, ta.gems_gp_value, ta.notes, "
             "l.name AS location_name "
             "FROM treasury_accounts ta "
             "LEFT JOIN locations l ON ta.location_id = l.location_id "
@@ -9720,19 +9864,31 @@ def db_add_treasury_account(
 
     if resolved_loc_name and not row.get("location_name"):
         row["location_name"] = resolved_loc_name
+    _pp = row.get("pp", 0) or 0
+    _gp = row.get("gp", 0) or 0
+    _ep = row.get("ep", 0) or 0
+    _sp = row.get("sp", 0) or 0
+    _cp = row.get("cp", 0) or 0
+    row["total_gp_equivalent"] = coins_to_gp_equivalent(_pp, _gp, _ep, _sp, _cp)
+    row["formatted_total"]     = format_coin_total(_pp, _gp, _ep, _sp, _cp)
     return row
 
 
 def db_list_treasury_accounts() -> dict:
     """
     Return every treasury account in the active campaign with id, name,
-    balances, linked location (if any), and notes — plus a campaign-wide
-    GP total. Mirrors the discovery shape of db_list_characters.
+    full coin balances (pp, gp, ep, sp, cp), gems gp-value, linked
+    location (if any), and notes. Per-account fields include
+    total_gp_equivalent + formatted_total; the wrapper response also
+    carries campaign-wide totals across all five denominations and an
+    overall treasury_total_gp_equivalent / treasury_formatted_total.
     """
+    _ensure_treasury_ep_column()
+
     with _get_conn(read_only=True) as conn:
         rows = conn.execute(
             "SELECT ta.treasury_id, ta.account_name, ta.location_id, "
-            "ta.gp, ta.sp, ta.cp, ta.pp, ta.gems_gp_value, ta.notes, "
+            "ta.gp, ta.sp, ta.cp, ta.pp, ta.ep, ta.gems_gp_value, ta.notes, "
             "l.name AS location_name "
             "FROM treasury_accounts ta "
             "LEFT JOIN locations l ON ta.location_id = l.location_id "
@@ -9743,30 +9899,57 @@ def db_list_treasury_accounts() -> dict:
 
     accounts: list[dict] = []
     total_gp = 0
+    total_pp = 0
+    total_ep = 0
+    total_sp = 0
+    total_cp = 0
+    total_gems = 0
     for r in rows:
-        gp_val = r["gp"] or 0
+        gp_val  = r["gp"] or 0
+        pp_val  = r["pp"] or 0
+        ep_val  = r["ep"] or 0
+        sp_val  = r["sp"] or 0
+        cp_val  = r["cp"] or 0
+        gems_val = r["gems_gp_value"] or 0
         total_gp += gp_val
+        total_pp += pp_val
+        total_ep += ep_val
+        total_sp += sp_val
+        total_cp += cp_val
+        total_gems += gems_val
         notes_preview = r["notes"] or ""
         if len(notes_preview) > 120:
             notes_preview = notes_preview[:117].rstrip() + "..."
+        acc_gp_equiv = coins_to_gp_equivalent(pp_val, gp_val, ep_val, sp_val, cp_val)
         accounts.append({
-            "treasury_id":    r["treasury_id"],
-            "account_name":   r["account_name"],
-            "location_id":    r["location_id"],
-            "location_name":  r["location_name"],
-            "gp":             gp_val,
-            "sp":             r["sp"] or 0,
-            "cp":             r["cp"] or 0,
-            "pp":             r["pp"] or 0,
-            "gems_gp_value":  r["gems_gp_value"] or 0,
-            "notes":          r["notes"],
-            "notes_preview":  notes_preview,
+            "treasury_id":         r["treasury_id"],
+            "account_name":        r["account_name"],
+            "location_id":         r["location_id"],
+            "location_name":       r["location_name"],
+            "pp":                  pp_val,
+            "gp":                  gp_val,
+            "ep":                  ep_val,
+            "sp":                  sp_val,
+            "cp":                  cp_val,
+            "gems_gp_value":       gems_val,
+            "total_gp_equivalent": acc_gp_equiv,
+            "formatted_total":     format_coin_total(pp_val, gp_val, ep_val, sp_val, cp_val),
+            "notes":               r["notes"],
+            "notes_preview":       notes_preview,
         })
 
+    total_gp_equiv = coins_to_gp_equivalent(total_pp, total_gp, total_ep, total_sp, total_cp)
     return {
-        "count":             len(accounts),
-        "treasury_total_gp": total_gp,
-        "accounts":          accounts,
+        "count":                        len(accounts),
+        "treasury_total_pp":            total_pp,
+        "treasury_total_gp":            total_gp,
+        "treasury_total_ep":            total_ep,
+        "treasury_total_sp":            total_sp,
+        "treasury_total_cp":            total_cp,
+        "treasury_total_gems_gp":       total_gems,
+        "treasury_total_gp_equivalent": total_gp_equiv,
+        "treasury_formatted_total":     format_coin_total(total_pp, total_gp, total_ep, total_sp, total_cp),
+        "accounts":                     accounts,
     }
 
 

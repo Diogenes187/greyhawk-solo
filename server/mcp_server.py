@@ -877,6 +877,8 @@ from engine.db import (
     # Phase 10 — treasury account create/list
     db_add_treasury_account,
     db_list_treasury_accounts,
+    coins_to_gp_equivalent,
+    format_coin_total,
     # Phase 29 — trade circuit tracker
     db_add_trade_circuit,
     db_list_trade_circuits,
@@ -1505,13 +1507,22 @@ def get_realm_state(
         return {"error": "Realm data not found in database."}
 
     # Summary roll-ups — always computed, included with their related section.
-    gp_total   = sum(a.get("gp", 0) or 0 for a in realm.get("treasury", []))
-    gems_total = sum(a.get("gems_gp_value", 0) or 0
-                     for a in realm.get("treasury", []))
+    _t_accts   = realm.get("treasury", [])
+    pp_total   = sum(a.get("pp", 0) or 0 for a in _t_accts)
+    gp_total   = sum(a.get("gp", 0) or 0 for a in _t_accts)
+    sp_total   = sum(a.get("sp", 0) or 0 for a in _t_accts)
+    cp_total   = sum(a.get("cp", 0) or 0 for a in _t_accts)
+    gems_total = sum(a.get("gems_gp_value", 0) or 0 for a in _t_accts)
+    _coin_equiv = coins_to_gp_equivalent(pp_total, gp_total, 0, sp_total, cp_total)
     treasury_summary = {
-        "liquid_gp":           gp_total,
+        "pp":                  pp_total,
+        "gp":                  gp_total,
+        "ep":                  0,
+        "sp":                  sp_total,
+        "cp":                  cp_total,
         "gems_gp_value":       gems_total,
-        "total_gp_equivalent": gp_total + gems_total,
+        "total_gp_equivalent": _coin_equiv + gems_total,
+        "formatted_total":     format_coin_total(pp_total, gp_total, 0, sp_total, cp_total),
     }
     troop_total = sum(t.get("count", 0) or 0 for t in realm.get("troops", []))
     troop_summary = {"total_troops": troop_total}
@@ -2162,6 +2173,11 @@ def update_treasury(
     sp_delta: Annotated[int, "Silver pieces to add or subtract."] = 0,
     cp_delta: Annotated[int, "Copper pieces to add or subtract."] = 0,
     pp_delta: Annotated[int, "Platinum pieces to add or subtract."] = 0,
+    ep_delta: Annotated[
+        int,
+        "Electrum pieces to add or subtract. AD&D 1e: 1 EP = 0.5 GP. "
+        "Often skipped — set when looted treasure includes electrum.",
+    ] = 0,
     gems_delta: Annotated[int, "Gem value in GP to add or subtract."] = 0,
     new_account_name: Annotated[
         str,
@@ -2176,9 +2192,17 @@ def update_treasury(
     Add or subtract coins/gems from a treasury account, and optionally
     rename the account.
 
+    Supports all five AD&D 1e coin denominations:
+      pp_delta — platinum (1 PP = 5 GP)
+      gp_delta — gold     (1 GP = 1 GP)
+      ep_delta — electrum (1 EP = 0.5 GP)
+      sp_delta — silver   (1 SP = 0.05 GP, NOT 0.1 — that is D&D 5e)
+      cp_delta — copper   (1 CP = 0.005 GP, NOT 0.01 — that is D&D 5e)
+    Plus gems_delta — gp-valued gem total tracked separately.
+
     Use negative deltas to spend money (e.g. gp_delta=-800 for an 800 gp
-    construction cost). The tool validates that no denomination goes below
-    zero and returns an error instead of allowing overdraft.
+    construction cost). The tool validates that no denomination goes
+    below zero and returns an error instead of allowing overdraft.
 
     Renaming: pass new_account_name to rename the row in the same call.
     Replaces the off-piste 'go through direct_db_edit' workflow for the
@@ -2186,12 +2210,17 @@ def update_treasury(
     Validation: non-empty, no case-insensitive collision with another
     treasury account.
 
-    Returns the account's full updated balances + name as confirmation.
+    Returns the account's full updated balances (pp, gp, ep, sp, cp,
+    gems_gp_value) plus total_gp_equivalent and a formatted_total string
+    such as
+      '9,465.3 gp equivalent (457 pp, 3465 gp, 0 ep, 5 sp, 60 cp)'.
     """
     try:
         result = db_update_treasury(
-            account_name, gp_delta=gp_delta, sp_delta=sp_delta,
-            cp_delta=cp_delta, pp_delta=pp_delta, gems_delta=gems_delta,
+            account_name,
+            gp_delta=gp_delta, sp_delta=sp_delta,
+            cp_delta=cp_delta, pp_delta=pp_delta,
+            ep_delta=ep_delta, gems_delta=gems_delta,
             new_account_name=(new_account_name or None),
         )
         return {"updated": True, **result}
@@ -2223,6 +2252,10 @@ def add_treasury_account(
     sp: Annotated[int, "Starting silver pieces. Default 0."] = 0,
     cp: Annotated[int, "Starting copper pieces. Default 0."] = 0,
     pp: Annotated[int, "Starting platinum pieces. Default 0."] = 0,
+    ep: Annotated[
+        int,
+        "Starting electrum pieces. AD&D 1e: 1 EP = 0.5 GP. Default 0.",
+    ] = 0,
     gems_gp_value: Annotated[
         int,
         "Total gem value in GP (sum of all gems stored). Default 0.",
@@ -2236,6 +2269,9 @@ def add_treasury_account(
     """
     Create a new treasury account.
 
+    Accepts opening balances in all five AD&D 1e coin denominations
+    (pp, gp, ep, sp, cp) plus a gp-valued gem total.
+
     Use this when the party establishes a new vault, claims a hoard, or
     splits an existing pile into a separately-tracked stash. The new
     account immediately becomes a valid target for update_treasury.
@@ -2244,14 +2280,15 @@ def add_treasury_account(
       - account_name is non-empty and unique in the campaign
       - location_name (if given) resolves to a real location row
 
-    Returns the new treasury_id and the full row (with linked location
-    name) as confirmation. On error returns {"error": "..."}.
+    Returns the new treasury_id, the full row (with linked location
+    name), the total_gp_equivalent and the formatted_total string as
+    confirmation. On error returns {"error": "..."}.
     """
     try:
         result = db_add_treasury_account(
             account_name=account_name,
             location_name=(location_name or None),
-            gp=gp, sp=sp, cp=cp, pp=pp,
+            gp=gp, sp=sp, cp=cp, pp=pp, ep=ep,
             gems_gp_value=gems_gp_value,
             notes=(notes or None),
         )
@@ -4994,11 +5031,13 @@ def get_domain_state(
     # Always include the small monetary roll-ups so the caller has the
     # bottom-line financial context regardless of which section they ask for.
     rollup = {
-        "treasury_total_gp":   full.get("treasury_total_gp"),
-        "monthly_income_range": full.get("monthly_income_range"),
-        "monthly_upkeep_gp":   full.get("monthly_upkeep_gp"),
-        "monthly_net_range":   full.get("monthly_net_range"),
-        "last_domain_turn":    full.get("last_domain_turn"),
+        "treasury_total_gp":            full.get("treasury_total_gp"),
+        "treasury_total_gp_equivalent": full.get("treasury_total_gp_equivalent"),
+        "treasury_formatted_total":     full.get("treasury_formatted_total"),
+        "monthly_income_range":         full.get("monthly_income_range"),
+        "monthly_upkeep_gp":            full.get("monthly_upkeep_gp"),
+        "monthly_net_range":            full.get("monthly_net_range"),
+        "last_domain_turn":             full.get("last_domain_turn"),
     }
 
     section_payload: dict = {"section": sec, **rollup}
@@ -5460,6 +5499,24 @@ def domain_turn(
     net_gp = income["total_gp"] - upkeep["total_gp_charged"]
     report["net_gp_this_season"] = net_gp
     report["completed_projects"] = [c["name"] for c in construction.get("completed", [])]
+
+    # Treasury rollup AFTER income/upkeep have been applied — gives the player
+    # a single bottom-line read on every coin denomination plus the
+    # gp-equivalent total.
+    try:
+        post_state = get_full_domain_state()
+        report["treasury_after_season"] = {
+            "treasury_total_pp":            post_state.get("treasury_total_pp"),
+            "treasury_total_gp":            post_state.get("treasury_total_gp"),
+            "treasury_total_ep":            post_state.get("treasury_total_ep"),
+            "treasury_total_sp":            post_state.get("treasury_total_sp"),
+            "treasury_total_cp":            post_state.get("treasury_total_cp"),
+            "treasury_total_gp_equivalent": post_state.get("treasury_total_gp_equivalent"),
+            "treasury_formatted_total":     post_state.get("treasury_formatted_total"),
+        }
+    except Exception as e:
+        report["treasury_after_season"] = {"error": str(e)}
+
     report["summary"] = (
         f"Season {season_label}: "
         f"Income {income['total_gp']:,} gp | "
@@ -5468,6 +5525,9 @@ def domain_turn(
         f"{len(construction.get('advanced', []))} projects progressed, "
         f"{len(construction.get('completed', []))} completed."
     )
+    tas = report.get("treasury_after_season") or {}
+    if isinstance(tas, dict) and tas.get("treasury_formatted_total"):
+        report["summary"] += f" Treasury after: {tas['treasury_formatted_total']}."
     if roll_event and report["realm_event"]:
         report["summary"] += f" Realm event: {report['realm_event']['title']}."
     circ = report.get("circuits") or {}
