@@ -10365,6 +10365,345 @@ def db_check_circuits_due(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# PHASE 31 — SPELLBOOK TABLE
+# A dedicated table for the spells a caster has in their book (the set of
+# spells they COULD memorize), separate from spell_memory (what they HAVE
+# memorized today). Applies only to arcane and divine casters — fighters,
+# thieves, and pure non-casters have no spellbook.
+#
+# Schema lives below; _ensure_spellbook_table runs an idempotent
+# CREATE TABLE IF NOT EXISTS at the top of every public function so existing
+# campaign DBs auto-migrate on first use without any manual step. The old
+# world_facts entry (e.g. ramun_spellbooks_v2) is NOT auto-migrated — new
+# rows arrive through gameplay via add_spell_to_book.
+# ══════════════════════════════════════════════════════════════════════════════
+
+_SPELLBOOK_DDL = """
+CREATE TABLE IF NOT EXISTS spellbook (
+    id            INTEGER PRIMARY KEY,
+    character_id  INTEGER NOT NULL,
+    spell_name    TEXT NOT NULL,
+    spell_level   INTEGER NOT NULL,
+    spell_class   TEXT NOT NULL,
+    source        TEXT,
+    notes         TEXT,
+    FOREIGN KEY (character_id) REFERENCES characters(character_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_spellbook_character_level
+    ON spellbook(character_id, spell_level, spell_name);
+
+CREATE INDEX IF NOT EXISTS idx_spellbook_character_class
+    ON spellbook(character_id, spell_class);
+"""
+
+
+def _ensure_spellbook_table(conn) -> None:
+    """Idempotent runtime migration. Safe to call on every entry."""
+    conn.executescript(_SPELLBOOK_DDL)
+
+
+# Classes that have a spellbook in AD&D 1e. Lowercased for case-insensitive
+# matching. Includes the conventional aliases so 'Mage' / 'Wizard' from
+# campaign data are recognised even though the canonical 1e label is
+# 'Magic-User'.
+_SPELLBOOK_CASTER_CLASSES: set[str] = {
+    "magic-user", "magic user", "mage", "wizard",
+    "illusionist",
+    "cleric", "druid",
+    "ranger", "paladin",
+    "bard",
+}
+
+
+def _character_caster_classes(conn, character_id: int) -> list[str]:
+    """Return the subset of a character's class_levels that are spellcasters."""
+    rows = conn.execute(
+        "SELECT class_name FROM class_levels WHERE character_id = ?",
+        (character_id,),
+    ).fetchall()
+    out: list[str] = []
+    for r in rows:
+        cn = (r["class_name"] or "").strip()
+        if cn and cn.lower() in _SPELLBOOK_CASTER_CLASSES:
+            out.append(cn)
+    return out
+
+
+def _resolve_spellbook_target(target) -> tuple[int, str]:
+    """
+    Resolve a spellbook owner. Returns (character_id, name). Raises
+    ValueError if the target doesn't resolve or is not a spellcasting class.
+    None / empty defaults to the PC.
+    """
+    if target is None or (isinstance(target, str) and not target.strip()):
+        cid = _PC_CHARACTER_ID
+    else:
+        cid = _resolve_character(target)
+        if cid is None:
+            raise ValueError(
+                f"character_target {target!r} did not resolve — use "
+                f"list_characters to discover available names/ids."
+            )
+
+    with _get_conn(read_only=True) as conn:
+        row = conn.execute(
+            "SELECT name FROM characters WHERE character_id = ?",
+            (cid,),
+        ).fetchone()
+        if not row:
+            raise ValueError(
+                f"character_id {cid} not found in this campaign."
+            )
+        name = row["name"]
+        caster_classes = _character_caster_classes(conn, cid)
+        all_classes = [r["class_name"] for r in conn.execute(
+            "SELECT class_name FROM class_levels WHERE character_id = ?",
+            (cid,),
+        ).fetchall()]
+
+    if not caster_classes:
+        raise ValueError(
+            f"{name} has no spellbook — classes are "
+            f"{all_classes or '(none)'}. Spellbooks apply only to arcane "
+            f"and divine casters (Magic-User, Illusionist, Cleric, Druid, "
+            f"Ranger, Paladin, Bard)."
+        )
+    return cid, name
+
+
+def db_get_spellbook(
+    character_target: int | str | None = None,
+    spell_level:      int | None = None,
+    spell_class:      str | None = None,
+) -> dict:
+    """
+    Return a character's spellbook (the spells they COULD memorize),
+    grouped by spell level. NOT today's memorized load — use
+    db_get_spell_slots for that.
+
+    Filters:
+      spell_level — restrict to one level (1-9).
+      spell_class — case-insensitive exact match against the spell_class
+                    column (e.g. 'Magic-User', 'Cleric').
+
+    Defaults character_target to the PC.
+    """
+    character_id, character_name = _resolve_spellbook_target(character_target)
+
+    with _get_conn() as conn:
+        _ensure_spellbook_table(conn)
+        sql = (
+            "SELECT id, spell_name, spell_level, spell_class, source, notes "
+            "FROM spellbook WHERE character_id = ?"
+        )
+        params: list = [character_id]
+        if spell_level is not None:
+            sql += " AND spell_level = ?"
+            params.append(int(spell_level))
+        if spell_class and str(spell_class).strip():
+            sql += " AND LOWER(spell_class) = LOWER(?)"
+            params.append(str(spell_class).strip())
+        sql += " ORDER BY spell_level, spell_class, spell_name"
+        rows = conn.execute(sql, params).fetchall()
+
+    grouped: dict[int, list[dict]] = {}
+    for r in rows:
+        d = _row_to_dict(r)
+        grouped.setdefault(d["spell_level"], []).append(d)
+
+    # Stable ordered output: list of {level, count, spells: [...]}
+    by_level = [
+        {
+            "spell_level": lvl,
+            "count":       len(grouped[lvl]),
+            "spells":      grouped[lvl],
+        }
+        for lvl in sorted(grouped)
+    ]
+
+    return {
+        "character_id":   character_id,
+        "character_name": character_name,
+        "filter": {
+            "spell_level": spell_level,
+            "spell_class": spell_class or None,
+        },
+        "count":     len(rows),
+        "by_level":  by_level,
+        "reminder":  "For today's memorized load use get_spell_slots.",
+    }
+
+
+def db_add_spell_to_book(
+    spell_name:       str,
+    spell_level:      int,
+    spell_class:      str,
+    source:           str | None = None,
+    notes:            str | None = None,
+    character_target: int | str | None = None,
+) -> dict:
+    """
+    Insert a spell into the character's spellbook.
+
+    Validates:
+      - spell_name, spell_class non-empty
+      - spell_level in 1-9
+      - character has at least one arcane or divine spellcasting class
+      - (character_id, spell_name, spell_class) is not already in the
+        book — duplicates return {"already_known": True, ...} instead of
+        inserting a second row.
+    """
+    sn = (spell_name or "").strip()
+    sc = (spell_class or "").strip()
+    if not sn:
+        raise ValueError("spell_name is required and may not be empty.")
+    if not sc:
+        raise ValueError("spell_class is required and may not be empty.")
+    if not isinstance(spell_level, int) or spell_level < 1 or spell_level > 9:
+        raise ValueError("spell_level must be an integer 1-9.")
+
+    character_id, character_name = _resolve_spellbook_target(character_target)
+
+    with _get_conn() as conn:
+        _ensure_spellbook_table(conn)
+
+        # Duplicate check: same character + spell_name + spell_class (case-
+        # insensitive). Cross-class duplicates ARE allowed (the rare spell
+        # that lives on both the Cleric and Druid lists, etc.).
+        dup = conn.execute(
+            "SELECT id, spell_level, source, notes FROM spellbook "
+            "WHERE character_id = ? "
+            "  AND LOWER(spell_name)  = LOWER(?) "
+            "  AND LOWER(spell_class) = LOWER(?) "
+            "LIMIT 1",
+            (character_id, sn, sc),
+        ).fetchone()
+        if dup:
+            return {
+                "already_known":   True,
+                "character_id":    character_id,
+                "character_name":  character_name,
+                "existing_id":     dup["id"],
+                "spell_name":      sn,
+                "spell_class":     sc,
+                "spell_level":     dup["spell_level"],
+                "existing_source": dup["source"],
+                "existing_notes":  dup["notes"],
+                "warning": (
+                    f"{character_name} already has '{sn}' ({sc} L{dup['spell_level']}) "
+                    f"in their spellbook — not inserted twice."
+                ),
+            }
+
+        cur = conn.execute(
+            "INSERT INTO spellbook "
+            "(character_id, spell_name, spell_level, spell_class, source, notes) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (character_id, sn, int(spell_level), sc,
+             (source or None), (notes or None)),
+        )
+        new_id = cur.lastrowid
+
+        row = conn.execute(
+            "SELECT id, character_id, spell_name, spell_level, spell_class, "
+            "       source, notes "
+            "FROM spellbook WHERE id = ?",
+            (new_id,),
+        ).fetchone()
+
+    return {
+        "added":          True,
+        "character_name": character_name,
+        **_row_to_dict(row),
+    }
+
+
+def db_remove_spell_from_book(
+    spell_name:       str,
+    confirm:          str = "",
+    character_target: int | str | None = None,
+    spell_class:      str | None = None,
+) -> dict:
+    """
+    Delete a spell row from the character's spellbook. Requires
+    confirm='yes' (case-insensitive) to actually delete — anything else
+    returns a preview shape with no write.
+
+    If multiple rows match (same spell name in multiple class lists),
+    the optional spell_class disambiguator must be passed; otherwise
+    the call is rejected with a list of the candidates so the caller
+    can pick.
+    """
+    sn = (spell_name or "").strip()
+    if not sn:
+        raise ValueError("spell_name is required.")
+
+    character_id, character_name = _resolve_spellbook_target(character_target)
+
+    with _get_conn() as conn:
+        _ensure_spellbook_table(conn)
+
+        sql = (
+            "SELECT id, spell_name, spell_level, spell_class, source, notes "
+            "FROM spellbook WHERE character_id = ? AND LOWER(spell_name) = LOWER(?)"
+        )
+        params: list = [character_id, sn]
+        if spell_class and str(spell_class).strip():
+            sql += " AND LOWER(spell_class) = LOWER(?)"
+            params.append(str(spell_class).strip())
+        candidates = conn.execute(sql, params).fetchall()
+
+        if not candidates:
+            return {
+                "removed":        False,
+                "character_id":   character_id,
+                "character_name": character_name,
+                "spell_name":     sn,
+                "error":          f"No spell named '{sn}' found in "
+                                  f"{character_name}'s spellbook.",
+            }
+
+        if len(candidates) > 1:
+            return {
+                "removed":        False,
+                "ambiguous":      True,
+                "character_id":   character_id,
+                "character_name": character_name,
+                "spell_name":     sn,
+                "matches":        [_row_to_dict(r) for r in candidates],
+                "error": (
+                    f"{character_name} has {len(candidates)} '{sn}' rows "
+                    f"(different classes). Pass spell_class to disambiguate."
+                ),
+            }
+
+        target = _row_to_dict(candidates[0])
+
+        if (confirm or "").strip().lower() != "yes":
+            return {
+                "removed":        False,
+                "preview":        True,
+                "character_id":   character_id,
+                "character_name": character_name,
+                "would_delete":   target,
+                "note": (
+                    "Preview only — NO WRITE happened. Re-call with "
+                    "confirm='yes' to delete this row."
+                ),
+            }
+
+        conn.execute("DELETE FROM spellbook WHERE id = ?", (target["id"],))
+
+    return {
+        "removed":        True,
+        "character_id":   character_id,
+        "character_name": character_name,
+        "deleted":        target,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # PHASE 12 — INVENTORY SLOT SYSTEM
 # Equipped-by-slot model · structured combat fields · auto-migration
 # ══════════════════════════════════════════════════════════════════════════════

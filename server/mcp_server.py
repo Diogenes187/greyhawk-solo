@@ -885,6 +885,10 @@ from engine.db import (
     db_collect_circuit_income,
     db_get_circuit_ledger,
     db_check_circuits_due,
+    # Phase 31 — spellbook
+    db_get_spellbook,
+    db_add_spell_to_book,
+    db_remove_spell_from_book,
     # Phase 12 — equipment slot system
     db_equip_item,
     db_list_equipped,
@@ -4065,6 +4069,164 @@ def end_combat(
 # ══════════════════════════════════════════════════════════════════════════════
 # PHASE 2B — SPELL SYSTEM
 # ══════════════════════════════════════════════════════════════════════════════
+
+# ── PHASE 31 — SPELLBOOK (long-term known spells, distinct from today's load)
+
+@mcp.tool()
+def get_spellbook(
+    character_target: Annotated[
+        str,
+        "Optional name (case-insensitive prefix match) or numeric "
+        "character_id of the caster. Leave blank to default to the PC. "
+        "Returns an error if the target has no spellcasting class.",
+    ] = "",
+    spell_level: Annotated[
+        int,
+        "Optional level filter (1-9). Pass -1 (or 0) to return all levels.",
+    ] = -1,
+    spell_class: Annotated[
+        str,
+        "Optional class filter (case-insensitive exact match against the "
+        "spell_class column). Examples: 'Magic-User', 'Illusionist', "
+        "'Cleric', 'Druid'. Leave blank for all classes.",
+    ] = "",
+) -> dict:
+    """
+    Return a character's spellbook — the spells they KNOW and could
+    memorize — grouped by spell level.
+
+    This is the long-term known-spells list, NOT today's prepared load.
+    For today's memorized loadout and remaining slot availability, call
+    get_spell_slots.
+
+    Each entry includes id, spell_name, spell_level, spell_class, source,
+    and notes. by_level groups the rows into {spell_level, count, spells}
+    blocks in ascending level order.
+    """
+    try:
+        lvl = None if spell_level is None or spell_level < 1 else int(spell_level)
+        return db_get_spellbook(
+            character_target=(character_target or None),
+            spell_level=lvl,
+            spell_class=(spell_class or None),
+        )
+    except ValueError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def add_spell_to_book(
+    spell_name: Annotated[
+        str,
+        "Name of the spell, e.g. 'Magic Missile', 'Cure Light Wounds'. "
+        "Required.",
+    ],
+    spell_level: Annotated[
+        int,
+        "Spell level 1-9 in the spell's class list. Required.",
+    ],
+    spell_class: Annotated[
+        str,
+        "Which casting class lists this spell. Examples: 'Magic-User', "
+        "'Illusionist', 'Cleric', 'Druid'. Required so multiclass "
+        "characters can keep their spellbooks cleanly separated.",
+    ],
+    source: Annotated[
+        str,
+        "Where this spell came from, e.g. 'starting spells', 'researched', "
+        "'copied from scroll', 'gifted by Tenser'. Optional.",
+    ] = "",
+    notes: Annotated[
+        str,
+        "Free-text notes for this row: scribed component cost, page "
+        "reference, special trigger conditions. Optional.",
+    ] = "",
+    character_target: Annotated[
+        str,
+        "Optional name or character_id of the spellbook owner. Blank = PC. "
+        "The target must have at least one arcane or divine spellcasting "
+        "class (Magic-User, Illusionist, Cleric, Druid, Ranger, Paladin, "
+        "Bard); fighters / thieves / non-casters are rejected.",
+    ] = "",
+) -> dict:
+    """
+    Add a spell to a character's spellbook.
+
+    Validates that:
+      - spell_name and spell_class are non-empty
+      - spell_level is in 1-9
+      - the target character has at least one spellcasting class
+      - the same (spell_name, spell_class) is not already in the book
+        for this character — duplicates return
+        {"already_known": True, "warning": "..."} instead of inserting
+        a second row.
+
+    Same spell on two different class lists IS allowed — Cleric 1
+    'Bless' and Magic-User 1 'Bless' (if a homebrew variant existed)
+    would coexist as separate rows.
+
+    Returns the new row on success.
+    """
+    try:
+        return db_add_spell_to_book(
+            spell_name=spell_name,
+            spell_level=int(spell_level),
+            spell_class=spell_class,
+            source=(source or None),
+            notes=(notes or None),
+            character_target=(character_target or None),
+        )
+    except ValueError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def remove_spell_from_book(
+    spell_name: Annotated[
+        str,
+        "Name of the spell to remove (case-insensitive exact match).",
+    ],
+    confirm: Annotated[
+        str,
+        "Must be the literal string 'yes' to actually delete. Any other "
+        "value (including blank, the default) returns a preview shape "
+        "with no write so the caller can verify before committing.",
+    ] = "",
+    spell_class: Annotated[
+        str,
+        "Required ONLY when the same spell_name exists in multiple class "
+        "lists for this character (e.g. Cleric and Druid both have it). "
+        "Leave blank when the spell is unambiguous.",
+    ] = "",
+    character_target: Annotated[
+        str,
+        "Optional spellbook owner. Blank = PC.",
+    ] = "",
+) -> dict:
+    """
+    Delete a row from a character's spellbook.
+
+    Safety gate: confirm='yes' is required for the deletion to actually
+    happen. Any other confirm value returns a preview showing
+    would_delete and a note — no write occurs.
+
+    Ambiguity gate: if multiple rows in the book share spell_name (the
+    same spell on two class lists for a multiclass caster), the call
+    is rejected with the candidate list so the caller can re-call
+    with spell_class to disambiguate.
+
+    Returns {"removed": True, "deleted": {...row...}} on success.
+    """
+    try:
+        return db_remove_spell_from_book(
+            spell_name=spell_name,
+            confirm=confirm,
+            character_target=(character_target or None),
+            spell_class=(spell_class or None),
+        )
+    except ValueError as e:
+        return {"error": str(e)}
+
 
 @mcp.tool()
 def get_spell_slots(

@@ -892,6 +892,31 @@ CREATE TABLE spells (
     notes TEXT
 , school TEXT, range_text TEXT, duration TEXT, area_of_effect TEXT, components TEXT, casting_time TEXT, saving_throw TEXT, description TEXT, source_file TEXT, imported_at TEXT, external_spell_id TEXT, normalized_name TEXT, source_row INTEGER, summary_text TEXT, combat_use_text TEXT, utility_use_text TEXT, audit_note TEXT);
 
+-- ------------------------------------------------------------------
+-- spellbook — the set of spells a caster KNOWS (can memorize).
+-- Distinct from spell_memory (today's loadout) which lives in world_facts.
+-- Applies only to arcane and divine casters (Magic-User, Illusionist,
+-- Cleric, Druid, Ranger, Paladin, Bard); fighters/thieves/etc. have none.
+-- Runtime migration via engine._ensure_spellbook_table adds this to
+-- legacy DBs idempotently — pre-existing world_facts entries
+-- (e.g. ramun_spellbooks_v2) are NOT auto-migrated; population happens
+-- through gameplay via add_spell_to_book.
+-- ------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS spellbook (
+    id            INTEGER PRIMARY KEY,
+    character_id  INTEGER NOT NULL,
+    spell_name    TEXT NOT NULL,
+    spell_level   INTEGER NOT NULL,
+    spell_class   TEXT NOT NULL,
+    source        TEXT,
+    notes         TEXT,
+    FOREIGN KEY (character_id) REFERENCES characters(character_id)
+);
+CREATE INDEX IF NOT EXISTS idx_spellbook_character_level
+    ON spellbook(character_id, spell_level, spell_name);
+CREATE INDEX IF NOT EXISTS idx_spellbook_character_class
+    ON spellbook(character_id, spell_class);
+
 CREATE TABLE state_change_proposals (
             proposal_id INTEGER PRIMARY KEY,
             turn_id INTEGER,
