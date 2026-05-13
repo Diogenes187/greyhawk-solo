@@ -1720,6 +1720,10 @@ def get_current_scene() -> dict:
 
     Call this at the start of every session and after any teleport, travel,
     or major scene transition before writing new narration.
+
+    Every response carries a contract_footer field — a one-line reminder
+    that the DM contract is active. The DM should treat that footer as
+    binding for the response it is about to write.
     """
     scene = load_current_scene()
 
@@ -1731,6 +1735,7 @@ def get_current_scene() -> dict:
     if scene:
         scene["last_player_action"]  = last_action
         scene["last_dm_response_preview"] = last_response[:300] if last_response else ""
+        scene["contract_footer"] = _DM_CONTRACT_FOOTER
         return scene
 
     # No scene record yet — build a default from DB context
@@ -1747,6 +1752,7 @@ def get_current_scene() -> dict:
         "last_player_action":          last_action,
         "last_dm_response_preview":    last_response[:300] if last_response else "",
         "recent_turn_count":           len(recent),
+        "contract_footer":             _DM_CONTRACT_FOOTER,
     }
 
 
@@ -3235,6 +3241,116 @@ def create_character(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# PHASE 32 — DM CONTRACT ENFORCEMENT
+# The AI DM drifts over a session. The contract lives in world_facts
+# (category='dm_contract') and is auto-installed on first read. session_start
+# prepends it; get_current_scene appends a footer reminder; the `contract`
+# tool fetches it on demand when the player types "contract".
+# ══════════════════════════════════════════════════════════════════════════════
+
+_DM_CONTRACT_DEFAULT = (
+    "DM CONTRACT (read before every response):\n"
+    "(a) Describe the world only — never write Ramun's/the player's actions "
+    "or decisions.\n"
+    "(b) No new NPC names without player permission. Use title only: "
+    "\"the castellan\", \"the guard captain\".\n"
+    "(c) Real dice only. Roll stats (4d6 drop lowest), HD, saves with actual "
+    "thresholds stated aloud before rolling.\n"
+    "(d) Brevity default. One sentence answers simple questions. No "
+    "paragraphs unless drama demands it.\n"
+    "(e) No scope creep. No improvised subplots, tropes, or invented lore. "
+    "If uncertain, ask.\n"
+    "(f) Player silence = player thinking. Describe the scene and wait. "
+    "Do not fill in.\n"
+    "(g) If player says \"contract\" — stop, re-read this, correct course, "
+    "acknowledge what drifted."
+)
+
+_DM_CONTRACT_HEADER = "=== DM CONTRACT ==="
+_DM_CONTRACT_FOOTER = (
+    "[Contract active — no player verbs, no improvised names, real dice only]"
+)
+
+
+def _get_or_install_dm_contract() -> str:
+    """
+    Return the active DM contract text from world_facts.
+
+    First call on a campaign auto-installs the default contract — no manual
+    .db edit or migration script needed. Returns the most recently inserted
+    fact_text for category='dm_contract' so an admin can override the
+    contract by appending a new world_fact (without overwriting history)
+    via update_world_fact(category='dm_contract', overwrite_category=True).
+    """
+    from engine.db import (_get_conn as _ec, _CAMPAIGN_ID as _cid,
+                           update_world_fact as _uwf)
+    with _ec(read_only=True) as conn:
+        row = conn.execute(
+            "SELECT fact_text FROM world_facts "
+            "WHERE campaign_id = ? AND category = 'dm_contract' "
+            "ORDER BY world_fact_id DESC LIMIT 1",
+            (_cid,),
+        ).fetchone()
+    if row and (row["fact_text"] or "").strip():
+        return row["fact_text"]
+    # Auto-install the default. Best-effort: a write that fails (read-only
+    # DB, locked) still leaves the caller with a usable contract string.
+    try:
+        _uwf(
+            category="dm_contract",
+            fact_text=_DM_CONTRACT_DEFAULT,
+            source_note="auto-installed Phase 32 default",
+            overwrite_category=False,
+        )
+    except Exception:
+        pass
+    return _DM_CONTRACT_DEFAULT
+
+
+def _formatted_dm_contract() -> str:
+    """Return the contract with the canonical header on top, ready to display."""
+    return f"{_DM_CONTRACT_HEADER}\n{_get_or_install_dm_contract()}"
+
+
+@mcp.tool()
+def contract() -> dict:
+    """
+    Fetch and display the active DM contract.
+
+    This is the player's reset button. When they type "contract" in chat,
+    call this tool, re-read the rules, and acknowledge IN YOUR NEXT
+    RESPONSE which rule you drifted from before continuing play.
+
+    The contract is stored in world_facts under category 'dm_contract'.
+    First call on any campaign auto-installs the default contract — no
+    setup step required. An admin may rewrite the contract for a campaign
+    by calling update_world_fact with category='dm_contract' and
+    overwrite_category=True.
+
+    Returns:
+      contract          — the contract text only (no header)
+      formatted         — the contract with the '=== DM CONTRACT ===' header
+                          prepended, suitable for direct display
+      header            — the literal header string
+      footer            — the one-line scene footer reminder
+      reminder_for_dm   — explicit instruction on how to handle this call
+    """
+    text = _get_or_install_dm_contract()
+    return {
+        "contract":  text,
+        "formatted": f"{_DM_CONTRACT_HEADER}\n{text}",
+        "header":    _DM_CONTRACT_HEADER,
+        "footer":    _DM_CONTRACT_FOOTER,
+        "reminder_for_dm": (
+            "Player invoked the contract reset. Read every rule (a)-(g), "
+            "identify which rule you most recently drifted from, "
+            "acknowledge it explicitly in your next response, then "
+            "course-correct."
+        ),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # TOOL: session_start
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -3369,8 +3485,20 @@ def session_start(
         scene["last_player_action"]       = history[-1]["player_action"]
         scene["last_dm_response_preview"] = (history[-1]["dm_response"] or "")[:300]
 
+    # ── DM contract: prepended to every session_start response ───────────────
+    # First call on a fresh campaign auto-installs the default contract.
+    # Stays at the TOP of the dict so it lands above scene/character/history
+    # when the response is rendered in insertion order.
+    contract_text = _get_or_install_dm_contract()
+    dm_contract = {
+        "header": _DM_CONTRACT_HEADER,
+        "text":   contract_text,
+        "formatted": f"{_DM_CONTRACT_HEADER}\n{contract_text}",
+    }
+
     if not full:
         return {
+            "dm_contract":     dm_contract,
             "mode":            "lean",
             "character":       char,
             "scene":           scene,
@@ -3379,13 +3507,15 @@ def session_start(
                 "Lean session_start. Pass full=True for pending_updates "
                 "and the full DM checklist. Inventory / spells not "
                 "included — use list_equipped / list_inventory / "
-                "get_spell_slots."
+                "get_spell_slots. Read dm_contract.formatted before "
+                "writing any narration."
             ),
         }
 
     # full=True: comprehensive briefing
     pending = db_get_pending_updates(limit=30)
     return {
+        "dm_contract":     dm_contract,
         "mode":            "full",
         "character":       char,
         "scene":           scene,
@@ -3393,6 +3523,8 @@ def session_start(
         "pending_updates": pending,
         "briefing_notes": (
             "SESSION STARTUP CHECKLIST — complete before narrating: "
+            "(0) Read dm_contract.formatted at the top of this response "
+            "and honour it for the rest of the session. "
             "(1) If pending_updates is non-empty, commit each unresolved "
             "state change now using the appropriate write tools. "
             "(2) Orient the player from the scene and recent_history "
