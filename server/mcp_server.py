@@ -1115,6 +1115,57 @@ def _saves_for_class_level(class_name: str, level: int) -> dict | None:
     return None
 
 
+# ── Phase 35: monster / NPC visual reference helpers ─────────────────────────
+# Every tool that surfaces a creature appends a `visual_refs` field at the
+# bottom of its response: one Google-image-search link per unique creature
+# name, blank-line separator. Tools that don't surface a creature omit it.
+
+def _visual_ref_url(name: str) -> str:
+    """Build the Google image-search URL for one creature/NPC name."""
+    encoded = (name or "").strip().replace(" ", "+")
+    return f"https://www.google.com/search?q={encoded}+1e+D%26D&tbm=isch"
+
+
+def _visual_ref_line(name: str) -> str:
+    """Format one '🎨 [Name visual](url)' line."""
+    return f"🎨 [{(name or '').strip()} visual]({_visual_ref_url(name)})"
+
+
+def _visual_refs_block(names) -> str | None:
+    """
+    Build the `visual_refs` block from a sequence of creature/NPC names.
+
+      - Dedups case-insensitively, first-seen order wins.
+      - Returns None when no names survive (caller omits the field).
+      - Output starts with a blank line and contains one link per unique
+        name, so when concatenated after other narration the spec's
+        "separated by a blank line" rule is satisfied.
+
+    Pass an empty list (or all-blank strings) to get None back — that is
+    how tools signal "no creature in this response".
+    """
+    if not names:
+        return None
+    if isinstance(names, str):
+        names = [names]
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for n in names:
+        if n is None:
+            continue
+        nm = str(n).strip()
+        if not nm:
+            continue
+        key = nm.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(nm)
+    if not uniq:
+        return None
+    return "\n" + "\n".join(_visual_ref_line(n) for n in uniq)
+
+
 @mcp.tool()
 def get_character_stats(
     character_target: Annotated[
@@ -1740,14 +1791,26 @@ def get_current_scene() -> dict:
     last_action   = recent[-1]["player_action"]  if recent else ""
     last_response = recent[-1]["dm_response"]    if recent else ""
 
+    # Phase 35: if there's an active combat, surface a visual_refs block for
+    # each unique enemy group so the DM has the image search ready while
+    # narrating. No combat / no creature in scene state ⇒ no link.
+    creature_names: list[str] = []
+    active = get_active_combat()
+    if active:
+        groups = active.get("groups") or {}
+        creature_names.extend(sorted(groups.keys()))
+
     if scene:
         scene["last_player_action"]  = last_action
         scene["last_dm_response_preview"] = last_response[:300] if last_response else ""
         scene["contract_footer"] = _DM_CONTRACT_FOOTER
+        block = _visual_refs_block(creature_names)
+        if block:
+            scene["visual_refs"] = block
         return scene
 
     # No scene record yet — build a default from DB context
-    return {
+    out = {
         "scene_set":            False,
         "location":             "Quasquetan (main keep)",
         "region":               "Vesve/Furyondy frontier, World of Greyhawk",
@@ -1762,6 +1825,10 @@ def get_current_scene() -> dict:
         "recent_turn_count":           len(recent),
         "contract_footer":             _DM_CONTRACT_FOOTER,
     }
+    block = _visual_refs_block(creature_names)
+    if block:
+        out["visual_refs"] = block
+    return out
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3895,7 +3962,11 @@ def start_combat(
     set_active_combat(state)
 
     # ── Return summary ─────────────────────────────────────────────────────────
-    return {
+    # Phase 35: one visual ref per unique enemy group (six orcs = one Orc
+    # link, not six). The PC entry is excluded — visual refs are for the
+    # monsters/NPCs the DM has to describe, not the player.
+    enemy_group_names = sorted(groups.keys())
+    response: dict = {
         "encounter_name":    encounter_name,
         "round":             1,
         "initiative_order": [
@@ -3915,6 +3986,10 @@ def start_combat(
             "at any time. Call end_combat() when the encounter concludes."
         ),
     }
+    block = _visual_refs_block(enemy_group_names)
+    if block:
+        response["visual_refs"] = block
+    return response
 
 
 @mcp.tool()
@@ -5273,6 +5348,14 @@ def random_encounter(
         "then call start_combat() with the monster name and count. "
         "After combat, call generate_treasure() with the monster's treasure_type."
     )
+
+    # Phase 35: one visual ref per unique creature surfaced. 'human' /
+    # 'subtable' branches have no canonical stat-block name to link, so we
+    # only attach a ref when we actually rolled a named monster.
+    if enc.get("branch_type") == "monster" and enc.get("monster_name"):
+        block = _visual_refs_block([enc["monster_name"]])
+        if block:
+            result["visual_refs"] = block
 
     return result
 
@@ -9685,12 +9768,20 @@ def populate_area(
     pre-rolled HP via start_combat — no extra wiring needed.
     """
     try:
-        return db_populate_area(
+        result = db_populate_area(
             location_name=location_name,
             dungeon_level=int(dungeon_level),
             num_rooms=int(num_rooms) if num_rooms else None,
             notes=notes or None,
         )
+        # Phase 35: one visual ref per unique monster type across all rooms.
+        rooms = result.get("rooms") or []
+        names = [room.get("monster_type") for room in rooms
+                 if room.get("monster_type")]
+        block = _visual_refs_block(names)
+        if block:
+            result["visual_refs"] = block
+        return result
     except Exception as e:
         return {"error": str(e), "tool": "populate_area"}
 
@@ -9865,13 +9956,22 @@ def populate_npc(
       - ~5%/level chance of a personal magic item (capped at 40%)
     """
     try:
-        return db_populate_npc(
+        result = db_populate_npc(
             npc_name=npc_name,
             level=int(level),
             class_name=class_name,
             race=race or None,
             npc_tier=(npc_tier.strip() or None),
         )
+        # Phase 35: one visual ref keyed to the NPC's canonical name. Prefer
+        # the resolved name from the result over the input (the resolver
+        # accepts a prefix), so 'Hadran' surfaces as 'Lord Hadran Velmire'.
+        if isinstance(result, dict) and not result.get("error"):
+            ref_name = result.get("name") or npc_name
+            block = _visual_refs_block([ref_name])
+            if block:
+                result["visual_refs"] = block
+        return result
     except Exception as e:
         return {"error": str(e), "tool": "populate_npc"}
 
