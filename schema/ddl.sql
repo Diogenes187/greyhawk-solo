@@ -1025,6 +1025,9 @@ CREATE TABLE area_instances (
     monster_count       INTEGER NOT NULL DEFAULT 0,
     individual_hp_json  TEXT,
     monster_status_json TEXT,
+    monster_stats_json  TEXT,                 -- Phase 34: JSON list of full stat dicts
+                                              -- (hp_current/hp_max/ac/thac0/save_*/morale/...)
+                                              -- one per individual monster in the room.
     treasure_json       TEXT,
     treasure_status     TEXT NOT NULL DEFAULT 'intact',
     encounter_status    TEXT NOT NULL DEFAULT 'pending',

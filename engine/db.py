@@ -7805,6 +7805,7 @@ CREATE TABLE IF NOT EXISTS area_instances (
     monster_count       INTEGER NOT NULL DEFAULT 0,
     individual_hp_json  TEXT,
     monster_status_json TEXT,
+    monster_stats_json  TEXT,
     treasure_json       TEXT,
     treasure_status     TEXT NOT NULL DEFAULT 'intact',
     encounter_status    TEXT NOT NULL DEFAULT 'pending',
@@ -7820,18 +7821,23 @@ CREATE INDEX IF NOT EXISTS idx_area_instances_location_name
 def _ensure_area_instances_table(conn) -> None:
     """
     Idempotent runtime migration. Only runs on writable connections.
-    Handles both 'table missing' and 'table exists but missing tier column'
-    (the latter for campaign DBs created before Phase 7 tiering).
+    Handles:
+      - table missing (CREATE IF NOT EXISTS)
+      - table exists but missing `tier` column (pre-Phase-7 tiering)
+      - table exists but missing `monster_stats_json` column
+        (pre-Phase-34 full-stat enforcement; see PHASE 34 below)
     """
     conn.executescript(_AREA_INSTANCES_DDL)
-    # Defensive ALTER: add the `tier` column if an older population pass
-    # created the table without it.
-    cols = [r["name"] for r in conn.execute(
-        "PRAGMA table_info(area_instances)").fetchall()]
+    cols = {r["name"] for r in conn.execute(
+        "PRAGMA table_info(area_instances)").fetchall()}
     if "tier" not in cols:
         conn.execute(
             "ALTER TABLE area_instances "
             "ADD COLUMN tier TEXT NOT NULL DEFAULT 'standard'"
+        )
+    if "monster_stats_json" not in cols:
+        conn.execute(
+            "ALTER TABLE area_instances ADD COLUMN monster_stats_json TEXT"
         )
 
 
@@ -7862,6 +7868,317 @@ def _roll_individual_hp(hd_text: str, count: int) -> tuple[list[int], float]:
         hp, eff_hd = _roll_monster_hp(hd_text)
         hp_list.append(int(hp))
     return hp_list, eff_hd
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PHASE 34 — FULL-STAT ENFORCEMENT FOR COMBATANTS
+# Every enemy must have HP / AC / THAC0 / 5 saves / morale stored as real
+# numbers BEFORE any dice resolution. The AI is not allowed to invent
+# approximate "about" values mid-combat. populate_area / populate_npc roll
+# the full stat block at spawn time; start_combat verifies before returning;
+# attack blocks if any combatant fails verify_combatant_stats.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Fields that must be present on every enemy combatant before attack() will
+# resolve dice against it. Listed in the order they're rolled / looked up.
+_REQUIRED_COMBATANT_FIELDS: tuple[str, ...] = (
+    "hp_current", "hp_max", "ac", "thac0",
+    "save_death", "save_wands", "save_paralysis", "save_breath", "save_spells",
+    "morale",
+)
+
+
+def _monster_thac0_from_hd(eff_hd: float | int) -> int:
+    """
+    Derive THAC0 for a monster from its effective HD using the AD&D 1e
+    monster-as-fighter convention: HD treated as fighter level, then
+    Fighter THAC0 table = 20 - max(0, level-1), capped at 6 (L15+).
+    """
+    lvl = max(1, int(round(float(eff_hd or 1))))
+    return max(6, 20 - max(0, lvl - 1))
+
+
+# AD&D 1e Monster Saving Throw Matrix (Fighter saves bucketed by HD), per
+# DMG p.79. Buckets are HD ranges (low, high inclusive) → (death, wands,
+# paralysis, breath, spells). 0-1 HD uses the 'normal man' line. Values
+# above 21+ HD just reuse the 21+ row.
+_MONSTER_SAVES_BY_HD: tuple[tuple[float, float, tuple[int, int, int, int, int]], ...] = (
+    # (min_hd, max_hd, (death, wands, paralysis, breath, spells))
+    (0.0,  1.0, (14, 16, 15, 17, 17)),  # 0-1 HD (normal man / 1 HD)
+    (1.0,  2.0, (14, 16, 15, 17, 17)),  # 1+1 HD bucket
+    (2.0,  4.0, (13, 14, 13, 16, 15)),  # 2-3+ HD
+    (4.0,  6.0, (11, 13, 12, 13, 14)),  # 4-5+ HD
+    (6.0,  9.0, (10, 11, 11, 12, 12)),  # 6-7+ HD
+    (9.0,  12.0, (8, 9, 9, 11, 10)),    # 8-10+ HD (NB inclusive)
+    (12.0, 16.0, (6, 8, 8, 8, 8)),      # 11-13+ HD
+    (16.0, 21.0, (5, 6, 6, 5, 6)),      # 14-16+ HD
+    (21.0, 9999.0, (3, 4, 4, 4, 4)),    # 17+ HD
+)
+
+
+def _monster_saves_from_hd(eff_hd: float | int) -> dict:
+    """
+    Look up monster saves (5 categories) from the AD&D 1e monster matrix
+    based on effective HD. Returns a dict with the five required keys.
+    """
+    hd = float(eff_hd or 1)
+    for lo, hi, vals in _MONSTER_SAVES_BY_HD:
+        if lo <= hd < hi:
+            d, w, p, b, s = vals
+            return {
+                "save_death":     int(d),
+                "save_wands":     int(w),
+                "save_paralysis": int(p),
+                "save_breath":    int(b),
+                "save_spells":    int(s),
+            }
+    # >= top bucket
+    d, w, p, b, s = _MONSTER_SAVES_BY_HD[-1][2]
+    return {
+        "save_death":     int(d),
+        "save_wands":     int(w),
+        "save_paralysis": int(p),
+        "save_breath":    int(b),
+        "save_spells":    int(s),
+    }
+
+
+def _monster_morale_value(monster_row: dict | None, eff_hd: float | int) -> int:
+    """
+    Resolve a monster's morale to an integer 2-12 (standard 2d6 scale).
+
+    Priority:
+      1. monster_row.notes / .source_file morale_text — try to parse a number.
+      2. By HD bucket — weak (<1HD) = 5, normal (1-3HD) = 7, tough (4-7HD) = 9,
+         elite (8-11HD) = 10, boss (12+ HD) = 11.
+    Always returns a positive integer so verify_combatant_stats can require
+    morale > 0.
+    """
+    if monster_row:
+        for fld in ("notes", "source_file"):
+            txt = (monster_row.get(fld) or "")
+            m = re.search(r"morale[^0-9]{0,6}(\d{1,2})", str(txt), re.IGNORECASE)
+            if m:
+                try:
+                    val = int(m.group(1))
+                    if 2 <= val <= 20:
+                        return val
+                except ValueError:
+                    pass
+    hd = float(eff_hd or 1)
+    if hd < 1:   return 5
+    if hd < 4:   return 7
+    if hd < 8:   return 9
+    if hd < 12:  return 10
+    return 11
+
+
+def _parse_monster_ac(raw_ac) -> int:
+    """Return the leading integer in a monster_row.armor_class field. Default 10."""
+    if raw_ac is None:
+        return 10
+    s = str(raw_ac).strip()
+    if not s:
+        return 10
+    try:
+        return int(s.split("/")[0].split()[0])
+    except (ValueError, IndexError):
+        return 10
+
+
+def _build_full_monster_stats_block(monster_name: str, count: int,
+                                    hd_text_override: str | None = None,
+                                    ac_override: int | None = None,
+                                    ) -> list[dict]:
+    """
+    Roll the full per-individual stat block for `count` monsters of the
+    given name, ready to JSON-encode into area_instances.monster_stats_json.
+
+    Each entry is a dict with at minimum every key in
+    _REQUIRED_COMBATANT_FIELDS, plus hd_text, effective_hd, damage,
+    num_attacks, and display_name for downstream consumers.
+
+    Uses real dice for HP; looks up AC from the monsters table (or an
+    override); derives THAC0 + saves from effective HD; resolves morale
+    from the monster's notes / HD bucket.
+    """
+    mdata = lookup_monster(monster_name) or {}
+    hd_text = hd_text_override or (mdata.get("hit_dice") or "1")
+    raw_ac  = ac_override if ac_override is not None else mdata.get("armor_class", "10")
+    damage  = mdata.get("damage", "1-6") or "1-6"
+    num_atk_text = (mdata.get("number_of_attacks") or "1")
+    try:
+        num_attacks = max(1, int(str(num_atk_text).strip().split("/")[0]))
+    except (ValueError, IndexError):
+        num_attacks = 1
+
+    out: list[dict] = []
+    eff_hd_seen: float = 1.0
+    for i in range(max(1, int(count))):
+        hp, eff_hd = _roll_monster_hp(hd_text)
+        eff_hd_seen = float(eff_hd)
+        ac    = _parse_monster_ac(raw_ac)
+        thac0 = _monster_thac0_from_hd(eff_hd)
+        saves = _monster_saves_from_hd(eff_hd)
+        morale = _monster_morale_value(mdata, eff_hd)
+        entry: dict = {
+            "display_name":   f"{mdata.get('name', monster_name)} {i+1}",
+            "monster_index":  i,
+            "hp_current":     int(hp),
+            "hp_max":         int(hp),
+            "ac":             int(ac),
+            "thac0":          int(thac0),
+            "morale":         int(morale),
+            "hd_text":        hd_text,
+            "effective_hd":   float(eff_hd),
+            "damage":         damage,
+            "num_attacks":    num_attacks,
+            "status":         "alive",
+            **saves,
+        }
+        out.append(entry)
+    return out
+
+
+def verify_combatant_stats(area_instance_id: int,
+                           monster_index: int | None = None,
+                           ) -> dict:
+    """
+    Return whether every required combat field is populated.
+
+    monster_index=None — check ALL monsters in the room. Returns
+    {ok: bool, total: N, ok_count: N, failures: [{monster_index,
+    display_name, missing: [field, ...]}, ...]}.
+
+    monster_index=int — check just that one. Returns the same shape
+    with total=1.
+
+    "Populated" means the field is present, not None, and (for the
+    numeric stat fields) > 0. A row with morale=0 or thac0=0 is
+    treated as missing — the AI must not roll dice against it.
+    """
+    with _get_conn(read_only=True) as conn:
+        if not _area_instances_table_exists(conn):
+            return {
+                "ok": False,
+                "error": f"area_instance_id={area_instance_id} not found",
+            }
+        try:
+            row = conn.execute(
+                "SELECT monster_type, monster_count, monster_stats_json, "
+                "       individual_hp_json "
+                "FROM area_instances WHERE area_instance_id = ?",
+                (area_instance_id,),
+            ).fetchone()
+        except Exception:
+            # Pre-migration DB: monster_stats_json column doesn't exist yet.
+            row = conn.execute(
+                "SELECT monster_type, monster_count, individual_hp_json "
+                "FROM area_instances WHERE area_instance_id = ?",
+                (area_instance_id,),
+            ).fetchone()
+    if not row:
+        return {
+            "ok": False,
+            "error": f"area_instance_id={area_instance_id} not found",
+        }
+
+    try:
+        stats_list = json.loads(row["monster_stats_json"] or "[]")
+        if not isinstance(stats_list, list):
+            stats_list = []
+    except (json.JSONDecodeError, TypeError, IndexError, KeyError):
+        stats_list = []
+
+    # Iterate over the declared monster_count (or HP-list length as a
+    # fallback) when no specific index was requested, so a row whose
+    # monster_stats_json is entirely missing reports each declared monster
+    # as failing rather than silently returning total=0.
+    try:
+        hp_list = json.loads(row["individual_hp_json"] or "[]")
+        hp_len  = len(hp_list) if isinstance(hp_list, list) else 0
+    except (json.JSONDecodeError, TypeError):
+        hp_len = 0
+    declared_count = int(row["monster_count"] or 0) or hp_len or len(stats_list)
+
+    failures: list[dict] = []
+    ok_count = 0
+    indices = ([int(monster_index)]
+               if monster_index is not None else range(declared_count))
+    total = 0
+    for i in indices:
+        total += 1
+        if not (0 <= i < len(stats_list)):
+            failures.append({
+                "monster_index": i,
+                "display_name":  f"{row['monster_type']} {i+1}",
+                "missing":       list(_REQUIRED_COMBATANT_FIELDS) + ["row"],
+            })
+            continue
+        entry = stats_list[i]
+        missing = [
+            f for f in _REQUIRED_COMBATANT_FIELDS
+            if entry.get(f) is None or (
+                isinstance(entry.get(f), (int, float)) and entry.get(f) <= 0
+            )
+        ]
+        if missing:
+            failures.append({
+                "monster_index": i,
+                "display_name":  entry.get("display_name",
+                                          f"{row['monster_type']} {i+1}"),
+                "missing":       missing,
+            })
+        else:
+            ok_count += 1
+
+    return {
+        "ok":         len(failures) == 0 and total > 0,
+        "total":      total,
+        "ok_count":   ok_count,
+        "failures":   failures,
+        "monster_type": row["monster_type"],
+    }
+
+
+def db_regenerate_combatant_stats(area_instance_id: int) -> dict:
+    """
+    Force a fresh roll of monster_stats_json for an existing area_instance
+    row. Used by start_combat as the auto-repair path when an older row
+    has individual_hp_json but no monster_stats_json (pre-Phase-34 data).
+    """
+    with _get_conn() as conn:
+        _ensure_area_instances_table(conn)
+        row = conn.execute(
+            "SELECT monster_type, monster_count, individual_hp_json "
+            "FROM area_instances WHERE area_instance_id = ?",
+            (area_instance_id,),
+        ).fetchone()
+        if not row:
+            return {"ok": False,
+                    "error": f"area_instance_id={area_instance_id} not found"}
+        try:
+            existing_hp = json.loads(row["individual_hp_json"] or "[]")
+        except (json.JSONDecodeError, TypeError):
+            existing_hp = []
+        count = max(1, int(row["monster_count"] or len(existing_hp) or 1))
+        stats = _build_full_monster_stats_block(
+            monster_name=row["monster_type"] or "Skeleton",
+            count=count,
+        )
+        # Preserve any prior HP (e.g. mid-combat damage already applied):
+        # if the existing list has a value, keep it as hp_current and treat
+        # the freshly rolled value as hp_max.
+        for i, entry in enumerate(stats):
+            if i < len(existing_hp) and isinstance(existing_hp[i], (int, float)):
+                entry["hp_current"] = int(existing_hp[i])
+        conn.execute(
+            "UPDATE area_instances SET monster_stats_json = ? "
+            "WHERE area_instance_id = ?",
+            (json.dumps(stats), area_instance_id),
+        )
+    return {"ok": True, "area_instance_id": area_instance_id,
+            "stats": stats}
 
 
 # ── populate_area ─────────────────────────────────────────────────────────────
@@ -7955,7 +8272,14 @@ def db_populate_area(
                 )
             room_tier = _normalize_tier(room_tier)
 
-            hp_list, _eff_hd = _roll_individual_hp(hd_text, int(count))
+            # Phase 34: roll the FULL stat block per individual at spawn time
+            # so every enemy has hp / ac / thac0 / saves / morale before any
+            # dice resolution. Keep individual_hp_json populated as the
+            # legacy cache for code paths that haven't been migrated yet.
+            full_stats = _build_full_monster_stats_block(
+                monster_name=mname, count=int(count), hd_text_override=hd_text,
+            )
+            hp_list  = [e["hp_current"] for e in full_stats]
             statuses = ["alive"] * len(hp_list)
 
             # Treasure — only roll for valid letters; otherwise empty.
@@ -7975,14 +8299,16 @@ def db_populate_area(
                     campaign_id, location_id, location_name, room_label,
                     dungeon_level, monster_type, monster_count,
                     individual_hp_json, monster_status_json,
+                    monster_stats_json,
                     treasure_json, treasure_status, encounter_status,
                     tier, created_date, notes
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'intact', 'pending', ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'intact', 'pending', ?, ?, ?)
                 """,
                 (
                     _CAMPAIGN_ID, location_id, location_name, room["room_label"],
                     int(dungeon_level), mname, len(hp_list),
                     json.dumps(hp_list), json.dumps(statuses),
+                    json.dumps(full_stats),
                     json.dumps(treasure) if treasure else None,
                     room_tier, now, notes,
                 ),
@@ -7995,6 +8321,7 @@ def db_populate_area(
                 "individual_hp":    hp_list,
                 "tier":             room_tier,
                 "treasure_summary": _summarize_treasure(treasure),
+                "stats_block":      full_stats,
             })
 
     return {
@@ -8107,14 +8434,30 @@ def db_get_monster_instance(area_instance_id: int, monster_index: int = 0) -> di
     """
     Return one monster's stats from a pre-rolled instance.
     monster_index is 0-based.
+
+    Phase 34: if monster_stats_json is missing/incomplete (legacy row, or
+    something raced), the response includes a stats_complete=False flag
+    and an explicit warning so the AI does NOT proceed to resolve dice
+    against improvised stats. Call populate_area (or start_combat, which
+    auto-repairs) first.
     """
     with _get_conn(read_only=True) as conn:
         if not _area_instances_table_exists(conn):
             return {"error": f"area_instance_id={area_instance_id} not found"}
-        row = conn.execute(
-            "SELECT * FROM area_instances WHERE area_instance_id = ?",
-            (area_instance_id,),
-        ).fetchone()
+        try:
+            row = conn.execute(
+                "SELECT *, monster_stats_json FROM area_instances "
+                "WHERE area_instance_id = ?",
+                (area_instance_id,),
+            ).fetchone()
+        except Exception:
+            # monster_stats_json column may not exist yet on a connection that
+            # was opened read-only against a pre-migration DB. Fall back to
+            # the older shape.
+            row = conn.execute(
+                "SELECT * FROM area_instances WHERE area_instance_id = ?",
+                (area_instance_id,),
+            ).fetchone()
 
     if not row:
         return {"error": f"area_instance_id={area_instance_id} not found"}
@@ -8131,6 +8474,12 @@ def db_get_monster_instance(area_instance_id: int, monster_index: int = 0) -> di
         treasure = json.loads(row["treasure_json"] or "{}")
     except (json.JSONDecodeError, TypeError):
         treasure = {}
+    try:
+        stats_list = json.loads(row["monster_stats_json"] or "[]")
+        if not isinstance(stats_list, list):
+            stats_list = []
+    except (json.JSONDecodeError, TypeError, IndexError, KeyError):
+        stats_list = []
 
     if not (0 <= monster_index < len(hp_list)):
         return {"error": f"monster_index {monster_index} out of range "
@@ -8144,7 +8493,24 @@ def db_get_monster_instance(area_instance_id: int, monster_index: int = 0) -> di
     except (IndexError, KeyError):
         tier_val = "standard"
 
-    return {
+    # Per-individual full stat block (Phase 34). Falls back to the bare
+    # cached HP if the block is missing — and flags it loudly.
+    full_stats: dict = {}
+    missing: list[str] = []
+    if 0 <= monster_index < len(stats_list):
+        entry = stats_list[monster_index] or {}
+        for fld in _REQUIRED_COMBATANT_FIELDS:
+            val = entry.get(fld)
+            if val is None or (isinstance(val, (int, float)) and val <= 0):
+                missing.append(fld)
+            else:
+                full_stats[fld] = val
+    else:
+        missing = list(_REQUIRED_COMBATANT_FIELDS)
+
+    stats_complete = not missing
+
+    out = {
         "area_instance_id": area_instance_id,
         "room_label":       row["room_label"],
         "monster_type":     row["monster_type"],
@@ -8153,9 +8519,18 @@ def db_get_monster_instance(area_instance_id: int, monster_index: int = 0) -> di
         "status":           statuses[monster_index] if monster_index < len(statuses) else "alive",
         "tier":             tier_val,
         "stats":            mstats,
+        "combat_stats":     full_stats,
+        "stats_complete":   stats_complete,
         "shared_treasure":  treasure,
         "treasure_status":  row["treasure_status"],
     }
+    if not stats_complete:
+        out["warning"] = (
+            "WARNING: stats incomplete — dice resolution blocked until "
+            "populate_npc is run."
+        )
+        out["missing_fields"] = missing
+    return out
 
 
 def db_update_monster_instance(
@@ -8335,6 +8710,94 @@ def _npc_thac0(class_name: str, level: int) -> int:
     if cl in ("magicuser", "mage"):
         return max(6, 20 - ((level - 1) // 5) * 1)
     return max(6, 20 - max(0, level - 1) // 3)
+
+
+# Cache of {class_name_lower: {level_str: {death:N, wands:N, paralysis:N,
+# breath:N, spells:N}}} loaded from data/classes.json on first read.
+_NPC_SAVES_CACHE: dict[str, dict[str, dict[str, int]]] | None = None
+
+
+def _load_npc_saves_tables() -> dict[str, dict[str, dict[str, int]]]:
+    """Lazy-load every class's saves_by_level from data/classes.json."""
+    global _NPC_SAVES_CACHE
+    if _NPC_SAVES_CACHE is not None:
+        return _NPC_SAVES_CACHE
+    out: dict[str, dict[str, dict[str, int]]] = {}
+    try:
+        with open(_ROOT / "data" / "classes.json", encoding="utf-8") as f:
+            data = json.load(f)
+        for cls_name, cls_data in (data or {}).items():
+            sbl = cls_data.get("saves_by_level") or {}
+            if isinstance(sbl, dict) and sbl:
+                out[cls_name.strip().lower()] = sbl
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        pass
+    _NPC_SAVES_CACHE = out
+    return out
+
+
+def _npc_saves(class_name: str, level: int) -> dict[str, int]:
+    """
+    Look up an NPC's saves dict from classes.json. Maps a class name token
+    onto the canonical entry, then picks the matching level (or the closest
+    available level <= requested). Returns a dict with the five keys the
+    rest of the engine consumes:
+       save_death, save_wands, save_paralysis, save_breath, save_spells.
+
+    Falls back to the AD&D 1e monster matrix (treating the NPC's level as
+    fighter HD) if classes.json is unavailable or doesn't cover this class —
+    the caller never gets None back, so verify_combatant_stats can require
+    every save > 0.
+    """
+    raw = (class_name or "").strip().lower()
+    # Normalise common aliases to whatever key is in classes.json.
+    alias_map = {
+        "magic-user": "magic-user", "magic user": "magic-user",
+        "mage": "magic-user", "wizard": "magic-user",
+        "fighter": "fighter", "paladin": "fighter", "ranger": "fighter",
+        "cleric": "cleric", "druid": "cleric",
+        "thief": "thief", "assassin": "thief",
+        "monk": "fighter", "bard": "fighter",
+        "illusionist": "magic-user",
+    }
+    key = alias_map.get(raw, raw)
+    tables = _load_npc_saves_tables()
+    table = tables.get(key) or {}
+
+    if not table:
+        # Last-ditch fallback: use the monster saves matrix at this level as HD.
+        return _monster_saves_from_hd(max(1, int(level or 1)))
+
+    lvl = max(1, int(level or 1))
+    if str(lvl) in table:
+        row = table[str(lvl)]
+    else:
+        avail = sorted(int(k) for k in table if str(k).isdigit() and int(k) <= lvl)
+        if not avail:
+            return _monster_saves_from_hd(lvl)
+        row = table[str(avail[-1])]
+
+    return {
+        "save_death":     int(row.get("death", 14)),
+        "save_wands":     int(row.get("wands", 16)),
+        "save_paralysis": int(row.get("paralysis", 15)),
+        "save_breath":    int(row.get("breath", 17)),
+        "save_spells":    int(row.get("spells", 17)),
+    }
+
+
+def _npc_morale(class_name: str, level: int, npc_tier: str = "standard") -> int:
+    """
+    Resolve NPC morale on the 2-12 scale.
+
+    Tier dominates: minions hold less, bosses hold more. Within a tier,
+    level shifts the result slightly so a L10 standard NPC has higher
+    morale than a L1 standard NPC.
+    """
+    tier = _normalize_tier(npc_tier)
+    base = {"minion": 6, "standard": 8, "boss": 11}.get(tier, 8)
+    bonus = max(0, int(level or 1) - 1) // 4  # +1 per 4 levels
+    return min(12, base + bonus)
 
 
 _CLASS_ABILITY_PRIORITY: dict[str, list[str]] = {
@@ -8591,7 +9054,9 @@ def _roll_npc_stats(
     dex_ac = _dex_ac_bonus(abilities["dexterity"])
     ac     = base_ac - dex_ac
 
-    thac0 = _npc_thac0(class_name, level)
+    thac0  = _npc_thac0(class_name, level)
+    saves  = _npc_saves(class_name, level)
+    morale = _npc_morale(class_name, level, tier)
 
     equipment = _npc_equipment(cl, level)
     carried_gp = random.randint(level, level * 50) + random.randint(0, 50)
@@ -8618,6 +9083,12 @@ def _roll_npc_stats(
         "ac":                ac,
         "dex_ac_bonus":      dex_ac,
         "thac0":             thac0,
+        "save_death":        saves["save_death"],
+        "save_wands":        saves["save_wands"],
+        "save_paralysis":    saves["save_paralysis"],
+        "save_breath":       saves["save_breath"],
+        "save_spells":       saves["save_spells"],
+        "morale":            morale,
         "equipment":         equipment,
         "carried_gp":        carried_gp,
         "magic_items":       magic_items,
@@ -8767,14 +9238,22 @@ def db_populate_npc(
                 (char_id, stats["hp_max"], stats["hp_max"], stats["ac"]),
             )
 
-        # Stash equipment + carried gold + thac0 + magic items + roll
-        # provenance in a category='npc_stats' world_facts row keyed to
-        # this character.
+        # Stash equipment + carried gold + thac0 + saves + morale + magic
+        # items + roll provenance in a category='npc_stats' world_facts row
+        # keyed to this character. Phase 34: saves and morale are now part
+        # of the canonical payload so verify_combatant_stats can confirm
+        # an NPC is ready for dice resolution without a re-roll.
         wf_payload = {
             "character_id":      char_id,
             "name":              npc_row["name"],
             "tier":              stats.get("tier", "standard"),
             "thac0":             stats["thac0"],
+            "save_death":        stats["save_death"],
+            "save_wands":        stats["save_wands"],
+            "save_paralysis":    stats["save_paralysis"],
+            "save_breath":       stats["save_breath"],
+            "save_spells":       stats["save_spells"],
+            "morale":            stats["morale"],
             "hit_die":           stats["hit_die"],
             "equipment":         stats["equipment"],
             "carried_gp":        stats["carried_gp"],
@@ -8834,6 +9313,24 @@ def _read_npc_full_stats(character_id: int, already_populated: bool) -> dict:
         except (json.JSONDecodeError, TypeError):
             pass
 
+    # Phase 34: backfill saves/morale on read for NPCs that were populated
+    # before the contract added these fields, so older NPCs still show as
+    # combat-ready instead of being marked incomplete by verify_combatant_stats.
+    needs_backfill = (
+        extra
+        and extra.get("save_death") is None
+        and cls
+    )
+    if needs_backfill:
+        backfill_saves  = _npc_saves(cls["class_name"], int(cls["level"] or 1))
+        backfill_morale = _npc_morale(
+            cls["class_name"], int(cls["level"] or 1),
+            npc_tier=extra.get("tier", "standard"),
+        )
+    else:
+        backfill_saves  = {}
+        backfill_morale = None
+
     return {
         "populated":         True,
         "already_populated": already_populated,
@@ -8848,6 +9345,12 @@ def _read_npc_full_stats(character_id: int, already_populated: bool) -> dict:
         "hp_max":            st["hp_max"] if st else None,
         "ac":                st["ac"] if st else None,
         "thac0":             extra.get("thac0"),
+        "save_death":        extra.get("save_death",     backfill_saves.get("save_death")),
+        "save_wands":        extra.get("save_wands",     backfill_saves.get("save_wands")),
+        "save_paralysis":    extra.get("save_paralysis", backfill_saves.get("save_paralysis")),
+        "save_breath":       extra.get("save_breath",    backfill_saves.get("save_breath")),
+        "save_spells":       extra.get("save_spells",    backfill_saves.get("save_spells")),
+        "morale":            extra.get("morale",         backfill_morale),
         "hit_die":           extra.get("hit_die"),
         "equipment":         extra.get("equipment", []),
         "carried_gp":        extra.get("carried_gp"),

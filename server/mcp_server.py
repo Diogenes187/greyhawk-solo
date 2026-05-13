@@ -866,6 +866,14 @@ from engine.db import (
     db_update_monster_instance,
     db_find_pre_rolled_for_combat,
     db_populate_npc,
+    # Phase 34 — full-stat enforcement
+    verify_combatant_stats,
+    db_regenerate_combatant_stats,
+    _REQUIRED_COMBATANT_FIELDS,
+    _build_full_monster_stats_block,
+    _monster_thac0_from_hd,
+    _monster_saves_from_hd,
+    _monster_morale_value,
     # Phase 8 — character roster, XP grants, class-level management
     db_grant_xp,
     db_add_class_level,
@@ -3739,27 +3747,116 @@ def start_combat(
                     prerolled_hp = [int(h) for h in hp_list[:count]]
                     prerolled_instance_id = inst.get("area_instance_id")
 
+        # Phase 34: if this group is backed by a pre-rolled area_instance row,
+        # auto-repair any pre-Phase-34 row that's missing monster_stats_json
+        # so verify_combatant_stats returns ok before we ever resolve dice.
+        prerolled_stats_block: list[dict] | None = None
+        if prerolled_instance_id is not None:
+            verify = verify_combatant_stats(prerolled_instance_id)
+            if not verify.get("ok"):
+                fixed = db_regenerate_combatant_stats(prerolled_instance_id)
+                if not fixed.get("ok"):
+                    return {
+                        "error": (
+                            f"Stats incomplete for {disp_name} "
+                            f"(area_instance_id={prerolled_instance_id}) — "
+                            f"run populate_npc first. "
+                            f"Repair failed: {fixed.get('error')}"
+                        ),
+                        "blocked_by_contract": True,
+                    }
+                prerolled_stats_block = fixed.get("stats") or None
+            else:
+                # Pull the existing block out of the row for fast access.
+                from engine.db import (_get_conn as _ec_block,
+                                       _area_instances_table_exists as _aiex)
+                with _ec_block(read_only=True) as conn:
+                    if _aiex(conn):
+                        try:
+                            r = conn.execute(
+                                "SELECT monster_stats_json FROM area_instances "
+                                "WHERE area_instance_id = ?",
+                                (prerolled_instance_id,),
+                            ).fetchone()
+                            if r and r["monster_stats_json"]:
+                                prerolled_stats_block = json.loads(
+                                    r["monster_stats_json"]
+                                )
+                        except Exception:
+                            prerolled_stats_block = None
+
+        # Adhoc groups (no pre-rolled row): roll a full stats block now so
+        # every combatant carries complete fields into the active_combat
+        # blob. This is what verify_combatant_stats and attack() rely on.
+        adhoc_stats_block: list[dict] | None = None
+        if prerolled_stats_block is None:
+            adhoc_stats_block = _build_full_monster_stats_block(
+                monster_name=disp_name, count=count,
+                hd_text_override=hd_text,
+                ac_override=(grp.get("ac_override") if grp.get("ac_override") else None),
+            )
+
         for i in range(1, count + 1):
             cid = f"{disp_name}_{i}"
-            hp_roll, eff_hd = _roll_monster_hp(hd_text)
+            # Resolve the per-individual full stat dict for this monster.
+            stat_block = None
+            if prerolled_stats_block and i - 1 < len(prerolled_stats_block):
+                stat_block = prerolled_stats_block[i - 1] or {}
+            elif adhoc_stats_block and i - 1 < len(adhoc_stats_block):
+                stat_block = adhoc_stats_block[i - 1] or {}
+            stat_block = dict(stat_block or {})
+
+            # Caller overrides win over rolled values.
+            if "hp_override" in grp:
+                stat_block["hp_current"] = int(grp["hp_override"])
+                stat_block["hp_max"]     = int(grp["hp_override"])
+            if "ac_override" in grp:
+                stat_block["ac"] = int(grp["ac_override"])
+            # If we used a pre-rolled HP list (mid-combat / damaged state),
+            # honour it over the freshly-rolled hp_current.
             if prerolled_hp is not None and i - 1 < len(prerolled_hp):
-                hp = int(prerolled_hp[i - 1])
-            else:
-                hp = int(grp.get("hp_override", hp_roll))
-            ac  = int(grp.get("ac_override", base_ac))
-            xp  = _xp_for_hd(eff_hd)
+                stat_block["hp_current"] = int(prerolled_hp[i - 1])
+
+            eff_hd = stat_block.get("effective_hd", 1.0)
+            xp     = _xp_for_hd(eff_hd)
+
+            # Final per-combatant verification — every required field
+            # present and > 0. If anything is missing here something is
+            # genuinely wrong with the build path; refuse to start combat.
+            missing = [
+                f for f in _REQUIRED_COMBATANT_FIELDS
+                if stat_block.get(f) is None
+                or (isinstance(stat_block.get(f), (int, float))
+                    and stat_block.get(f) <= 0)
+            ]
+            if missing:
+                return {
+                    "error": (
+                        f"Stats incomplete for {disp_name} {i} — run "
+                        f"populate_npc first. Missing: {missing}"
+                    ),
+                    "blocked_by_contract": True,
+                    "missing_fields":       missing,
+                }
 
             combatants[cid] = {
                 "name":        f"{disp_name} {i}",
                 "side":        "enemy",
                 "initiative":  random.randint(1, 10),
-                "hp_current":  hp,
-                "hp_max":      hp,
-                "ac":          ac,
-                "hd_text":     hd_text,
-                "effective_hd": eff_hd,
-                "damage_text": damage,
-                "num_attacks": n_attacks,
+                "hp_current":  int(stat_block["hp_current"]),
+                "hp_max":      int(stat_block["hp_max"]),
+                "ac":          int(stat_block["ac"]),
+                "thac0":       int(stat_block["thac0"]),
+                "save_death":     int(stat_block["save_death"]),
+                "save_wands":     int(stat_block["save_wands"]),
+                "save_paralysis": int(stat_block["save_paralysis"]),
+                "save_breath":    int(stat_block["save_breath"]),
+                "save_spells":    int(stat_block["save_spells"]),
+                "morale":      int(stat_block["morale"]),
+                "hd_text":     stat_block.get("hd_text", hd_text),
+                "effective_hd": float(stat_block.get("effective_hd", eff_hd)),
+                "damage_text": stat_block.get("damage", damage),
+                "num_attacks": int(stat_block.get("num_attacks", n_attacks)),
                 "xp":          xp,
                 "is_pc":       False,
                 "status":      "active",
@@ -3968,6 +4065,49 @@ def attack(
         return {"error": f"{attacker['name']} is {attacker['status']} and cannot attack."}
     if target["status"] != "active":
         return {"error": f"{target['name']} is already {target['status']}."}
+
+    # ── Phase 34: stat-enforcement gate ───────────────────────────────────────
+    # Block dice resolution against any enemy combatant whose stat block in
+    # the active_combat state is missing required fields. PCs are exempt —
+    # their stats live in characters / character_status and are validated
+    # by their own pipelines. The required fields for an enemy are the
+    # full set in _REQUIRED_COMBATANT_FIELDS.
+    def _missing_required(c: dict) -> list[str]:
+        if c.get("is_pc"):
+            # PC entries only need hp/ac for the d20 math here.
+            out = []
+            if c.get("hp_current") is None or c.get("hp_current") < 0:
+                out.append("hp_current")
+            if c.get("ac") is None:
+                out.append("ac")
+            return out
+        return [
+            f for f in _REQUIRED_COMBATANT_FIELDS
+            if c.get(f) is None
+            or (isinstance(c.get(f), (int, float)) and c.get(f) <= 0
+                and f != "hp_current")  # hp_current=0 means dead, which is ok upstream
+        ]
+
+    miss_attacker = _missing_required(attacker)
+    miss_target   = _missing_required(target)
+    if miss_attacker:
+        return {
+            "error": (
+                f"Stats incomplete for {attacker['name']} — run "
+                f"populate_npc first. Missing: {miss_attacker}"
+            ),
+            "blocked_by_contract": True,
+            "missing_fields":       miss_attacker,
+        }
+    if miss_target:
+        return {
+            "error": (
+                f"Stats incomplete for {target['name']} — run "
+                f"populate_npc first. Missing: {miss_target}"
+            ),
+            "blocked_by_contract": True,
+            "missing_fields":       miss_target,
+        }
 
     target_ac = target["ac"]
     result    = {"attacker": attacker["name"], "target": target["name"],
