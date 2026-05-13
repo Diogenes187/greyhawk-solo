@@ -3252,18 +3252,27 @@ _DM_CONTRACT_DEFAULT = (
     "DM CONTRACT (read before every response):\n"
     "(a) Describe the world only — never write Ramun's/the player's actions "
     "or decisions.\n"
-    "(b) No new NPC names without player permission. Use title only: "
-    "\"the castellan\", \"the guard captain\".\n"
-    "(c) Real dice only. Roll stats (4d6 drop lowest), HD, saves with actual "
+    "(b) Real dice only. Roll stats (4d6 drop lowest), HD, saves with actual "
     "thresholds stated aloud before rolling.\n"
-    "(d) Brevity default. One sentence answers simple questions. No "
+    "(c) Brevity default. One sentence answers simple questions. No "
     "paragraphs unless drama demands it.\n"
-    "(e) No scope creep. No improvised subplots, tropes, or invented lore. "
+    "(d) No scope creep. No improvised subplots, tropes, or invented lore. "
     "If uncertain, ask.\n"
-    "(f) Player silence = player thinking. Describe the scene and wait. "
+    "(e) Player silence = player thinking. Describe the scene and wait. "
     "Do not fill in.\n"
-    "(g) If player says \"contract\" — stop, re-read this, correct course, "
+    "(f) If player says \"contract\" — stop, re-read this, correct course, "
     "acknowledge what drifted."
+)
+
+# Phrases that uniquely identify a SUPERSEDED default contract. Used by the
+# auto-upgrade path in _get_or_install_dm_contract to swap legacy rows over
+# to the current default via update_world_fact(overwrite_category=True).
+# Each entry is the exact opening of a discontinued (a)-(g) item line; a
+# stored contract is treated as legacy when ANY of these phrases is present
+# AND the canonical header is also present (so custom admin overrides that
+# happen to mention "NPC names" aren't blown away).
+_DM_CONTRACT_LEGACY_PHRASES: tuple[str, ...] = (
+    "No new NPC names without player permission.",
 )
 
 _DM_CONTRACT_HEADER = "=== DM CONTRACT ==="
@@ -3272,15 +3281,41 @@ _DM_CONTRACT_FOOTER = (
 )
 
 
+def _is_legacy_dm_contract(text: str) -> bool:
+    """
+    True if `text` looks like a superseded engine default rather than a
+    custom admin override. Requires the canonical header AND at least one
+    discontinued-line phrase from _DM_CONTRACT_LEGACY_PHRASES.
+    """
+    if not text:
+        return False
+    if "DM CONTRACT (read before every response):" not in text:
+        return False
+    return any(p in text for p in _DM_CONTRACT_LEGACY_PHRASES)
+
+
 def _get_or_install_dm_contract() -> str:
     """
     Return the active DM contract text from world_facts.
 
-    First call on a campaign auto-installs the default contract — no manual
-    .db edit or migration script needed. Returns the most recently inserted
-    fact_text for category='dm_contract' so an admin can override the
-    contract by appending a new world_fact (without overwriting history)
-    via update_world_fact(category='dm_contract', overwrite_category=True).
+    Three paths:
+
+    1. No row present — auto-install the current default (no manual .db
+       edit or migration script needed). Inserted via update_world_fact
+       with source_note 'auto-installed Phase 33 default'.
+
+    2. Stored row matches a known legacy default (superseded engine
+       version detected via _is_legacy_dm_contract) — replace it with
+       the current default via update_world_fact(overwrite_category=True).
+       This is how a contract revision (e.g. dropping the NPC-names
+       rule) propagates to existing campaigns without an external
+       migration step or any direct .db edit.
+
+    3. Stored row exists and is NOT a known legacy default — leave it
+       alone. Custom admin overrides survive untouched.
+
+    Returns the most recently inserted fact_text for category
+    ='dm_contract' (after any auto-install / auto-upgrade has run).
     """
     from engine.db import (_get_conn as _ec, _CAMPAIGN_ID as _cid,
                            update_world_fact as _uwf)
@@ -3291,15 +3326,35 @@ def _get_or_install_dm_contract() -> str:
             "ORDER BY world_fact_id DESC LIMIT 1",
             (_cid,),
         ).fetchone()
-    if row and (row["fact_text"] or "").strip():
-        return row["fact_text"]
-    # Auto-install the default. Best-effort: a write that fails (read-only
-    # DB, locked) still leaves the caller with a usable contract string.
+
+    stored = (row["fact_text"] if row else "") or ""
+
+    # Path 2: stored row is a recognised legacy default — auto-upgrade.
+    if stored and _is_legacy_dm_contract(stored):
+        try:
+            _uwf(
+                category="dm_contract",
+                fact_text=_DM_CONTRACT_DEFAULT,
+                source_note="auto-upgraded Phase 33 default (legacy row replaced)",
+                overwrite_category=True,
+            )
+        except Exception:
+            # Couldn't write — still return the new text so the caller
+            # sees the correct contract this session.
+            pass
+        return _DM_CONTRACT_DEFAULT
+
+    # Path 3: custom override / already-current default — keep as-is.
+    if stored.strip():
+        return stored
+
+    # Path 1: no row yet — auto-install. Best-effort: a write that fails
+    # (read-only DB, locked) still leaves the caller with a usable string.
     try:
         _uwf(
             category="dm_contract",
             fact_text=_DM_CONTRACT_DEFAULT,
-            source_note="auto-installed Phase 32 default",
+            source_note="auto-installed Phase 33 default",
             overwrite_category=False,
         )
     except Exception:
