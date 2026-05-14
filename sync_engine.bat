@@ -98,6 +98,12 @@ for /l %%I in (1,1,%COUNT%) do (
         copy /y "%SRC%\sync_engine.sh"  "!DST!\sync_engine.sh"  >nul 2>&1
         if errorlevel 1 (echo    WARN: sync_engine.sh copy failed)  else (echo    OK  sync_engine.sh)
 
+        rem skills/ -- full folder sync (Phase 36: universal skill files)
+        if exist "%SRC%\skills" (
+            robocopy "%SRC%\skills" "!DST!\skills" /E /NP /NFL /NDL /NJH /NJS >nul 2>&1
+            if errorlevel 8 (echo    WARN: skills/ copy failed) else (echo    OK  skills/)
+        )
+
         set /a PASS+=1
     )
 )

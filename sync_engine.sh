@@ -100,6 +100,17 @@ for i in "${!TARGETS[@]}"; do
     copy_file "$SRC/sync_engine.bat"               "$DST/sync_engine.bat"               "sync_engine.bat"
     copy_file "$SRC/sync_engine.sh"                "$DST/sync_engine.sh"                "sync_engine.sh"
 
+    # skills/ — full folder sync (Phase 36: universal skill files)
+    if [[ -d "$SRC/skills" ]]; then
+        if rsync -a "$SRC/skills/" "$DST/skills/" 2>/dev/null; then
+            echo "   OK  skills/"
+        elif cp -r "$SRC/skills/." "$DST/skills/" 2>/dev/null; then
+            echo "   OK  skills/ (via cp)"
+        else
+            echo "   WARN: skills/ copy failed"
+        fi
+    fi
+
     PASS=$((PASS+1))
 done
 

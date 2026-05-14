@@ -10090,5 +10090,536 @@ def add_class_level(
         return {"error": str(e), "tool": "add_class_level"}
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# PHASE 36 — MAKE MODULE SUBSYSTEM
+# Self-contained AD&D 1e module storage with fog-of-war progress tracking.
+#
+# Storage layout (all in world_facts; no schema change required):
+#   category='module_key_index'  source_note=module_key  fact_text=JSON wrapper
+#       {"module_key":..., "module_name":..., "total_rooms":N,
+#        "entrance_room":N, "rooms":[{"room":i,"name":"","stored":false}, ...]}
+#   category='module_map_state'  source_note=module_key  fact_text=JSON
+#       {"explored":[...], "triggered_traps":[...],
+#        "found_secrets":[...], "cleared_rooms":[...]}
+#   category='module_notes'      source_note=module_key  fact_text=text
+#   category='module_room'       source_note='<module_key>:r<n>'
+#                                fact_text=room content (≤1800 chars)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_MODULE_KEY_INDEX_CATEGORY = "module_key_index"
+_MODULE_MAP_STATE_CATEGORY = "module_map_state"
+_MODULE_NOTES_CATEGORY     = "module_notes"
+_MODULE_ROOM_CATEGORY      = "module_room"
+_MODULE_ROOM_CONTENT_MAX   = 1800
+
+_MAP_STATE_ACTIONS: dict[str, str] = {
+    "explore_room":  "explored",
+    "trigger_trap":  "triggered_traps",
+    "find_secret":   "found_secrets",
+    "clear_room":    "cleared_rooms",
+}
+
+
+def _validate_module_key(s: str) -> str:
+    """
+    Normalise a module_key. Lowercase, [a-z0-9_], 2-64 chars. Raises
+    ValueError for anything else. Module keys appear in world_facts.source_note
+    and become part of room source_notes; keeping them slug-shaped means a
+    direct LIKE / equality lookup never needs escaping.
+    """
+    if not s:
+        raise ValueError("module_key is required.")
+    sk = s.strip().lower()
+    if not re.match(r"^[a-z0-9_]{2,64}$", sk):
+        raise ValueError(
+            "module_key must be 2-64 chars of lowercase a-z, 0-9, and "
+            "underscore (e.g. 'tomb_of_barreth')."
+        )
+    return sk
+
+
+def _module_row_read(category: str, source_note: str) -> dict | None:
+    """Return the most-recent world_facts row for (category, source_note)."""
+    from engine.db import _get_conn as _ec, _CAMPAIGN_ID as _cid
+    with _ec(read_only=True) as conn:
+        row = conn.execute(
+            "SELECT world_fact_id, fact_text, source_note "
+            "FROM world_facts "
+            "WHERE campaign_id = ? AND category = ? AND source_note = ? "
+            "ORDER BY world_fact_id DESC LIMIT 1",
+            (_cid, category, source_note),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def _module_row_upsert(category: str, source_note: str, fact_text: str) -> int:
+    """
+    Upsert a world_facts row keyed by (category, source_note). Deletes any
+    prior rows that match the pair and inserts a fresh one — equivalent to
+    a SQLite UPSERT that does not require a UNIQUE constraint on the table.
+    Returns the new world_fact_id.
+    """
+    from engine.db import _get_conn as _ec, _CAMPAIGN_ID as _cid
+    with _ec() as conn:
+        conn.execute(
+            "DELETE FROM world_facts "
+            "WHERE campaign_id = ? AND category = ? AND source_note = ?",
+            (_cid, category, source_note),
+        )
+        cur = conn.execute(
+            "INSERT INTO world_facts "
+            "(campaign_id, category, fact_text, source_note) "
+            "VALUES (?, ?, ?, ?)",
+            (_cid, category, fact_text, source_note),
+        )
+        return cur.lastrowid
+
+
+def _module_room_source_note(module_key: str, room_number: int) -> str:
+    """Canonical source_note for a stored room row."""
+    return f"{module_key}:r{int(room_number)}"
+
+
+@mcp.tool()
+def create_module_scaffold(
+    module_key: Annotated[
+        str,
+        "Short slug identifier — lowercase a-z, 0-9, underscore; 2-64 chars. "
+        "Example: 'tomb_of_barreth'. Used as the key in every world_facts "
+        "row this module writes; collisions overwrite the prior scaffold.",
+    ],
+    module_name: Annotated[
+        str,
+        "Display name shown to the DM, e.g. 'The Tomb of Barreth the Lich'.",
+    ],
+    total_rooms: Annotated[
+        int,
+        "Total number of numbered rooms in the module. The key_index is "
+        "pre-populated with one entry per room (stored=false) so "
+        "get_module_key_index immediately shows what's left to write.",
+    ],
+    entrance_room: Annotated[
+        int,
+        "Room number the party enters through. Pre-marked as explored in "
+        "the initial map_state so the player's fog-of-war map can render "
+        "the entrance and outward passages on first call.",
+    ] = 1,
+    notes: Annotated[
+        str,
+        "Free-text module notes — theme, hook, faction relationships, "
+        "ecology, anything the DM needs at the module level (not per-room). "
+        "Optional.",
+    ] = "",
+) -> dict:
+    """
+    Create the three scaffold world_facts rows for a new module:
+      - {module_key}_key_index — pre-populated rooms list + module metadata
+      - {module_key}_map_state — fog-of-war state (entrance pre-explored)
+      - {module_key}_notes     — the notes text
+
+    Idempotent on module_key: re-running overwrites all three rows for that
+    key (use a new key if you want to keep the old module alongside the new
+    one). Returns the three fact IDs and a confirmation.
+    """
+    try:
+        sk = _validate_module_key(module_key)
+        name = (module_name or "").strip() or sk
+        try:
+            total = int(total_rooms)
+        except (TypeError, ValueError):
+            return {"error": "total_rooms must be a positive integer."}
+        if total < 1 or total > 500:
+            return {"error": "total_rooms must be 1-500."}
+        try:
+            entrance = int(entrance_room)
+        except (TypeError, ValueError):
+            entrance = 1
+        if entrance < 1 or entrance > total:
+            return {"error": (f"entrance_room {entrance} out of range "
+                              f"1..{total}.")}
+
+        key_index_obj = {
+            "module_key":    sk,
+            "module_name":   name,
+            "total_rooms":   total,
+            "entrance_room": entrance,
+            "rooms": [
+                {"room": i, "name": "", "stored": False}
+                for i in range(1, total + 1)
+            ],
+        }
+        map_state = {
+            "explored":         [entrance],
+            "triggered_traps":  [],
+            "found_secrets":    [],
+            "cleared_rooms":    [],
+        }
+        idx_id   = _module_row_upsert(
+            _MODULE_KEY_INDEX_CATEGORY, sk, json.dumps(key_index_obj),
+        )
+        map_id   = _module_row_upsert(
+            _MODULE_MAP_STATE_CATEGORY, sk, json.dumps(map_state),
+        )
+        notes_id = _module_row_upsert(
+            _MODULE_NOTES_CATEGORY, sk, notes or "",
+        )
+
+        return {
+            "created":            True,
+            "module_key":         sk,
+            "module_name":        name,
+            "total_rooms":        total,
+            "entrance_room":      entrance,
+            "key_index_fact_id":  idx_id,
+            "map_state_fact_id":  map_id,
+            "notes_fact_id":      notes_id,
+            "stored_room_count":  0,
+        }
+    except ValueError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def store_room(
+    module_key: Annotated[str, "Module slug. Must already exist (created via "
+                              "create_module_scaffold)."],
+    room_number: Annotated[
+        int,
+        "1-based room number. Must be within 1..total_rooms for the "
+        "scaffold.",
+    ],
+    room_name: Annotated[
+        str,
+        "Short room name for the key_index, e.g. 'Entrance Hall', "
+        "'Pillared Crypt', 'Sunken Library'. Max ~120 chars.",
+    ],
+    content: Annotated[
+        str,
+        "Full room content (description, monster placements, traps, "
+        "treasure, secrets). Hard-capped at 1800 characters so the DM "
+        "can't dump unstructured walls of text into a single row.",
+    ],
+) -> dict:
+    """
+    Upsert {module_key}_r{room_number} (category='module_room') with the
+    given content, and flip the matching entry in the key_index's `rooms`
+    list to stored=true with the supplied name. Returns the fact_id and
+    the current stored count vs total so the DM can track completeness.
+
+    Re-storing the same (module_key, room_number) overwrites the prior
+    content — re-running is safe.
+    """
+    try:
+        sk = _validate_module_key(module_key)
+        try:
+            rn = int(room_number)
+        except (TypeError, ValueError):
+            return {"error": "room_number must be a positive integer."}
+        if rn < 1:
+            return {"error": "room_number must be >= 1."}
+
+        name = (room_name or "").strip()
+        if not name:
+            return {"error": "room_name is required."}
+        if len(name) > 120:
+            return {"error": "room_name capped at 120 characters."}
+
+        body = content or ""
+        if len(body) > _MODULE_ROOM_CONTENT_MAX:
+            return {
+                "error": (
+                    f"content exceeds {_MODULE_ROOM_CONTENT_MAX} characters "
+                    f"({len(body)} given). Split the room or trim narrative."
+                ),
+            }
+
+        idx_row = _module_row_read(_MODULE_KEY_INDEX_CATEGORY, sk)
+        if not idx_row:
+            return {"error": (f"Module {sk!r} not found. Run "
+                              f"create_module_scaffold first.")}
+        try:
+            idx_obj = json.loads(idx_row["fact_text"])
+        except (TypeError, ValueError):
+            return {"error": (f"Module {sk!r} key_index is corrupt — "
+                              f"cannot parse JSON.")}
+        total = int(idx_obj.get("total_rooms") or 0)
+        if rn > total:
+            return {"error": (f"room_number {rn} > total_rooms {total} for "
+                              f"module {sk!r}.")}
+
+        # Persist the room content.
+        room_fact_id = _module_row_upsert(
+            _MODULE_ROOM_CATEGORY,
+            _module_room_source_note(sk, rn),
+            body,
+        )
+
+        # Flip stored=true and set the name on the matching key_index entry.
+        rooms = idx_obj.get("rooms") or []
+        updated = False
+        for entry in rooms:
+            try:
+                if int(entry.get("room")) == rn:
+                    entry["name"]   = name
+                    entry["stored"] = True
+                    updated = True
+                    break
+            except (TypeError, ValueError):
+                continue
+        if not updated:
+            rooms.append({"room": rn, "name": name, "stored": True})
+        idx_obj["rooms"] = rooms
+        _module_row_upsert(
+            _MODULE_KEY_INDEX_CATEGORY, sk, json.dumps(idx_obj),
+        )
+
+        stored_count = sum(1 for e in rooms if e.get("stored"))
+        return {
+            "stored":            True,
+            "module_key":        sk,
+            "room_number":       rn,
+            "room_name":         name,
+            "room_fact_id":      room_fact_id,
+            "content_chars":     len(body),
+            "stored_room_count": stored_count,
+            "total_rooms":       total,
+            "complete":          stored_count == total,
+        }
+    except ValueError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def get_room(
+    module_key: Annotated[str, "Module slug."],
+    room_number: Annotated[int, "1-based room number to fetch."],
+) -> dict:
+    """
+    Return the full stored content for a single room. The DM should call
+    this every time the party enters or re-inspects a room — NEVER
+    paraphrase a room from memory.
+
+    Returns {"error": "Room {n} not stored for module {module_key}."}
+    when the row is absent, so the caller can stop and prompt the DM to
+    store the room before narrating.
+    """
+    try:
+        sk = _validate_module_key(module_key)
+        try:
+            rn = int(room_number)
+        except (TypeError, ValueError):
+            return {"error": "room_number must be an integer."}
+        row = _module_row_read(
+            _MODULE_ROOM_CATEGORY, _module_room_source_note(sk, rn),
+        )
+        if not row:
+            return {"error": f"Room {rn} not stored for module {sk}."}
+
+        # Surface the matching key_index entry (if any) so the caller sees
+        # the canonical room name alongside the content.
+        room_name = None
+        idx_row = _module_row_read(_MODULE_KEY_INDEX_CATEGORY, sk)
+        if idx_row:
+            try:
+                idx_obj = json.loads(idx_row["fact_text"])
+                for e in idx_obj.get("rooms", []):
+                    try:
+                        if int(e.get("room")) == rn:
+                            room_name = e.get("name") or None
+                            break
+                    except (TypeError, ValueError):
+                        continue
+            except (TypeError, ValueError):
+                pass
+
+        return {
+            "module_key":    sk,
+            "room_number":   rn,
+            "room_name":     room_name,
+            "fact_id":       row["world_fact_id"],
+            "content":       row["fact_text"] or "",
+            "content_chars": len(row["fact_text"] or ""),
+        }
+    except ValueError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def get_module_key_index(
+    module_key: Annotated[str, "Module slug."],
+) -> dict:
+    """
+    Return the module's key_index: module_name, total_rooms, entrance_room,
+    and the full rooms list with each entry's stored status. Useful for
+    auditing completeness BEFORE play begins ("are all 12 rooms written?")
+    and during play for resolving room numbers to names.
+    """
+    try:
+        sk = _validate_module_key(module_key)
+        row = _module_row_read(_MODULE_KEY_INDEX_CATEGORY, sk)
+        if not row:
+            return {"error": f"Module {sk!r} not found."}
+        try:
+            idx_obj = json.loads(row["fact_text"])
+        except (TypeError, ValueError):
+            return {"error": f"Module {sk!r} key_index is corrupt JSON."}
+
+        rooms = idx_obj.get("rooms") or []
+        stored_count = sum(1 for e in rooms if e.get("stored"))
+        total        = int(idx_obj.get("total_rooms") or len(rooms))
+        return {
+            "module_key":        idx_obj.get("module_key", sk),
+            "module_name":       idx_obj.get("module_name", sk),
+            "total_rooms":       total,
+            "entrance_room":     idx_obj.get("entrance_room"),
+            "stored_room_count": stored_count,
+            "pending_count":     max(0, total - stored_count),
+            "complete":          stored_count == total,
+            "rooms":             rooms,
+            "fact_id":           row["world_fact_id"],
+        }
+    except ValueError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def update_map_state(
+    module_key: Annotated[str, "Module slug."],
+    action: Annotated[
+        str,
+        "One of: 'explore_room' (party entered this room), 'trigger_trap' "
+        "(a trap fired here), 'find_secret' (the party discovered the "
+        "room's secret), 'clear_room' (all hostile occupants neutralised). "
+        "Each action appends room_number to the matching list — no "
+        "duplicates.",
+    ],
+    room_number: Annotated[int, "1-based room number."],
+) -> dict:
+    """
+    Append room_number to the appropriate map_state list (dedup'd) and
+    persist. Returns the updated map state in full so the caller can hand
+    it straight to a map-render step.
+    """
+    try:
+        sk = _validate_module_key(module_key)
+        try:
+            rn = int(room_number)
+        except (TypeError, ValueError):
+            return {"error": "room_number must be an integer."}
+        a = (action or "").strip().lower()
+        bucket = _MAP_STATE_ACTIONS.get(a)
+        if not bucket:
+            return {
+                "error": (
+                    f"action must be one of {sorted(_MAP_STATE_ACTIONS)}; "
+                    f"got {action!r}."
+                ),
+            }
+
+        row = _module_row_read(_MODULE_MAP_STATE_CATEGORY, sk)
+        if not row:
+            return {"error": (f"Module {sk!r} not found. Run "
+                              f"create_module_scaffold first.")}
+        try:
+            state = json.loads(row["fact_text"]) or {}
+        except (TypeError, ValueError):
+            state = {}
+        # Heal any missing buckets so a corrupt/legacy state still upgrades.
+        for k in _MAP_STATE_ACTIONS.values():
+            if not isinstance(state.get(k), list):
+                state[k] = []
+
+        lst = state[bucket]
+        was_already = rn in lst
+        if not was_already:
+            lst.append(rn)
+            lst.sort()
+
+        _module_row_upsert(
+            _MODULE_MAP_STATE_CATEGORY, sk, json.dumps(state),
+        )
+        return {
+            "updated":      True,
+            "module_key":   sk,
+            "action":       a,
+            "room_number":  rn,
+            "already_set":  was_already,
+            "map_state":    state,
+        }
+    except ValueError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def get_map_state(
+    module_key: Annotated[str, "Module slug."],
+) -> dict:
+    """
+    Return the module's full fog-of-war state — explored rooms, triggered
+    traps, found secrets, cleared rooms. The DM reads this before
+    regenerating the player's exploration map so only explored rooms (and
+    their immediate connecting passages) are revealed.
+    """
+    try:
+        sk = _validate_module_key(module_key)
+        row = _module_row_read(_MODULE_MAP_STATE_CATEGORY, sk)
+        if not row:
+            return {"error": f"Module {sk!r} not found."}
+        try:
+            state = json.loads(row["fact_text"]) or {}
+        except (TypeError, ValueError):
+            state = {}
+        # Heal missing buckets on read so callers always get the canonical
+        # shape regardless of when the row was written.
+        for k in _MAP_STATE_ACTIONS.values():
+            if not isinstance(state.get(k), list):
+                state[k] = []
+        state["module_key"] = sk
+        state["fact_id"]    = row["world_fact_id"]
+        return state
+    except ValueError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def list_modules() -> dict:
+    """
+    Return every module scaffolded in the active campaign: module_key,
+    module_name, total_rooms, stored_room_count, complete bool, and
+    entrance_room. Read by the DM at session start to find existing
+    dungeons ("what modules already exist for this campaign?").
+    """
+    from engine.db import _get_conn as _ec, _CAMPAIGN_ID as _cid
+    with _ec(read_only=True) as conn:
+        rows = conn.execute(
+            "SELECT world_fact_id, fact_text, source_note "
+            "FROM world_facts "
+            "WHERE campaign_id = ? AND category = ? "
+            "ORDER BY source_note",
+            (_cid, _MODULE_KEY_INDEX_CATEGORY),
+        ).fetchall()
+
+    modules: list[dict] = []
+    for row in rows:
+        try:
+            obj = json.loads(row["fact_text"]) or {}
+        except (TypeError, ValueError):
+            obj = {}
+        rooms = obj.get("rooms") or []
+        stored_count = sum(1 for e in rooms if e.get("stored"))
+        total = int(obj.get("total_rooms") or len(rooms))
+        modules.append({
+            "module_key":        obj.get("module_key", row["source_note"]),
+            "module_name":       obj.get("module_name", row["source_note"]),
+            "total_rooms":       total,
+            "stored_room_count": stored_count,
+            "pending_count":     max(0, total - stored_count),
+            "complete":          stored_count == total,
+            "entrance_room":     obj.get("entrance_room"),
+            "fact_id":           row["world_fact_id"],
+        })
+    return {"count": len(modules), "modules": modules}
+
+
 if __name__ == "__main__":
     mcp.run()
