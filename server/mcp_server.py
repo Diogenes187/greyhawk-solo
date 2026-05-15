@@ -795,6 +795,18 @@ sys.path.insert(0, str(_ROOT))
 
 from mcp.server.fastmcp import FastMCP
 
+from engine.combat import (
+    dex_initiative_mod,
+    parse_movement_rate,
+    rounds_to_close,
+    is_melee_possible,
+    is_round_distance_estimated,
+    make_round_state,
+    empty_combatant_round_entry,
+    SURPRISE_MODES,
+    DECLARE_ACTIONS,
+)
+
 from engine.db import (
     # Read
     load_character,
@@ -3815,22 +3827,43 @@ def start_combat(
         str,
         "Current location for the encounter log.",
     ] = "",
+    distance_feet: Annotated[
+        int,
+        "Phase 38: Distance in feet between the party and enemies at the "
+        "moment combat begins. Default 10 (immediate melee range). Set to "
+        "the actual gap for ranged starts — ambushes from the treeline, "
+        "parley breaking down across a courtyard, dragon spotted high "
+        "overhead. Round numbers (30/60/100 etc.) are flagged "
+        "distance.estimated=true with no mechanical penalty.",
+    ] = 10,
+    surprise: Annotated[
+        str,
+        "Phase 38: One of 'none' (default), 'player_surprised', "
+        "'enemy_surprised', or 'roll'. 'roll' rolls 1d6 per side: 1-2 "
+        "surprised, and the unsurprised side gets free segments equal to "
+        "their roll. The fixed modes 'player_surprised' / "
+        "'enemy_surprised' roll 1d6 for the awarded free segments.",
+    ] = "none",
 ) -> dict:
     """
-    Initialise a new combat encounter.
+    Initialise a new combat encounter using the Phase 38 d6 countdown
+    segment system.
 
-    Looks up each enemy type in the monsters table, rolls HP for every
-    individual, rolls initiative for all sides (d10 per combatant, DEX
-    modifier applied to PC), builds the full initiative order, and stores
-    the complete combat state in world_facts so every subsequent tool call
-    can read and update it.
+    Builds the per-combatant stat block (HP, AC, THAC0, full saves,
+    morale) and a Phase 38 round_state carrying:
 
-    Returns the full initiative order with opening HP and AC for every
-    combatant. Narrate the scene, then begin calling attack() in initiative
-    order each round.
+      - phase (surprise | declare | roll | countdown | complete)
+      - current_segment (10 → 1 during countdown)
+      - distance.feet / .estimated / .melee_possible /
+        .missile_rounds_before_melee
+      - surprise.active / .surprised_side / .free_segments
+      - per-combatant slots with initiative_roll/score, declared_action,
+        spell_resolves_segment, in_melee_range, acted, holding
 
-    Note: if a monster name is not found in the database, a generic stat
-    block is generated (AC 10, 1 HD, 1-6 damage, 1 attack).
+    Round flow: start_combat → (resolve_surprise_segment ×N if needed) →
+    declare_round → roll_initiative → resolve_segment ×N → declare_round
+    again for the next round. Existing attack() and damage helpers are
+    still called from inside resolve_segment / resolve_player_action.
     """
     # ── Parse enemies ─────────────────────────────────────────────────────────
     try:
@@ -3839,6 +3872,20 @@ def start_combat(
             return {"error": "enemies must be a JSON list."}
     except json.JSONDecodeError as e:
         return {"error": f"Invalid enemies JSON: {e}"}
+
+    # Phase 38: validate surprise mode
+    surp_mode = (surprise or "none").strip().lower()
+    if surp_mode not in SURPRISE_MODES:
+        return {
+            "error": (
+                f"surprise must be one of {list(SURPRISE_MODES)}; "
+                f"got {surprise!r}."
+            ),
+        }
+    try:
+        dist_ft = max(0, int(distance_feet))
+    except (TypeError, ValueError):
+        return {"error": "distance_feet must be a non-negative integer."}
 
     # ── Load PC state ──────────────────────────────────────────────────────────
     char    = load_character()
@@ -3849,11 +3896,10 @@ def start_combat(
     pc_hp_max = status.get("hp_max", 1)
     pc_ac     = status.get("ac", 10)
 
-    # DEX initiative modifier (-3 to +3 mapped from AC modifier range)
-    abilities  = char.get("abilities", {})
-    dex        = abilities.get("dexterity") or 10
-    dex_init   = {3: -3, 4: -2, 5: -2, 6: -1, 7: -1, 8: -1,
-                  15: 1, 16: 1, 17: 2, 18: 3}.get(dex, 0)
+    # DEX initiative modifier (Phase 38 table)
+    abilities = char.get("abilities", {})
+    dex       = abilities.get("dexterity") or 10
+    dex_init  = dex_initiative_mod(dex)
 
     pc_init = random.randint(1, 10) + dex_init
 
@@ -3866,6 +3912,8 @@ def start_combat(
             "hp_max":     pc_hp_max,
             "ac":         pc_ac,
             "classes":    classes,
+            "dex":        dex,
+            "movement_rate": 120,  # human baseline; refined when needed
             "is_pc":      True,
             "status":     "active",
         }
@@ -3884,6 +3932,9 @@ def start_combat(
         damage    = mdata.get("damage", "1-6") if mdata else "1-6"
         num_atk   = mdata.get("number_of_attacks", "1") if mdata else "1"
         disp_name = mdata.get("name", mname) if mdata else mname
+        # Phase 38: parse this group's movement rate (AD&D 1e inches → ft/round)
+        raw_move  = mdata.get("move", "") if mdata else ""
+        grp_move_ft = parse_movement_rate(raw_move, default_ft_per_round=60)
 
         try:
             base_ac = int(str(raw_ac).strip().split("/")[0])
@@ -3900,6 +3951,8 @@ def start_combat(
             "initial_count": count,
             "current_count":  count,
             "morale_broken":  False,
+            "movement_rate":  grp_move_ft,
+            "raw_move":       raw_move,
         }
 
         # ── Phase 7: consult pre-rolled area_instances ────────────────────────
@@ -4053,6 +4106,8 @@ def start_combat(
                 "is_pc":       False,
                 "status":      "active",
                 "group":       group_key,
+                "dex":         None,
+                "movement_rate": grp_move_ft,
                 # Tracks back to the pre-rolled row so attacks can update it.
                 "area_instance_id":      prerolled_instance_id,
                 "monster_index":         (i - 1) if prerolled_instance_id else None,
@@ -4060,40 +4115,195 @@ def start_combat(
             }
 
     # ── Sort initiative order (highest first, PC wins ties) ───────────────────
+    # Kept for backward-compat callers that still consume the legacy
+    # initiative_order field. The Phase 38 round_state has its own order.
     order = sorted(
         combatants.keys(),
         key=lambda cid: (combatants[cid]["initiative"], 1 if cid == "PC" else 0),
         reverse=True,
     )
 
-    state = {
-        "encounter_name": encounter_name,
-        "location":       location,
-        "round":          1,
-        "status":         "active",
-        "combatants":     combatants,
-        "initiative_order": order,
-        "current_actor_index": 0,
-        "groups":         groups,
-        "combat_log":     [
-            f"Round 1 begins. Initiative: "
-            + ", ".join(
-                f"{combatants[cid]['name']}({combatants[cid]['initiative']})"
-                for cid in order
+    # ── Phase 38: resolve surprise + build round_state ────────────────────────
+    surprise_log: list[str] = []
+    surprised_side: str | None = None
+    free_segments: int = 0
+
+    if surp_mode == "roll":
+        # Both sides roll 1d6: 1-2 = surprised. Unsurprised side gets free
+        # segments equal to their own roll. If both surprised → treat as none.
+        pc_roll  = random.randint(1, 6)
+        en_roll  = random.randint(1, 6)
+        pc_surprised = pc_roll <= 2
+        en_surprised = en_roll <= 2
+        if pc_surprised and en_surprised:
+            surprise_log.append(
+                f"Surprise roll: PC {pc_roll}, enemies {en_roll} — "
+                f"both rolled surprised, treat as neither (no free segments)."
             )
+        elif pc_surprised and not en_surprised:
+            surprised_side = "player"
+            free_segments  = en_roll
+            surprise_log.append(
+                f"PC surprised (rolled {pc_roll}). Enemies "
+                f"act freely for {free_segments} segments (enemy roll: "
+                f"{en_roll})."
+            )
+        elif en_surprised and not pc_surprised:
+            surprised_side = "enemy"
+            free_segments  = pc_roll
+            surprise_log.append(
+                f"Enemies surprised (rolled {en_roll}). PC acts "
+                f"freely for {free_segments} segments (PC roll: {pc_roll})."
+            )
+        else:
+            surprise_log.append(
+                f"Surprise roll: PC {pc_roll}, enemies {en_roll} — "
+                f"neither surprised."
+            )
+    elif surp_mode == "player_surprised":
+        surprised_side = "player"
+        free_segments  = random.randint(1, 6)
+        surprise_log.append(
+            f"You are surprised. Enemies act freely for "
+            f"{free_segments} segments."
+        )
+    elif surp_mode == "enemy_surprised":
+        surprised_side = "enemy"
+        free_segments  = random.randint(1, 6)
+        surprise_log.append(
+            f"Enemies surprised. PC acts freely for "
+            f"{free_segments} segments."
+        )
+
+    # Distance calculations (use the FASTEST enemy as the closing rate)
+    enemy_speeds = [g.get("movement_rate", 60) for g in groups.values()] or [60]
+    fastest_enemy_mv = max(enemy_speeds)
+    dist_estimated = is_round_distance_estimated(dist_ft)
+    melee_now      = is_melee_possible(dist_ft)
+    rtc            = rounds_to_close(dist_ft, fastest_enemy_mv)
+    missile_rounds = 0 if melee_now else rtc
+
+    # Per-combatant round_state slots
+    round_combatants: list[dict] = []
+    for cid in order:
+        c = combatants[cid]
+        in_melee = bool(c.get("is_pc")) or melee_now
+        # PC is always "in melee range" from their own perspective only when
+        # they can reach an enemy. With distance > 10, neither side can melee
+        # this round; the new tools enforce that on the attack side.
+        if not melee_now:
+            in_melee = False
+        round_combatants.append(
+            empty_combatant_round_entry(
+                cid=cid,
+                name=c.get("name", cid),
+                side=c.get("side", "enemy"),
+                dex=c.get("dex"),
+                movement_rate=int(c.get("movement_rate", 60) or 60),
+                in_melee_range=in_melee,
+            )
+        )
+
+    initial_phase = "surprise" if (surprised_side and free_segments > 0) else "declare"
+    round_state = make_round_state(
+        round_number=1,
+        phase=initial_phase,
+        distance_feet=dist_ft,
+        distance_estimated=dist_estimated,
+        missile_rounds_before_melee=missile_rounds,
+        melee_possible=melee_now,
+        surprise_active=bool(surprised_side),
+        surprised_side=surprised_side,
+        free_segments=free_segments,
+        combatants=round_combatants,
+    )
+
+    state = {
+        "encounter_name":      encounter_name,
+        "location":            location,
+        "round":               1,
+        "status":              "active",
+        "combatants":          combatants,
+        "initiative_order":    order,
+        "current_actor_index": 0,
+        "groups":              groups,
+        "round_state":         round_state,
+        "combat_log": [
+            f"Round 1 begins. Distance ~{dist_ft} ft"
+            f"{' (estimated)' if dist_estimated else ''}. "
+            f"Melee {'possible' if melee_now else f'closes in ~{rtc} round(s)'}.",
+            *surprise_log,
         ],
     }
 
     set_active_combat(state)
 
-    # ── Return summary ─────────────────────────────────────────────────────────
-    # Phase 35: one visual ref per unique enemy group (six orcs = one Orc
-    # link, not six). The PC entry is excluded — visual refs are for the
-    # monsters/NPCs the DM has to describe, not the player.
+    # ── Build summary lines for the response ─────────────────────────────────
+    enemy_summary = ", ".join(
+        f"{g_name} (mv {g['movement_rate']})"
+        for g_name, g in groups.items()
+    )
+    lines: list[str] = []
+    lines.append("Combat begins.")
+    lines.append(
+        f"Distance: ~{dist_ft} ft"
+        + (" (estimated)" if dist_estimated else "")
+    )
+    if enemy_summary:
+        lines.append(f"Enemies: {enemy_summary}")
+    if melee_now:
+        lines.append("Melee contact: this round (already in range).")
+    else:
+        lines.append(
+            f"Melee contact: round {rtc + 1} at earliest "
+            f"(enemies must close ~{dist_ft} ft)."
+        )
+        lines.append(
+            f"Missile fire available: {missile_rounds} round(s) of free "
+            f"fire before melee range."
+        )
+    if surprised_side and free_segments > 0:
+        if surprised_side == "player":
+            lines.append(
+                f"You are surprised. Enemies act freely for "
+                f"{free_segments} segments before round 1 initiative."
+            )
+            next_call = (
+                "Call resolve_surprise_segment in DM-driven sequence to "
+                "burn the free segments, then declare_round for round 1."
+            )
+        else:
+            lines.append(
+                f"Enemy surprised — {free_segments} free segments before "
+                f"round 1 initiative."
+            )
+            next_call = (
+                "Call resolve_surprise_segment (with your action) for "
+                f"each of the {free_segments} free segments, then "
+                "declare_round for round 1."
+            )
+    else:
+        next_call = "Call declare_round with your action for round 1."
+    lines.append("")
+    lines.append(next_call)
+
+    # Phase 35: one visual ref per unique enemy group.
     enemy_group_names = sorted(groups.keys())
     response: dict = {
         "encounter_name":    encounter_name,
         "round":             1,
+        "phase":             initial_phase,
+        "distance": {
+            "feet":                        dist_ft,
+            "estimated":                   dist_estimated,
+            "melee_possible":              melee_now,
+            "missile_rounds_before_melee": missile_rounds,
+        },
+        "surprise": {
+            "active":         bool(surprised_side),
+            "surprised_side": surprised_side,
+            "free_segments":  free_segments,
+        },
         "initiative_order": [
             {
                 "id":         cid,
@@ -4105,16 +4315,676 @@ def start_combat(
             }
             for cid in order
         ],
-        "note": (
-            "Combat state saved. Call attack(attacker_id, target_id, ...) "
-            "in initiative order. Call get_combat_state() to review current HP "
-            "at any time. Call end_combat() when the encounter concludes."
-        ),
+        "note":     "\n".join(lines),
     }
     block = _visual_refs_block(enemy_group_names)
     if block:
         response["visual_refs"] = block
     return response
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PHASE 38 — d6 COUNTDOWN SEGMENT ROUND FLOW
+# Adds declare_round / roll_initiative / resolve_segment /
+# resolve_player_action / check_spell_interrupt / hold_action /
+# resolve_surprise_segment on top of the existing start_combat / attack
+# helpers. The active_combat blob gains a `round_state` field carrying
+# per-round phase, segment counter, distance, surprise, and per-combatant
+# declarations + initiative scores.
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def _require_round_state() -> tuple[dict | None, dict | None]:
+    """
+    Load the active combat + round_state. Returns (state, error_dict).
+    On failure error_dict is populated and state is None; on success
+    state is the combat dict and error_dict is None.
+    """
+    st = get_active_combat()
+    if not st:
+        return None, {"error": "No active combat. Call start_combat first."}
+    if not isinstance(st.get("round_state"), dict):
+        return None, {
+            "error": (
+                "Active combat is missing round_state — was it started "
+                "before Phase 38? End_combat and start_combat again to "
+                "rebuild the round_state."
+            ),
+        }
+    return st, None
+
+
+def _find_round_entry(rs: dict, cid: str) -> dict | None:
+    """Return the per-combatant round_state slot for `cid`, or None."""
+    for entry in rs.get("combatants", []):
+        if entry.get("id") == cid:
+            return entry
+    return None
+
+
+def _living_enemy_ids(state: dict) -> list[str]:
+    """IDs of enemy combatants still active (not dead/fled)."""
+    return [
+        cid for cid, c in state.get("combatants", {}).items()
+        if not c.get("is_pc") and c.get("status") == "active"
+    ]
+
+
+@mcp.tool()
+def declare_round(
+    player_action: Annotated[
+        str,
+        "Declared action for the PC this round. Must be one of: "
+        "'melee', 'missile', 'spell', 'move', 'item', 'flee', 'hold'. "
+        "Spellcasters MUST pass player_spell and player_spell_casting_time "
+        "when action='spell'.",
+    ],
+    player_action_detail: Annotated[
+        str,
+        "Free-text qualifier for the action (target name, item used, "
+        "movement direction, etc.). Optional but useful for the combat log.",
+    ] = "",
+    player_spell: Annotated[
+        str,
+        "Spell name when action='spell'. Required for action='spell'.",
+    ] = "",
+    player_spell_casting_time: Annotated[
+        int,
+        "Casting time in segments (1-10) when action='spell'. Required for "
+        "action='spell'. Determines spell_resolves_segment = "
+        "initiative_score - casting_time after roll_initiative.",
+    ] = 0,
+) -> dict:
+    """
+    Declare the PC's action for this round.
+
+    Must be called during phase='declare'. If distance.melee_possible is
+    False and the PC declares 'melee', the call is rejected with the spec
+    warning. After a successful declaration, the response tells the caller
+    to call roll_initiative next.
+    """
+    state, err = _require_round_state()
+    if err:
+        return err
+    rs = state["round_state"]
+    if rs["phase"] != "declare":
+        return {"error": f"declare_round called during phase={rs['phase']!r}; "
+                         f"expected 'declare'."}
+    act = (player_action or "").strip().lower()
+    if act not in DECLARE_ACTIONS:
+        return {"error": f"player_action must be one of {list(DECLARE_ACTIONS)}; "
+                         f"got {player_action!r}."}
+    if act == "spell":
+        if not (player_spell or "").strip():
+            return {"error": "player_spell is required when action='spell'."}
+        try:
+            ct = int(player_spell_casting_time)
+        except (TypeError, ValueError):
+            ct = 0
+        if ct < 1 or ct > 10:
+            return {"error": ("player_spell_casting_time must be 1-10 "
+                              "segments when action='spell'.")}
+
+    if act == "melee" and not rs["distance"]["melee_possible"]:
+        return {
+            "error": (
+                f"No enemy in melee range yet — closest enemy is ~"
+                f"{rs['distance']['feet']} ft away. Declare missile, "
+                f"spell, move, or hold instead."
+            ),
+            "blocked":         True,
+            "distance_feet":   rs["distance"]["feet"],
+            "melee_possible":  False,
+        }
+
+    pc_entry = _find_round_entry(rs, "PC")
+    if not pc_entry:
+        return {"error": "PC entry missing from round_state.combatants."}
+    pc_entry["declared_action"]        = act
+    pc_entry["declared_action_detail"] = (player_action_detail or "").strip() or None
+    pc_entry["declared_spell"]         = (player_spell or "").strip() or None
+    pc_entry["spell_casting_time"]     = (
+        int(player_spell_casting_time) if act == "spell" else None
+    )
+    pc_entry["acted"]                  = False
+    pc_entry["holding"]                = (act == "hold")
+
+    set_active_combat(state)
+    return {
+        "declared":    True,
+        "round":       rs["round"],
+        "action":      act,
+        "spell":       pc_entry["declared_spell"],
+        "casting_time": pc_entry["spell_casting_time"],
+        "note":        "Actions declared. Call roll_initiative.",
+    }
+
+
+@mcp.tool()
+def roll_initiative() -> dict:
+    """
+    Phase 38: roll 1d6 + DEX-mod per combatant, sort countdown order
+    (highest first; high goes first in segment terms, ties broken by
+    higher DEX), then compute spell_resolves_segment for any caster
+    whose declared action is 'spell'.
+
+    Decrements distance.feet by the fastest enemy's movement rate and
+    re-evaluates distance.melee_possible / in_melee_range. Phase moves
+    from 'declare' to 'countdown' on success.
+
+    Must be called during phase='declare'.
+    """
+    state, err = _require_round_state()
+    if err:
+        return err
+    rs = state["round_state"]
+    if rs["phase"] != "declare":
+        return {"error": f"roll_initiative called during phase={rs['phase']!r}; "
+                         f"expected 'declare'."}
+
+    # Roll d6 + DEX-mod for every still-active combatant.
+    rolls: list[dict] = []
+    for entry in rs["combatants"]:
+        cid = entry["id"]
+        master = state["combatants"].get(cid, {})
+        if master.get("status") != "active":
+            entry["initiative_roll"]  = None
+            entry["initiative_score"] = None
+            continue
+        d6 = random.randint(1, 6)
+        score = d6 + int(entry.get("initiative_mod") or 0)
+        entry["initiative_roll"]  = d6
+        entry["initiative_score"] = score
+        # Spell-resolution segment for declared casters.
+        if (entry.get("declared_action") == "spell"
+                and entry.get("spell_casting_time")):
+            resolves = score - int(entry["spell_casting_time"])
+            entry["spell_resolves_segment"] = resolves
+            if resolves <= 0:
+                entry["spell_carries_to_next"] = True
+                entry["spell_carries_segment"] = abs(resolves)
+        rolls.append({
+            "id":              cid,
+            "name":            entry["name"],
+            "side":            entry["side"],
+            "d6":              d6,
+            "initiative_mod":  entry["initiative_mod"],
+            "initiative_score": score,
+            "declared_action": entry.get("declared_action"),
+            "spell_resolves_segment": entry.get("spell_resolves_segment"),
+            "spell_carries_to_next":  entry.get("spell_carries_to_next", False),
+            "spell_carries_segment":  entry.get("spell_carries_segment"),
+        })
+
+    # Decrement distance by the FASTEST enemy's movement rate.
+    enemy_speeds = [
+        e.get("movement_rate", 60) for e in rs["combatants"]
+        if e.get("side") != "party"
+    ] or [60]
+    fastest = max(enemy_speeds)
+    new_dist = max(0, int(rs["distance"]["feet"]) - fastest)
+    rs["distance"]["feet"] = new_dist
+    rs["distance"]["melee_possible"] = is_melee_possible(new_dist)
+    rs["distance"]["missile_rounds_before_melee"] = (
+        0 if rs["distance"]["melee_possible"]
+        else rounds_to_close(new_dist, fastest)
+    )
+    melee_now = rs["distance"]["melee_possible"]
+    for e in rs["combatants"]:
+        e["in_melee_range"] = melee_now or bool(state["combatants"].get(
+            e["id"], {}).get("is_pc")) and False
+        # PC also gated when melee_now is False — neither side can swing.
+        if not melee_now:
+            e["in_melee_range"] = False
+
+    # Sort by initiative_score descending; ties broken by DEX desc, then PC wins
+    def _key(entry):
+        score = entry.get("initiative_score")
+        if score is None:
+            return (-999, -999, 0)
+        return (
+            int(score),
+            int(entry.get("dex") or 0),
+            1 if entry["id"] == "PC" else 0,
+        )
+    sorted_rolls = sorted(
+        [e for e in rs["combatants"] if e.get("initiative_score") is not None],
+        key=_key, reverse=True,
+    )
+
+    # Set countdown to start at the highest initiative_score (or 10 if higher
+    # than 10 — d6+3 caps at 9 so 10 is the natural ceiling).
+    top_score = max(
+        (e["initiative_score"] for e in sorted_rolls),
+        default=10,
+    )
+    rs["current_segment"] = min(10, max(int(top_score), 1))
+    rs["phase"] = "countdown"
+
+    set_active_combat(state)
+    return {
+        "rolled":           True,
+        "round":            rs["round"],
+        "phase":            "countdown",
+        "current_segment":  rs["current_segment"],
+        "distance":         dict(rs["distance"]),
+        "initiative_table": [
+            {
+                "id":                rl["id"],
+                "name":              rl["name"],
+                "side":              rl["side"],
+                "d6":                rl["d6"],
+                "initiative_mod":    rl["initiative_mod"],
+                "initiative_score":  rl["initiative_score"],
+                "declared_action":   rl["declared_action"],
+                "spell_resolves_segment": rl.get("spell_resolves_segment"),
+                "spell_carries_to_next":  rl.get("spell_carries_to_next"),
+                "spell_carries_segment":  rl.get("spell_carries_segment"),
+            }
+            for rl in [r for r in rolls
+                       if r["initiative_score"] is not None]
+        ],
+        "note": (
+            "Initiative rolled. Phase 'countdown' active. Call "
+            "resolve_segment to walk segments from "
+            f"{rs['current_segment']} downwards."
+        ),
+    }
+
+
+@mcp.tool()
+def resolve_segment() -> dict:
+    """
+    Phase 38: advance the segment countdown by one tick.
+
+    Finds combatants acting on current_segment (initiative_score ==
+    segment OR spell_resolves_segment == segment for casters). For
+    enemy segments the response carries the enemy's declared action so
+    the DM can run it. For the PC segment the response signals that the
+    PC must call resolve_player_action with their action_detail. For
+    empty segments the counter decrements automatically.
+
+    If no actor sits on this segment AND segment > 1, decrements and
+    returns immediately. When segment reaches 0 OR every active
+    combatant has acted, phase moves to 'complete' and the response
+    tells the caller to declare_round for the next round.
+
+    Melee actions are gated on in_melee_range — an enemy whose
+    declared_action='melee' but who hasn't closed yet skips with a
+    "Still closing — N ft remaining" entry in the log.
+    """
+    state, err = _require_round_state()
+    if err:
+        return err
+    rs = state["round_state"]
+    if rs["phase"] != "countdown":
+        return {"error": f"resolve_segment called during phase={rs['phase']!r}; "
+                         f"expected 'countdown'."}
+
+    seg = int(rs.get("current_segment") or 0)
+    if seg <= 0:
+        rs["phase"] = "complete"
+        set_active_combat(state)
+        return {
+            "resolved":      False,
+            "phase":         "complete",
+            "round":         rs["round"],
+            "note":          f"Round {rs['round']} complete. "
+                             f"Call declare_round for round {rs['round'] + 1}.",
+        }
+
+    # Anyone acting on this segment? Two possible triggers per combatant:
+    #   (a) initiative_score == seg AND not yet acted AND not holding
+    #   (b) spell_resolves_segment == seg AND not yet interrupted
+    actors_normal: list[dict] = []
+    spell_fires:   list[dict] = []
+    for entry in rs["combatants"]:
+        if entry.get("acted") or entry.get("holding"):
+            # holding intentionally waits; non-acted-normal actions trigger.
+            pass
+        if (entry.get("initiative_score") == seg
+                and not entry.get("acted")
+                and not entry.get("holding")):
+            actors_normal.append(entry)
+        if (entry.get("spell_resolves_segment") == seg
+                and not entry.get("spell_interrupted")
+                and not entry.get("acted")):
+            # Spells trigger on their own resolution segment — separately
+            # from the initiative_score for the cast itself.
+            if entry not in actors_normal:
+                spell_fires.append(entry)
+
+    log_entries: list[str] = []
+
+    # Process spells first — they consume their declared action.
+    for entry in spell_fires:
+        if entry["id"] == "PC":
+            log_entries.append(
+                f"Segment {seg}: PC spell '{entry.get('declared_spell')}' "
+                f"resolves — call resolve_player_action to fire."
+            )
+            # Don't auto-mark acted; the player resolves it explicitly.
+        else:
+            log_entries.append(
+                f"Segment {seg}: {entry['name']} spell "
+                f"'{entry.get('declared_spell')}' resolves "
+                f"(enemy-cast; DM resolves)."
+            )
+            entry["acted"] = True
+
+    # Then normal actor resolutions.
+    melee_blocked: list[str] = []
+    pc_to_act:     dict | None = None
+    enemy_acts:    list[dict]  = []
+    for entry in actors_normal:
+        declared = entry.get("declared_action")
+        if (declared == "melee"
+                and not entry.get("in_melee_range")
+                and not rs["distance"]["melee_possible"]):
+            log_entries.append(
+                f"Segment {seg}: {entry['name']} cannot reach melee — "
+                f"still closing ({rs['distance']['feet']} ft remaining)."
+            )
+            melee_blocked.append(entry["name"])
+            entry["acted"] = True  # they tried; declared action consumed.
+            continue
+        if entry["id"] == "PC":
+            pc_to_act = entry
+            log_entries.append(
+                f"Segment {seg}: PC acts — call resolve_player_action."
+            )
+        else:
+            entry["acted"] = True
+            enemy_acts.append(entry)
+            log_entries.append(
+                f"Segment {seg}: {entry['name']} acts "
+                f"({declared or 'no declaration'})."
+            )
+
+    # Append log
+    state.setdefault("combat_log", []).extend(log_entries)
+
+    # Decrement segment unless the PC needs to take their action first.
+    pc_pending = pc_to_act is not None or any(
+        e["id"] == "PC" and not e.get("acted")
+           and e.get("spell_resolves_segment") == seg
+           and not e.get("spell_interrupted")
+        for e in spell_fires
+    )
+
+    if not pc_pending:
+        rs["current_segment"] = max(0, seg - 1)
+        # Round complete when everyone has acted or counter ran out.
+        all_done = all(
+            e.get("acted") or e.get("holding")
+                or e.get("initiative_score") is None
+            for e in rs["combatants"]
+        )
+        if rs["current_segment"] <= 0 or all_done:
+            rs["phase"] = "complete"
+
+    set_active_combat(state)
+
+    response = {
+        "resolved":       True,
+        "round":          rs["round"],
+        "phase":          rs["phase"],
+        "segment":        seg,
+        "next_segment":   rs["current_segment"],
+        "pc_must_act":    pc_pending,
+        "enemies_acted": [e["name"] for e in enemy_acts],
+        "spells_fired": [
+            {"id": e["id"], "name": e["name"],
+             "spell": e.get("declared_spell")} for e in spell_fires
+        ],
+        "melee_blocked":  melee_blocked,
+        "log_entries":    log_entries,
+        "distance":       dict(rs["distance"]),
+    }
+    if rs["phase"] == "complete":
+        response["note"] = (
+            f"Round {rs['round']} complete. "
+            f"Call declare_round for round {rs['round'] + 1}."
+        )
+    elif pc_pending:
+        response["note"] = (
+            "PC has the current segment. Call resolve_player_action with "
+            "your action_detail to fire the declared action, then call "
+            "resolve_segment again to advance."
+        )
+    else:
+        response["note"] = (
+            f"Segment advanced to {rs['current_segment']}. "
+            "Call resolve_segment again."
+        )
+    return response
+
+
+@mcp.tool()
+def resolve_player_action(
+    action_detail: Annotated[
+        str,
+        "Free-text qualifier for what the PC actually did this segment "
+        "(target name, weapon swung, item used, movement description, "
+        "spell target). Recorded on the combat log.",
+    ] = "",
+) -> dict:
+    """
+    Phase 38: resolve the PC's declared action on the current segment.
+
+    Marks the PC's round_state entry as acted, appends a log entry,
+    and returns confirmation. The caller then calls resolve_segment to
+    advance the countdown. For spell resolution the segment is the one
+    matched by spell_resolves_segment.
+
+    Spell interruption is NOT checked here — call check_spell_interrupt
+    explicitly before this when an enemy damage roll lands on the
+    caster mid-cast.
+    """
+    state, err = _require_round_state()
+    if err:
+        return err
+    rs = state["round_state"]
+    pc_entry = _find_round_entry(rs, "PC")
+    if not pc_entry:
+        return {"error": "PC entry missing from round_state.combatants."}
+    seg = int(rs.get("current_segment") or 0)
+    pc_entry["acted"] = True
+    detail = (action_detail or "").strip()
+    declared = pc_entry.get("declared_action")
+    msg = (
+        f"Segment {seg}: PC resolves {declared!r}"
+        + (f" — {detail}" if detail else "")
+    )
+    state.setdefault("combat_log", []).append(msg)
+    set_active_combat(state)
+    return {
+        "resolved":  True,
+        "segment":   seg,
+        "action":    declared,
+        "detail":    detail or None,
+        "note":      "PC action recorded. Call resolve_segment to advance.",
+    }
+
+
+@mcp.tool()
+def check_spell_interrupt(
+    caster_id: Annotated[str, "Combatant id of the caster (e.g. 'PC' or "
+                              "'Goblin_2'). The caster's "
+                              "spell_resolves_segment is compared against "
+                              "damage_segment to decide interruption."],
+    damage_segment: Annotated[int, "Segment number on which damage landed "
+                                   "(usually rs.current_segment when the "
+                                   "attack resolved)."],
+) -> dict:
+    """
+    Phase 38: compare damage_segment to the caster's
+    spell_resolves_segment and decide whether the spell is interrupted.
+
+    Rules (per spec):
+      damage_segment >  spell_resolves_segment → interrupted, spell lost.
+      damage_segment == spell_resolves_segment → simultaneous, spell fires.
+      damage_segment <  spell_resolves_segment → caster hasn't started
+        casting yet (rare; spell not lost — DM may rule otherwise).
+
+    Mutates round_state in place: sets spell_interrupted=true when the
+    interrupt fires.
+    """
+    state, err = _require_round_state()
+    if err:
+        return err
+    rs = state["round_state"]
+    entry = _find_round_entry(rs, caster_id)
+    if not entry:
+        return {"error": f"Combatant {caster_id!r} not in round_state."}
+    if entry.get("declared_action") != "spell":
+        return {"error": f"{caster_id!r} did not declare a spell this round."}
+    resolves = entry.get("spell_resolves_segment")
+    if resolves is None:
+        return {"error": f"{caster_id!r} has no spell_resolves_segment — "
+                         f"did roll_initiative run?"}
+    try:
+        ds = int(damage_segment)
+    except (TypeError, ValueError):
+        return {"error": "damage_segment must be an integer."}
+
+    if ds > resolves:
+        entry["spell_interrupted"] = True
+        verdict = "interrupted"
+        note = (f"Damage on segment {ds} > spell resolves on {resolves} — "
+                f"{entry['name']}'s '{entry.get('declared_spell')}' is "
+                f"interrupted and lost.")
+    elif ds == resolves:
+        verdict = "simultaneous"
+        note = (f"Damage on segment {ds} == spell resolution — "
+                f"{entry['name']}'s spell fires simultaneously.")
+    else:
+        verdict = "pre_cast"
+        note = (f"Damage on segment {ds} < spell resolves on {resolves} — "
+                f"{entry['name']} has not yet begun the casting; spell "
+                f"is not technically interrupted (DM may rule otherwise).")
+    state.setdefault("combat_log", []).append(f"check_spell_interrupt: {note}")
+    set_active_combat(state)
+    return {
+        "caster_id":              caster_id,
+        "damage_segment":         ds,
+        "spell_resolves_segment": resolves,
+        "verdict":                verdict,
+        "spell_interrupted":      bool(entry["spell_interrupted"]),
+        "note":                   note,
+    }
+
+
+@mcp.tool()
+def hold_action() -> dict:
+    """
+    Phase 38: mark the PC's declared action as 'held'. The PC will not
+    auto-act on their initiative segment; instead call
+    resolve_player_action when the trigger event occurs (e.g. when an
+    ally falls, when an enemy crosses a threshold). Phase must be
+    'countdown' or 'declare'.
+    """
+    state, err = _require_round_state()
+    if err:
+        return err
+    rs = state["round_state"]
+    if rs["phase"] not in ("declare", "countdown"):
+        return {"error": f"hold_action called during phase={rs['phase']!r}; "
+                         f"expected 'declare' or 'countdown'."}
+    pc_entry = _find_round_entry(rs, "PC")
+    if not pc_entry:
+        return {"error": "PC entry missing from round_state.combatants."}
+    pc_entry["holding"]         = True
+    pc_entry["declared_action"] = pc_entry.get("declared_action") or "hold"
+    state.setdefault("combat_log", []).append(
+        f"Segment {rs.get('current_segment')}: PC holds action."
+    )
+    set_active_combat(state)
+    return {
+        "holding": True,
+        "note":    ("Action held. Call resolve_player_action when ready "
+                    "to fire your held action."),
+    }
+
+
+@mcp.tool()
+def resolve_surprise_segment(
+    action_detail: Annotated[
+        str,
+        "Free-text description of the PC's action this free segment. "
+        "Only used when the PC is the UNSURPRISED side (player gets "
+        "free segments against flat-footed enemies).",
+    ] = "",
+) -> dict:
+    """
+    Phase 38: burn one free surprise-round segment.
+
+    Only valid during phase='surprise'. Decrements
+    surprise.free_segments by one. When 0 free segments remain the
+    phase advances to 'declare' and the caller is told to call
+    declare_round for round 1.
+
+    The DM resolves dice as usual via attack(), cast_spell(), etc.
+    during the free segments — this tool just tracks the counter and
+    the surprise log.
+    """
+    state, err = _require_round_state()
+    if err:
+        return err
+    rs = state["round_state"]
+    if rs["phase"] != "surprise":
+        return {"error": f"resolve_surprise_segment called during "
+                         f"phase={rs['phase']!r}; expected 'surprise'."}
+    surp = rs.get("surprise", {}) or {}
+    side = surp.get("surprised_side")
+    remaining = int(rs.get("free_segments_remaining") or surp.get("free_segments") or 0)
+    if remaining <= 0:
+        rs["phase"] = "declare"
+        set_active_combat(state)
+        return {
+            "completed": True,
+            "phase":     "declare",
+            "note":      "Surprise round complete. Call declare_round for round 1.",
+        }
+
+    detail = (action_detail or "").strip()
+    if side == "enemy":
+        actor = "PC"
+        msg = (
+            f"Free segment ({remaining} left): PC acts vs flat-footed enemies"
+            + (f" — {detail}" if detail else "")
+        )
+    elif side == "player":
+        actor = "enemies"
+        msg = (
+            f"Free segment ({remaining} left): enemies act vs surprised PC"
+            + (f" — {detail}" if detail else "")
+        )
+    else:
+        actor = "neither"
+        msg = f"Free segment ({remaining} left): no surprised side recorded."
+
+    state.setdefault("combat_log", []).append(msg)
+    remaining -= 1
+    rs["free_segments_remaining"] = remaining
+    surp["free_segments_used"]    = True
+    rs["surprise"] = surp
+    if remaining <= 0:
+        rs["phase"] = "declare"
+
+    set_active_combat(state)
+    return {
+        "resolved":         True,
+        "actor":            actor,
+        "remaining":        remaining,
+        "phase":            rs["phase"],
+        "note": (
+            "Surprise round complete. Call declare_round for round 1."
+            if rs["phase"] == "declare"
+            else f"{remaining} free segment(s) left. Call "
+                 f"resolve_surprise_segment again."
+        ),
+    }
 
 
 @mcp.tool()
@@ -4153,8 +5023,35 @@ def get_combat_state(
     order      = state.get("initiative_order", [])
     current_actor = order[state.get("current_actor_index", 0)] if order else ""
 
+    # Phase 38: surface round_state on every response.
+    rs = state.get("round_state") if isinstance(state.get("round_state"), dict) else None
+    phase_info: dict | None = None
+    pending_spells: list[dict] = []
+    if rs:
+        phase_info = {
+            "phase":           rs.get("phase"),
+            "current_segment": rs.get("current_segment"),
+            "free_segments_remaining": rs.get("free_segments_remaining"),
+            "distance":        rs.get("distance"),
+            "surprise":        rs.get("surprise"),
+        }
+        for entry in rs.get("combatants", []):
+            if entry.get("declared_action") == "spell" \
+                    and entry.get("spell_resolves_segment") is not None \
+                    and not entry.get("spell_interrupted") \
+                    and not entry.get("acted"):
+                pending_spells.append({
+                    "id":                     entry["id"],
+                    "name":                   entry["name"],
+                    "spell":                  entry.get("declared_spell"),
+                    "casting_time":           entry.get("spell_casting_time"),
+                    "spell_resolves_segment": entry.get("spell_resolves_segment"),
+                    "spell_carries_to_next":  entry.get("spell_carries_to_next", False),
+                    "spell_carries_segment":  entry.get("spell_carries_segment"),
+                })
+
     if summary_only:
-        return {
+        out = {
             "active":         True,
             "summary_only":   True,
             "encounter_name": state.get("encounter_name", ""),
@@ -4171,8 +5068,12 @@ def get_combat_state(
                 if cid in combatants
             ],
         }
+        if phase_info:
+            out["round_state"]    = phase_info
+            out["pending_spells"] = pending_spells
+        return out
 
-    return {
+    out = {
         "active":          True,
         "encounter_name":  state.get("encounter_name", ""),
         "location":        state.get("location", ""),
@@ -4194,6 +5095,11 @@ def get_combat_state(
         ],
         "combat_log": state.get("combat_log", [])[-10:],
     }
+    if phase_info:
+        out["round_state"]      = phase_info
+        out["pending_spells"]   = pending_spells
+        out["round_combatants"] = rs.get("combatants", [])
+    return out
 
 
 @mcp.tool()
@@ -4265,6 +5171,27 @@ def attack(
         return {"error": f"{attacker['name']} is {attacker['status']} and cannot attack."}
     if target["status"] != "active":
         return {"error": f"{target['name']} is already {target['status']}."}
+
+    # ── Phase 38: melee-distance gate ─────────────────────────────────────────
+    # If a melee attack is attempted while distance.melee_possible is False
+    # (e.g. enemies still closing across a courtyard), refuse the resolution
+    # with the spec-mandated message.
+    rs = state.get("round_state") if isinstance(state.get("round_state"), dict) else None
+    if rs and not (rs.get("distance", {}) or {}).get("melee_possible", True):
+        wlow = (weapon or "").strip().lower()
+        is_melee = wlow not in ("", "bow", "longbow", "shortbow", "crossbow",
+                                "sling", "javelin", "dart", "missile",
+                                "ranged", "arrow", "bolt", "stone", "spell")
+        if is_melee:
+            return {
+                "error": (
+                    f"Enemy cannot reach melee this round — still closing. "
+                    f"{rs.get('distance', {}).get('feet', '?')} ft remaining."
+                ),
+                "blocked":        True,
+                "melee_possible": False,
+                "distance_feet":  rs.get("distance", {}).get("feet"),
+            }
 
     # ── Phase 34: stat-enforcement gate ───────────────────────────────────────
     # Block dice resolution against any enemy combatant whose stat block in
