@@ -1041,6 +1041,31 @@ CREATE INDEX IF NOT EXISTS idx_area_instances_location_name
     ON area_instances(location_name);
 
 -- ============================================================
+-- NAME REGISTRY (Phase 37)
+-- Single source of truth for every named place / NPC / item that
+-- has been introduced into the campaign. Prevents name recycling
+-- and geographic contamination across all character DBs.
+-- The canonical=1 rows are seeded from data/canonical_greyhawk.json
+-- by engine.seed_canonical_names — both at _bootstrap_new_db time
+-- and idempotently from the runtime migration on first use.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS name_registry (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    type TEXT NOT NULL,          -- 'place', 'npc', 'item'
+    subtype TEXT,                -- 'village','dungeon','male','female','dwarf','elf','sword', etc.
+    region TEXT,                 -- Greyhawk region where this name belongs
+    context TEXT,                -- one line: how/where introduced
+    canonical INTEGER DEFAULT 0, -- 1 = protected Greyhawk canon, cannot be moved
+    session_date TEXT,
+    UNIQUE(name, type)
+);
+CREATE INDEX IF NOT EXISTS idx_name_registry_type
+    ON name_registry(type, name);
+CREATE INDEX IF NOT EXISTS idx_name_registry_region
+    ON name_registry(region);
+
+-- ============================================================
 -- SCHEMA: VIEWS
 -- ============================================================
 

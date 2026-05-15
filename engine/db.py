@@ -1484,6 +1484,20 @@ def _bootstrap_new_db(db_path: Path) -> None:
                     raise
         conn.execute("COMMIT")
         conn.execute("PRAGMA journal_mode=WAL")
+
+        # Phase 37: seed the canonical Greyhawk name registry. Runs inside
+        # the same connection as the DDL load so a fresh DB exits this
+        # function with the registry fully populated. Existing DBs hit the
+        # same seeding via _ensure_name_registry_table on first use.
+        conn.row_factory = sqlite3.Row
+        try:
+            _seed_canonical_names_into(conn)
+            conn.commit()
+        except sqlite3.Error:
+            # Seeding is best-effort — never block DB creation on it. The
+            # runtime migration in _ensure_name_registry_table will retry
+            # on next use.
+            pass
     finally:
         conn.close()
 
@@ -11204,6 +11218,412 @@ def db_remove_spell_from_book(
         "character_name": character_name,
         "deleted":        target,
     }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PHASE 37 — NAME REGISTRY
+# Single source of truth for every named place / NPC / item that has been
+# introduced into the active campaign. Prevents name recycling across
+# campaigns and geographic contamination (using a canonical Greyhawk name
+# in the wrong region). Canonical seed lives in data/canonical_greyhawk.json
+# and is inserted with canonical=1 on first use.
+#
+# Schema lives in schema/ddl.sql and is mirrored here for idempotent
+# runtime migration on existing campaign DBs.
+# ══════════════════════════════════════════════════════════════════════════════
+
+_NAME_REGISTRY_DDL = """
+CREATE TABLE IF NOT EXISTS name_registry (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    type TEXT NOT NULL,
+    subtype TEXT,
+    region TEXT,
+    context TEXT,
+    canonical INTEGER DEFAULT 0,
+    session_date TEXT,
+    UNIQUE(name, type)
+);
+CREATE INDEX IF NOT EXISTS idx_name_registry_type
+    ON name_registry(type, name);
+CREATE INDEX IF NOT EXISTS idx_name_registry_region
+    ON name_registry(region);
+"""
+
+_NAME_REGISTRY_VALID_TYPES = ("place", "npc", "item")
+
+# Syllable tables for procedural name generation. See generate_fresh_name.
+_SYLLABLES: dict[str, list[str]] = {
+    "place_start": [
+        "Ash","Brak","Carn","Dol","Ember","Fen","Gal","Helm","Iron","Keld",
+        "Lor","Moor","Neth","Oak","Pel","Raven","Stone","Tor","Ul","Vex",
+        "Wyn","Xan","Yar","Zan",
+    ],
+    "place_end": [
+        "bridge","brook","dale","den","fell","ford","gate","holm","keep",
+        "mere","moor","port","reach","stead","thorn","vale","wall","watch",
+        "wick","wood",
+    ],
+    "npc_male": [
+        "Aldric","Bren","Cort","Davan","Edric","Fenn","Garad","Holt","Ivran",
+        "Jorath","Kern","Lothar","Maran","Navar","Osric","Pell","Rath",
+        "Soren","Taren","Ulvar","Varn","Weld","Xarn","Yorn","Zavan",
+    ],
+    "npc_female": [
+        "Aela","Brynn","Calla","Dara","Elva","Fara","Gwen","Hilda","Issa",
+        "Jora","Kara","Lyra","Mira","Nara","Orla","Pell","Reva","Sela",
+        "Tara","Una","Vara","Wren","Xara","Yara","Zara",
+    ],
+    "npc_dwarf": [
+        "Bofri","Durn","Garin","Haldor","Korum","Lothi","Mordak","Nori",
+        "Ordak","Thordak","Urgot","Valdak",
+    ],
+    "npc_elf": [
+        "Aelindra","Caladwen","Elowyn","Faelith","Galadhen","Ithilwen",
+        "Laeriel","Miravel","Naelith","Sylvara","Thalindra","Vaelith",
+    ],
+    "item_prefix": [
+        "Ashen","Bone","Crimson","Dark","Edge","Fell","Ghost","Iron","Jade",
+        "Keen","Liege","Mist","Night","Oak","Pale","Rune","Shadow","Storm",
+        "Thunder","Void",
+    ],
+    "item_suffix": [
+        "bane","blade","cleave","edge","fang","gleam","guard","light",
+        "reach","song","strike","thorn","ward","weave",
+    ],
+}
+
+
+def _ensure_name_registry_table(conn) -> None:
+    """
+    Idempotent runtime migration:
+      1. Create name_registry + indexes if missing.
+      2. Seed canonical Greyhawk names from data/canonical_greyhawk.json
+         on first use (i.e. when no canonical=1 row exists yet). The
+         seed function uses INSERT OR IGNORE so a partial seed never
+         duplicates rows.
+    Safe to call repeatedly; only does work on the first run.
+    """
+    conn.executescript(_NAME_REGISTRY_DDL)
+    canon_row = conn.execute(
+        "SELECT 1 FROM name_registry WHERE canonical = 1 LIMIT 1"
+    ).fetchone()
+    if canon_row is None:
+        _seed_canonical_names_into(conn)
+
+
+def _seed_canonical_names_into(conn) -> int:
+    """
+    INSERT OR IGNORE the canonical Greyhawk rows defined in
+    data/canonical_greyhawk.json. Returns the number of new rows
+    actually inserted (excluding duplicates).
+    """
+    seed_path = _ROOT / "data" / "canonical_greyhawk.json"
+    if not seed_path.exists():
+        return 0
+    try:
+        data = json.loads(seed_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return 0
+    if not isinstance(data, list):
+        return 0
+    inserted = 0
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        nm = (entry.get("name") or "").strip()
+        tp = (entry.get("type") or "").strip().lower()
+        if not nm or tp not in _NAME_REGISTRY_VALID_TYPES:
+            continue
+        try:
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO name_registry "
+                "(name, type, subtype, region, context, canonical) "
+                "VALUES (?, ?, ?, ?, ?, 1)",
+                (
+                    nm, tp,
+                    entry.get("subtype"),
+                    entry.get("region"),
+                    entry.get("context")
+                        or "Canonical Greyhawk reference (auto-seeded).",
+                ),
+            )
+            inserted += cur.rowcount
+        except sqlite3.Error:
+            continue
+    return inserted
+
+
+def seed_canonical_names(db_path: str | Path | None = None) -> int:
+    """
+    Public migration helper. Seeds the canonical Greyhawk names into
+    name_registry for the given DB path (or the currently active campaign
+    when db_path is None). Idempotent: re-running seeds nothing new.
+
+    Returns the count of rows inserted on this call (0 when already seeded).
+    """
+    if db_path is None:
+        with _get_conn() as conn:
+            _ensure_name_registry_table(conn)
+            return 0  # _ensure_name_registry_table already seeded if needed.
+
+    p = Path(db_path)
+    conn = sqlite3.connect(p)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.executescript(_NAME_REGISTRY_DDL)
+        count = _seed_canonical_names_into(conn)
+        conn.commit()
+        return count
+    finally:
+        conn.close()
+
+
+def db_check_name(name: str) -> dict | None:
+    """
+    Look up a name in the registry (case-insensitive exact match). Returns
+    the row dict if found, None otherwise. Type-agnostic lookup — if a
+    'Saltmarsh' is registered as a place and someone asks about it, the
+    place entry comes back first.
+    """
+    nm = (name or "").strip()
+    if not nm:
+        return None
+    with _get_conn() as conn:
+        _ensure_name_registry_table(conn)
+        row = conn.execute(
+            "SELECT id, name, type, subtype, region, context, canonical, "
+            "       session_date "
+            "FROM name_registry "
+            "WHERE LOWER(name) = LOWER(?) "
+            "ORDER BY canonical DESC, id ASC LIMIT 1",
+            (nm,),
+        ).fetchone()
+    return _row_to_dict(row) if row else None
+
+
+def db_register_name(
+    name: str,
+    name_type: str,
+    subtype: str | None = None,
+    region:  str | None = None,
+    context: str | None = None,
+    canonical: bool = False,
+    session_date: str | None = None,
+) -> dict:
+    """
+    Insert a name into the registry. Raises ValueError on invalid
+    name_type or duplicate (name, type) — callers can pre-flight via
+    db_check_name to differentiate "duplicate" from "succeeded".
+    Returns the inserted row dict including the new id.
+    """
+    nm = (name or "").strip()
+    if not nm:
+        raise ValueError("name is required.")
+    tp = (name_type or "").strip().lower()
+    if tp not in _NAME_REGISTRY_VALID_TYPES:
+        raise ValueError(
+            f"name_type must be one of {list(_NAME_REGISTRY_VALID_TYPES)}; "
+            f"got {name_type!r}."
+        )
+
+    with _get_conn() as conn:
+        _ensure_name_registry_table(conn)
+        try:
+            cur = conn.execute(
+                "INSERT INTO name_registry "
+                "(name, type, subtype, region, context, canonical, session_date) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (nm, tp, subtype, region, context,
+                 1 if canonical else 0, session_date),
+            )
+            new_id = cur.lastrowid
+        except sqlite3.IntegrityError as e:
+            raise ValueError(
+                f"Name {nm!r} of type {tp!r} is already registered."
+            ) from e
+        row = conn.execute(
+            "SELECT id, name, type, subtype, region, context, canonical, "
+            "       session_date FROM name_registry WHERE id = ?",
+            (new_id,),
+        ).fetchone()
+    return _row_to_dict(row)
+
+
+def db_list_registry(
+    name_type: str | None = None,
+    region:    str | None = None,
+    limit:     int = 50,
+) -> dict:
+    """
+    Return registry rows newest-first, filtered by name_type and/or
+    region (both case-insensitive). limit is clamped to 1-500.
+    """
+    lim = max(1, min(int(limit or 50), 500))
+    sql = (
+        "SELECT id, name, type, subtype, region, context, canonical, "
+        "       session_date "
+        "FROM name_registry"
+    )
+    where: list[str] = []
+    params: list = []
+    if name_type and str(name_type).strip():
+        where.append("LOWER(type) = LOWER(?)")
+        params.append(str(name_type).strip())
+    if region and str(region).strip():
+        where.append("LOWER(region) = LOWER(?)")
+        params.append(str(region).strip())
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY id DESC LIMIT ?"
+    params.append(lim)
+    with _get_conn() as conn:
+        _ensure_name_registry_table(conn)
+        rows = conn.execute(sql, params).fetchall()
+    return {
+        "count": len(rows),
+        "limit": lim,
+        "filter": {
+            "name_type": (name_type or None),
+            "region":    (region or None),
+        },
+        "rows":  [_row_to_dict(r) for r in rows],
+    }
+
+
+def generate_fresh_name(
+    db_path: str | Path | None = None,
+    name_type: str = "place",
+    subtype:   str | None = None,
+    region:    str | None = None,
+    context:   str | None = None,
+) -> dict:
+    """
+    Generate a name not currently in the registry, insert it (canonical=0),
+    and return {name, registry_id, type, subtype, region, context}.
+
+    Strategy: build the candidate pool from the syllable tables, shuffle,
+    walk it; the first name with no existing (name, type) row wins.
+    If the entire pool is taken, append a numeric suffix and keep trying.
+
+    db_path is accepted for API parity with the spec (`seed_canonical_names`
+    takes a path too). None defaults to the active campaign; a string or
+    Path runs against that specific DB.
+    """
+    tp = (name_type or "").strip().lower()
+    if tp not in _NAME_REGISTRY_VALID_TYPES:
+        raise ValueError(
+            f"name_type must be one of {list(_NAME_REGISTRY_VALID_TYPES)}; "
+            f"got {name_type!r}."
+        )
+    sub = (subtype or "").strip().lower() or None
+
+    # Build candidate pool
+    pool = _build_name_pool(tp, sub)
+    if not pool:
+        raise ValueError(
+            f"No syllable table available for name_type={tp!r}, "
+            f"subtype={sub!r}."
+        )
+    random.shuffle(pool)
+
+    def _name_taken(conn, candidate: str) -> bool:
+        row = conn.execute(
+            "SELECT 1 FROM name_registry "
+            "WHERE LOWER(name) = LOWER(?) AND type = ? LIMIT 1",
+            (candidate, tp),
+        ).fetchone()
+        return row is not None
+
+    # Choose the appropriate connection
+    if db_path is None:
+        conn_ctx = _get_conn()
+    else:
+        conn = sqlite3.connect(Path(db_path))
+        conn.row_factory = sqlite3.Row
+        conn_ctx = _explicit_conn(conn)
+
+    with conn_ctx as conn:
+        _ensure_name_registry_table(conn)
+        chosen: str | None = None
+        for candidate in pool:
+            if not _name_taken(conn, candidate):
+                chosen = candidate
+                break
+        if chosen is None:
+            # Pool exhausted — append a 2..200 suffix to the first item.
+            base = pool[0]
+            for n in range(2, 201):
+                attempt = f"{base}{n}"
+                if not _name_taken(conn, attempt):
+                    chosen = attempt
+                    break
+        if chosen is None:
+            raise ValueError(
+                f"Could not generate a fresh {tp} name after exhausting the "
+                f"pool plus suffixes 2..200. Registry too full."
+            )
+
+        cur = conn.execute(
+            "INSERT INTO name_registry "
+            "(name, type, subtype, region, context, canonical) "
+            "VALUES (?, ?, ?, ?, ?, 0)",
+            (chosen, tp, sub, region, context),
+        )
+        new_id = cur.lastrowid
+
+    return {
+        "name":         chosen,
+        "registry_id":  new_id,
+        "type":         tp,
+        "subtype":      sub,
+        "region":       region,
+        "context":      context,
+        "canonical":    False,
+    }
+
+
+def _build_name_pool(name_type: str, subtype: str | None) -> list[str]:
+    """
+    Return the candidate name list for a (type, subtype). For 'place' /
+    'item' this is the Cartesian product of the two syllable tables; for
+    'npc' it's the matching subtype list (default: male).
+    """
+    if name_type == "place":
+        starts = list(_SYLLABLES["place_start"])
+        ends   = list(_SYLLABLES["place_end"])
+        return [f"{s}{e}" for s in starts for e in ends]
+    if name_type == "item":
+        prefixes = list(_SYLLABLES["item_prefix"])
+        suffixes = list(_SYLLABLES["item_suffix"])
+        return [f"{p}{s}" for p in prefixes for s in suffixes]
+    if name_type == "npc":
+        key = (subtype or "male").strip().lower()
+        # Normalise common aliases
+        alias = {
+            "m": "male", "man": "male", "human_male": "male",
+            "f": "female", "woman": "female", "human_female": "female",
+            "dwarven": "dwarf", "elven": "elf", "elvish": "elf",
+        }.get(key, key)
+        table_key = f"npc_{alias}"
+        return list(_SYLLABLES.get(table_key,
+                                   _SYLLABLES["npc_male"]))
+    return []
+
+
+@contextmanager
+def _explicit_conn(conn):
+    """
+    Wrap a sqlite3 Connection in a context manager that commits on exit
+    and always closes. Used by generate_fresh_name when a caller passes
+    an explicit db_path (the normal _get_conn() path uses the active
+    campaign).
+    """
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
 
 
 # ══════════════════════════════════════════════════════════════════════════════

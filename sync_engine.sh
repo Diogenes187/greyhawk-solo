@@ -92,6 +92,10 @@ for i in "${!TARGETS[@]}"; do
     copy_file "$SRC/schema/ddl.sql"                "$DST/schema/ddl.sql"                "schema/ddl.sql"
     copy_file "$SRC/schema/starter.sql"            "$DST/schema/starter.sql"            "schema/starter.sql"
 
+    # Phase 37: canonical Greyhawk name registry seed
+    mkdir -p "$DST/data" 2>/dev/null
+    copy_file "$SRC/data/canonical_greyhawk.json"  "$DST/data/canonical_greyhawk.json"  "data/canonical_greyhawk.json"
+
     # clone/sync helper scripts
     copy_file "$SRC/clone_for_new_character.bat"   "$DST/clone_for_new_character.bat"   "clone_for_new_character.bat"
     copy_file "$SRC/clone_for_new_character.sh"    "$DST/clone_for_new_character.sh"    "clone_for_new_character.sh"

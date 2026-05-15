@@ -81,6 +81,13 @@ for /l %%I in (1,1,%COUNT%) do (
         copy /y "%SRC%\schema\starter.sql" "!DST!\schema\starter.sql" >nul 2>&1
         if errorlevel 1 (echo    WARN: schema/starter.sql copy failed) else (echo    OK  schema/starter.sql)
 
+        rem Phase 37: canonical Greyhawk name registry seed
+        if exist "%SRC%\data\canonical_greyhawk.json" (
+            if not exist "!DST!\data" mkdir "!DST!\data" 2>nul
+            copy /y "%SRC%\data\canonical_greyhawk.json" "!DST!\data\canonical_greyhawk.json" >nul 2>&1
+            if errorlevel 1 (echo    WARN: data/canonical_greyhawk.json copy failed) else (echo    OK  data/canonical_greyhawk.json)
+        )
+
         rem clone/sync helper scripts
         if exist "%SRC%\clone_for_new_character.bat" (
             copy /y "%SRC%\clone_for_new_character.bat" "!DST!\clone_for_new_character.bat" >nul 2>&1

@@ -897,6 +897,12 @@ from engine.db import (
     db_get_spellbook,
     db_add_spell_to_book,
     db_remove_spell_from_book,
+    # Phase 37 — name registry
+    db_check_name,
+    db_register_name,
+    db_list_registry,
+    generate_fresh_name,
+    seed_canonical_names,
     # Phase 12 — equipment slot system
     db_equip_item,
     db_list_equipped,
@@ -2661,6 +2667,19 @@ def add_location(
         "Name of a parent location if this is a sub-location (e.g. a building inside Quasquetan). "
         "Leave blank for top-level locations.",
     ] = "",
+    region: Annotated[
+        str,
+        "Greyhawk region this location belongs to (recorded in name_registry "
+        "for future collision checks). Optional but strongly recommended.",
+    ] = "",
+    allow_name_reuse: Annotated[
+        bool,
+        "Override the name-registry collision guard. Default False — if the "
+        "name is already registered (canonical or otherwise) in a different "
+        "region, the call is blocked. Set True to acknowledge the warning "
+        "and proceed anyway. Canonical-name collisions are NEVER allowed; "
+        "this flag does not bypass them.",
+    ] = False,
 ) -> dict:
     """
     Add a new location to Theron's realm.
@@ -2669,13 +2688,66 @@ def add_location(
     constructed outpost, a dungeon the party has entered, a village that
     comes under Theron's protection, etc.
 
+    Phase 37 guard: pre-checks name_registry before inserting. Canonical
+    Greyhawk names (Hommlet, Verbobonc, etc.) cannot be reused as new
+    locations — those calls return a hard error. Non-canonical collisions
+    return a warning that the caller can override with allow_name_reuse=True.
+
+    After a successful insert, the name is auto-registered in
+    name_registry under type='place' with the supplied region.
+
     Returns the new location_id and full row as confirmation.
     """
+    nm = (name or "").strip()
+    if nm:
+        existing = db_check_name(nm)
+        if existing:
+            same_region = (existing.get("region") or "").strip().lower() == \
+                          (region or "").strip().lower()
+            if existing.get("canonical") and not same_region:
+                return {
+                    "error": (
+                        f"WARNING: {nm} is canonical Greyhawk "
+                        f"(region: {existing.get('region')}) — cannot be "
+                        f"reused as a new location. Use generate_name for "
+                        f"a fresh name."
+                    ),
+                    "blocked":             True,
+                    "canonical_collision": True,
+                    "existing":            existing,
+                }
+            if not same_region and not allow_name_reuse:
+                return {
+                    "error": (
+                        f"WARNING: {nm} already registered in "
+                        f"{existing.get('region') or '(unknown region)'} "
+                        f"— confirm this is intentional or use generate_name "
+                        f"for a fresh name."
+                    ),
+                    "blocked":           True,
+                    "existing":          existing,
+                    "override_hint":     "Re-call with allow_name_reuse=True "
+                                         "to proceed.",
+                }
     try:
         result = db_add_location(
             name=name, location_type=location_type, status=status,
             notes=notes, parent_location_name=parent_location_name or None,
         )
+        # Post-insert: log to name_registry (idempotent — duplicates ignored).
+        if nm:
+            try:
+                db_register_name(
+                    name=nm, name_type="place",
+                    subtype=(location_type or None),
+                    region=(region or None),
+                    context=(f"add_location({nm!r}, type={location_type!r}, "
+                             f"status={status!r})"),
+                    canonical=False,
+                )
+            except ValueError:
+                # Already registered — fine.
+                pass
         return {"created": True, **result}
     except ValueError as e:
         return {"error": str(e)}
@@ -3206,6 +3278,20 @@ def add_npc(
         str | None,
         "Additional context for the relationship (circumstances of meeting, etc.).",
     ] = None,
+    region: Annotated[
+        str,
+        "Greyhawk region this NPC is associated with (recorded in "
+        "name_registry for future collision checks). Optional but strongly "
+        "recommended for any NPC tied to a specific place.",
+    ] = "",
+    allow_name_reuse: Annotated[
+        bool,
+        "Override the name-registry collision guard. Default False — if the "
+        "name is already registered in a different region (whether canonical "
+        "or not), the call is blocked. Set True to acknowledge the warning "
+        "and proceed; NPCs can intentionally share a name with a town, an "
+        "older campaign NPC, etc.",
+    ] = False,
 ) -> dict:
     """
     Add a newly encountered or newly relevant NPC to the database.
@@ -3214,15 +3300,54 @@ def add_npc(
     return to, an enemy commander whose name was learned, a quest giver,
     a new hireling, or a prisoner taken during play.
 
+    Phase 37 guard: pre-checks name_registry. If the name is already
+    registered in a different region, the call returns a warning instead
+    of inserting; re-call with allow_name_reuse=True if intentional.
+
+    After a successful insert, the name is auto-registered in
+    name_registry under type='npc' with the supplied region.
+
     Returns the new character_id and full row. If relationship_to_theron
     is provided, a relationship record is also created.
     """
+    nm = (name or "").strip()
+    if nm and not allow_name_reuse:
+        existing = db_check_name(nm)
+        if existing:
+            same_region = (existing.get("region") or "").strip().lower() == \
+                          (region or "").strip().lower()
+            if not same_region:
+                return {
+                    "error": (
+                        f"WARNING: {nm} already registered in "
+                        f"{existing.get('region') or '(unknown region)'} "
+                        f"— confirm this is intentional or use generate_name "
+                        f"for a fresh name."
+                    ),
+                    "blocked":          True,
+                    "existing":         existing,
+                    "override_hint":    "Re-call with allow_name_reuse=True "
+                                        "to proceed.",
+                }
     try:
         result = db_add_npc(
             name=name, race=race, character_type=character_type,
             notes=notes, relationship_to_theron=relationship_to_theron,
             relationship_notes=relationship_notes,
         )
+        # Post-insert: log to name_registry under type='npc'.
+        if nm:
+            try:
+                db_register_name(
+                    name=nm, name_type="npc",
+                    subtype=(race or None),
+                    region=(region or None),
+                    context=f"add_npc({nm!r}, type={character_type!r})",
+                    canonical=False,
+                )
+            except ValueError:
+                # Already registered — fine.
+                pass
         return {"created": True, **result}
     except Exception as e:
         return {"error": str(e)}
@@ -10619,6 +10744,233 @@ def list_modules() -> dict:
             "fact_id":           row["world_fact_id"],
         })
     return {"count": len(modules), "modules": modules}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PHASE 37 — NAME REGISTRY TOOLS
+# Prevents name recycling and geographic contamination across campaigns.
+# Backed by engine.db.name_registry, seeded from data/canonical_greyhawk.json
+# on first use (runtime migration) and on every fresh _bootstrap_new_db.
+# ══════════════════════════════════════════════════════════════════════════════
+
+_NAME_TYPES_DOC = "Must be one of 'place', 'npc', or 'item'."
+_NAME_NOT_IN_REGISTRY_TEXT = (
+    "Not in registry — safe to use, register it with generate_name or "
+    "register_name."
+)
+
+
+@mcp.tool()
+def generate_name(
+    name_type: Annotated[
+        str,
+        "What kind of name to generate. " + _NAME_TYPES_DOC,
+    ],
+    subtype: Annotated[
+        str,
+        "Optional subtype controlling the syllable pool. For npc: 'male' "
+        "(default), 'female', 'dwarf', 'elf'. For place/item the subtype "
+        "is recorded but doesn't change the pool. Leave blank for the "
+        "default behaviour.",
+    ] = "",
+    region: Annotated[
+        str,
+        "Greyhawk region to pin the generated name to (e.g. 'Keoland', "
+        "'Wild Coast'). Recorded on the registry row so future "
+        "collision checks know where the name lives.",
+    ] = "",
+    context: Annotated[
+        str,
+        "Optional one-line description of how/where the name is being "
+        "introduced. Recorded on the registry row for later audit.",
+    ] = "",
+) -> dict:
+    """
+    Generate a fresh procedurally-built name not currently in the
+    registry, write it back to the registry (canonical=0), and return
+    the new name plus its registry id.
+
+    Generation strategy: build the candidate pool from the syllable
+    tables, shuffle, walk it; the first unused name wins. Pool sizes
+    are large (480 for places, 280 for items, 12-25 for NPCs), so a
+    fresh name is almost always available without falling back to a
+    numeric suffix.
+    """
+    try:
+        return generate_fresh_name(
+            db_path=None,
+            name_type=name_type,
+            subtype=(subtype or None),
+            region=(region or None),
+            context=(context or None),
+        )
+    except ValueError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def check_name(
+    name: Annotated[
+        str,
+        "Name to look up in the registry. Case-insensitive exact match. "
+        "Returns metadata if registered, or the 'Not in registry' "
+        "message if free to use.",
+    ],
+) -> dict:
+    """
+    Check whether a name has been registered in this campaign.
+
+    On hit, returns: exists=true, type, subtype, region, context,
+    canonical, session_date, registry_id.
+    On miss, returns: exists=false, name, note=<the canonical
+    'safe to use' message>.
+
+    Always type-agnostic — if the same string is registered as both a
+    place and an NPC (rare), the canonical row wins, then lowest id.
+    """
+    row = db_check_name(name)
+    if not row:
+        return {
+            "exists": False,
+            "name":   (name or "").strip(),
+            "note":   _NAME_NOT_IN_REGISTRY_TEXT,
+        }
+    return {
+        "exists":       True,
+        "registry_id":  row["id"],
+        "name":         row["name"],
+        "type":         row["type"],
+        "subtype":      row["subtype"],
+        "region":       row["region"],
+        "context":      row["context"],
+        "canonical":    bool(row["canonical"]),
+        "session_date": row["session_date"],
+    }
+
+
+@mcp.tool()
+def register_name(
+    name: Annotated[str, "The name to register."],
+    name_type: Annotated[str, _NAME_TYPES_DOC],
+    subtype: Annotated[
+        str,
+        "Optional subtype: 'village','dungeon','male','female','dwarf', "
+        "'elf','sword', etc.",
+    ] = "",
+    region: Annotated[
+        str,
+        "Greyhawk region this name belongs to.",
+    ] = "",
+    context: Annotated[
+        str,
+        "One-line description of how/where the name was introduced.",
+    ] = "",
+) -> dict:
+    """
+    Register a player-introduced (or DM-introduced) name in the registry.
+
+    Pre-flights for collision:
+      - If the name is already registered as canonical Greyhawk in a
+        DIFFERENT region, the call is BLOCKED with an explicit warning
+        — those names cannot be moved.
+      - If the name is registered (non-canonical) in a different region,
+        the call is BLOCKED with the spec warning text; the caller can
+        re-call register_name with the same region to confirm, or pick
+        a different name via generate_name.
+      - If the name is already registered with the SAME region (and
+        same type), this is treated as a no-op success — returns the
+        existing row.
+      - Otherwise inserts a fresh row.
+    """
+    nm = (name or "").strip()
+    if not nm:
+        return {"error": "name is required."}
+
+    existing = db_check_name(nm)
+    if existing:
+        same_region = (existing.get("region") or "").strip().lower() == \
+                      (region or "").strip().lower()
+        if existing.get("canonical") and not same_region:
+            return {
+                "error": (
+                    f"WARNING: {nm} is canonical Greyhawk "
+                    f"(region: {existing.get('region')}) — cannot be "
+                    f"reassigned to region {region!r}. Use generate_name "
+                    f"for a fresh name."
+                ),
+                "blocked":           True,
+                "canonical_collision": True,
+                "existing":          existing,
+            }
+        if not same_region:
+            return {
+                "error": (
+                    f"WARNING: {nm} already registered in "
+                    f"{existing.get('region') or '(unknown region)'} "
+                    f"— confirm this is intentional or use generate_name "
+                    f"for a fresh name."
+                ),
+                "blocked":  True,
+                "existing": existing,
+            }
+        # Same region, same name — already registered, treat as no-op.
+        return {
+            "registered": True,
+            "already_present": True,
+            **{k: existing[k] for k in
+               ("id", "name", "type", "subtype", "region", "context",
+                "canonical", "session_date")},
+            "registry_id": existing["id"],
+        }
+
+    try:
+        row = db_register_name(
+            name=nm,
+            name_type=name_type,
+            subtype=(subtype or None),
+            region=(region or None),
+            context=(context or None),
+            canonical=False,
+        )
+        return {
+            "registered":  True,
+            "already_present": False,
+            "registry_id": row["id"],
+            **{k: row[k] for k in
+               ("name", "type", "subtype", "region", "context",
+                "canonical", "session_date")},
+        }
+    except ValueError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def list_registry(
+    name_type: Annotated[
+        str,
+        "Optional filter — 'place', 'npc', or 'item'. Blank = no filter.",
+    ] = "",
+    region: Annotated[
+        str,
+        "Optional region filter (case-insensitive exact match).",
+    ] = "",
+    limit: Annotated[
+        int,
+        "Max rows to return, newest first. Default 50, clamped to 1-500.",
+    ] = 50,
+) -> dict:
+    """
+    Return registered names newest-first, with optional filters.
+
+    Each row carries id, name, type, subtype, region, context, canonical
+    bool, and session_date. The response also echoes the filter applied
+    and the row count so the caller can paginate via id if needed.
+    """
+    return db_list_registry(
+        name_type=(name_type or None),
+        region=(region or None),
+        limit=int(limit) if limit else 50,
+    )
 
 
 if __name__ == "__main__":
