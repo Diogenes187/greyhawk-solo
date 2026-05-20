@@ -14,15 +14,24 @@ Five rules checked:
   4. INVENTED LORE — no new factions / subplots / hooks beyond game state.
   5. DICE FUDGING  — no roll references without a matching roll_dice call.
 
-The `anthropic` package is imported lazily inside validate_dm_response so
-the rest of the engine still imports cleanly on machines where the
-validator is opt-in. If the import or the API call fails, the function
-returns a degraded shape with `clean=False` and `available=False` so
-the calling tool can surface the situation honestly rather than
-silently passing the response through.
+`anthropic` is imported at module scope and a single Anthropic() client
+is constructed once at import time, reused for every validate_dm_response
+call. The SDK reads ANTHROPIC_API_KEY from the environment automatically;
+construction does not require the key — only the `messages.create` call
+does — so missing-key errors surface at call time with a useful message
+instead of breaking module import.
+
+Install (one-time, into the Python the MCP server actually launches):
+
+    "C:\\Users\\<you>\\AppData\\Local\\Programs\\Python\\Python313\\python.exe" \\
+        -m pip install anthropic
+
+After install the MCP server picks up the module on next restart.
 """
 
 from __future__ import annotations
+
+import anthropic
 
 VALIDATOR_MODEL = "claude-haiku-4-5"
 
@@ -42,6 +51,13 @@ If VIOLATION, identify which rules failed.
 Do not rewrite the response. Only judge it."""
 
 
+# Single module-level client, constructed once at import. Anthropic() does
+# not require the API key at construction — it's read from
+# ANTHROPIC_API_KEY when messages.create is called — so this is safe to
+# create at module load even on a machine where the key is not yet set.
+_CLIENT = anthropic.Anthropic()
+
+
 def validate_dm_response(response_text: str, game_state_summary: str) -> dict:
     """
     Send the DM response + one-paragraph game-state summary to
@@ -49,48 +65,17 @@ def validate_dm_response(response_text: str, game_state_summary: str) -> dict:
 
     Success shape:
       {"clean": bool, "verdict": full text, "original_response": text,
-       "available": True}
+       "available": True, "model": "claude-haiku-4-5"}
 
-    Degraded shape (anthropic missing / API error / missing API key):
-      {"clean": False, "verdict": <error text>,
-       "original_response": text, "available": False,
-       "error": <reason>}
+    API-call-failure shape (network error, missing API key, rate limit):
+      {"clean": False, "available": False, "error": <reason>,
+       "verdict": <short error blurb>, "original_response": text}
 
     The caller (validate_response MCP tool) is responsible for parsing
     `verdict` into a rules_failed list and presenting it to the DM.
     """
     text = response_text or ""
     state = game_state_summary or ""
-
-    # Lazy import so the engine still loads when anthropic isn't installed.
-    try:
-        import anthropic  # type: ignore
-    except ImportError as e:
-        return {
-            "clean":              False,
-            "available":          False,
-            "error": (
-                "The 'anthropic' package is not installed. "
-                "Run `pip install anthropic` to enable the DM-response "
-                f"validator. Original ImportError: {e}"
-            ),
-            "verdict":            "Validator unavailable — anthropic package missing.",
-            "original_response":  text,
-        }
-
-    try:
-        client = anthropic.Anthropic()
-    except Exception as e:
-        return {
-            "clean":              False,
-            "available":          False,
-            "error": (
-                "Could not initialise the Anthropic client (likely "
-                f"missing ANTHROPIC_API_KEY env var). Original error: {e}"
-            ),
-            "verdict":            "Validator unavailable — API client init failed.",
-            "original_response":  text,
-        }
 
     check_input = (
         "GAME STATE SUMMARY:\n"
@@ -100,7 +85,7 @@ def validate_dm_response(response_text: str, game_state_summary: str) -> dict:
     )
 
     try:
-        result = client.messages.create(
+        result = _CLIENT.messages.create(
             model=VALIDATOR_MODEL,
             max_tokens=300,
             system=VALIDATOR_PROMPT,
@@ -110,7 +95,7 @@ def validate_dm_response(response_text: str, game_state_summary: str) -> dict:
         return {
             "clean":              False,
             "available":          False,
-            "error": f"Anthropic API call failed: {e}",
+            "error":              f"Anthropic API call failed: {e}",
             "verdict":            "Validator unavailable — API call failed.",
             "original_response":  text,
         }
