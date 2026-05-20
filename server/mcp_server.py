@@ -11900,5 +11900,147 @@ def list_registry(
     )
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# PHASE 39 — DM RESPONSE VALIDATOR
+# Lightweight claude-haiku-4-5 check applied to every DM narrative before
+# it reaches the player. Verifies the five hard rules (no player verbs,
+# no improvised NPC names, brevity, no invented lore, no dice fudging).
+# Engine logic lives in engine/validator.py; this tool wraps it and
+# parses the verdict text into structured fields.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Numeric → human label for the five validator rules. Used by the
+# rules-failed parser in validate_response.
+_VALIDATOR_RULE_LABELS: dict[int, str] = {
+    1: "PLAYER_AGENCY",
+    2: "NPC_NAMES",
+    3: "VERBOSITY",
+    4: "INVENTED_LORE",
+    5: "DICE_FUDGING",
+}
+
+# Compiled once so the regex isn't recompiled on every tool call.
+_VALIDATOR_RULE_LINE_RE = re.compile(
+    r"^\s*(?:rule\s*)?([1-5])[\.\)\:\-]\s*(.*?)\s*(?:[\-—:]\s*)?"
+    r"\b(PASS|FAIL)\b(.*)$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _parse_validator_verdict(verdict_text: str) -> tuple[list[str], list[dict]]:
+    """
+    Walk the validator's reply and pull out (rules_failed, per_rule_detail).
+
+    rules_failed is a list of canonical labels — 'PLAYER_AGENCY',
+    'NPC_NAMES', etc. — corresponding to rule numbers that received a
+    FAIL verdict. per_rule_detail mirrors each PASS/FAIL line with its
+    (rule_number, label, status, reason) for the DM to inspect.
+    """
+    rules_failed: list[str] = []
+    per_rule:     list[dict] = []
+    if not verdict_text:
+        return rules_failed, per_rule
+    for m in _VALIDATOR_RULE_LINE_RE.finditer(verdict_text):
+        try:
+            n = int(m.group(1))
+        except (TypeError, ValueError):
+            continue
+        status = (m.group(3) or "").upper()
+        reason = (m.group(4) or "").strip(" -—:.\t")
+        label = _VALIDATOR_RULE_LABELS.get(n, f"RULE_{n}")
+        per_rule.append({
+            "rule_number": n,
+            "rule_label":  label,
+            "status":      status,
+            "reason":      reason or None,
+        })
+        if status == "FAIL":
+            rules_failed.append(label)
+    return rules_failed, per_rule
+
+
+@mcp.tool()
+def validate_response(
+    response_text: Annotated[
+        str,
+        "The DM's narrative response to validate. Send EXACTLY the text "
+        "you plan to deliver to the player — no markup, no chrome.",
+    ],
+    context: Annotated[
+        str,
+        "One-paragraph game-state summary the validator reads as ground "
+        "truth: current location, named NPCs already in play, active "
+        "combatants, last player action. The validator flags anything "
+        "in the response that doesn't appear in this paragraph.",
+    ],
+) -> dict:
+    """
+    Pre-flight a DM narrative through claude-haiku-4-5 before showing
+    it to the player.
+
+    On CLEAN:
+      {"status": "clean", "response": <unchanged>}
+
+    On VIOLATION:
+      {"status": "violation",
+       "rules_failed": [<labels>],
+       "verdict":  <full validator text>,
+       "instruction": "Rewrite the response. Fix the flagged
+                        violations. Do not add anything new."}
+
+    Usage pattern: call validate_response, rewrite on VIOLATION, call
+    again. Max two attempts — if the second still fails, deliver the
+    response anyway with a '[Validator flagged: ...]' header so the
+    player can invoke 'contract' if needed.
+
+    Degraded paths: when anthropic is not installed or
+    ANTHROPIC_API_KEY is missing, returns status='unavailable' so the
+    DM can choose whether to ship the response unverified.
+    """
+    from engine.validator import validate_dm_response
+
+    result = validate_dm_response(
+        response_text=response_text or "",
+        game_state_summary=context or "",
+    )
+
+    if not result.get("available", False):
+        return {
+            "status":   "unavailable",
+            "response": response_text or "",
+            "verdict":  result.get("verdict", ""),
+            "error":    result.get("error", ""),
+            "note": (
+                "Validator unavailable — install the 'anthropic' Python "
+                "package and set the ANTHROPIC_API_KEY env var to enable "
+                "the DM-response check. The DM may proceed without "
+                "validation, but should self-audit against the five "
+                "hard rules."
+            ),
+        }
+
+    if result.get("clean"):
+        return {
+            "status":   "clean",
+            "response": response_text or "",
+            "verdict":  result.get("verdict", ""),
+            "model":    result.get("model"),
+        }
+
+    rules_failed, per_rule = _parse_validator_verdict(result.get("verdict", ""))
+    return {
+        "status":        "violation",
+        "rules_failed":  rules_failed,
+        "per_rule":      per_rule,
+        "verdict":       result.get("verdict", ""),
+        "response":      response_text or "",
+        "instruction": (
+            "Rewrite the response. Fix the flagged violations. Do not "
+            "add anything new."
+        ),
+        "model":         result.get("model"),
+    }
+
+
 if __name__ == "__main__":
     mcp.run()

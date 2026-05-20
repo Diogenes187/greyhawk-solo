@@ -27,12 +27,15 @@ cd greyhawk-solo
 
 ## Step 2 — Install the MCP library
 
-There is one Python dependency: the MCP library.
+There is one required Python dependency (the MCP library) and one
+optional dependency (`anthropic`, used only by the Phase 39 DM-response
+validator tool — the rest of the engine works without it).
 
 **Without a virtual environment:**
 
 ```bash
 pip install "mcp[cli]"
+pip install anthropic            # optional — enables validate_response
 ```
 
 **With a virtual environment (recommended — keeps your system Python clean):**
@@ -53,7 +56,13 @@ source .venv/bin/activate
 
 # Install
 pip install "mcp[cli]"
+pip install anthropic            # optional — enables validate_response
 ```
+
+`anthropic` reads its API key from the `ANTHROPIC_API_KEY` environment
+variable. If the package is missing or the key is unset, the
+`validate_response` tool returns `status='unavailable'` instead of
+blocking — the DM may proceed without validation.
 
 Note the full path to your Python executable — you will need it in Step 4.
 
